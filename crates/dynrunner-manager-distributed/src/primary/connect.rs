@@ -140,7 +140,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // here would drain the pool ahead of it and break the
                         // initial-assignment shape. The queued `TasksAdded`
                         // stays on the bus and is serviced by the
-                        // post-assignment `wait_for_mesh_ready` drain / the
                         // operational-loop entry sweep — the roster is current,
                         // dispatch is just ordered after initial assignment.
                         Some(m) => self.dispatch_message(m, command_rx).await?,
@@ -307,11 +306,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// receiver into the TaskComplete / TaskFailed cascade so a
     /// callback-issued `spawn_tasks` applies inline before the next
     /// `drain_empty_active_phases` poll. The pre-loop waits
-    /// (`wait_for_connections`, `wait_for_mesh_ready`) pass the LIVE
-    /// `command_rx` (`Some`): PyPrimaryHandle is already reachable before
-    /// operational-loop entry (it shares the pre-`run` `command_sender()`
-    /// clone), so a callback-queued command drains inline during those
-    /// waits. Only the post-loop caller (`drain_pending_messages`) passes
+    /// `wait_for_connections` passes the LIVE `command_rx` (`Some`):
+    /// PyPrimaryHandle is already reachable before operational-loop entry
+    /// (it shares the pre-`run` `command_sender()` clone), so a
+    /// callback-queued command drains inline during that wait. Only the post-loop caller (`drain_pending_messages`) passes
     /// `&mut None`: the loop has already exited and won't re-enter, so no
     /// in-runtime callback path needs draining.
     pub(super) async fn dispatch_message(
@@ -632,23 +630,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.send_terminal_ack_to(seq, reporter).await;
     }
 
-    /// Record a secondary's `MeshReady` report. The
-    /// `wait_for_mesh_ready` step blocks on this set covering every
-    /// connected secondary before it lets the `PrimaryChanged`
-    /// announcement fire. A stray `MeshReady` after the wait already
-    /// cleared is
-    /// idempotent — the set just stays full and the message is a
-    /// no-op.
-    /// # Sole writer of the mesh-confirmation set
+    /// Record a secondary's `MeshReady` report. This set is the input to
+    /// the operational loop's background mesh-formation deadline
+    /// ([`Self::mesh_formation_missing`] + `config.mesh_ready_timeout`):
+    /// a ≥2-node fleet must have every EXPECTED secondary report a FORMED
+    /// peer mesh, and the run aborts if any never does by the deadline.
+    /// Bring-up does NOT block on this — dispatch proceeds immediately.
     ///
-    /// `mesh_ready_secondaries` is the single source of truth for "has
-    /// this member confirmed its peer-mesh leg formed". This is its ONLY
-    /// insertion site, and it is UNCONDITIONAL — a `MeshReady` that lands
-    /// AFTER `wait_for_mesh_ready` already proceeded on the timeout (a
-    /// straggler that finished its dials late) STILL flips the member
-    /// confirmed here, so the dispatch gate keyed on
-    /// [`Self::member_mesh_confirmed`] recovers it into the assignable
-    /// set. Late join must recover — there is no one-shot guard.
+    /// # Sole writer; FORMED-mesh semantics (`peer_count >= 1`)
+    ///
+    /// `mesh_ready_secondaries` is the single source of truth for "this
+    /// member reported that its peer mesh FORMED" — and dispatch does NOT
+    /// read it (the peer mesh is failover-only and dispatch ⊥ peer mesh;
+    /// see `should_skip_worker_for_dispatch`). The insert is gated on
+    /// `peer_count >= 1`: a secondary that meshed with ≥1 peer reports a
+    /// positive count, whereas a DEGRADED secondary (deadline elapsed,
+    /// zero peers — `report_mesh_ready_if_needed`'s watchdog-elapsed
+    /// branch) reports `peer_count == 0`. A zero-count report is a
+    /// "reported-but-mesh-NOT-formed" signal: it must NOT satisfy the
+    /// wait, so the run aborts on the deadline rather than proceeding
+    /// peer-mesh-degraded (mesh-always: no-mesh topologies are
+    /// unsupported, superseding the old `--jobs 2` degraded tolerance).
+    ///
+    /// Idempotent and late-join tolerant: a stray `MeshReady` after the
+    /// wait already proceeded is a no-op (the set just stays as-is), and
+    /// a re-announce after a primary identity change re-seeds the entry.
     pub(super) fn handle_mesh_ready(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::MeshReady {
             target: None,
@@ -662,120 +668,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 peer_count,
                 "secondary reports mesh ready"
             );
-            let newly_confirmed = self.mesh_ready_secondaries.insert(secondary_id.clone());
-            if newly_confirmed {
-                // Name the CONSEQUENCE the silent-branch rule asks for: the
-                // dispatch gate that withheld work from this member
-                // (`member_mesh_confirmed` returned false for it) now lets
-                // it through — a late MeshReady recovers a member that the
-                // mesh-ready timeout left unassignable.
-                tracing::info!(
+            if peer_count >= 1 {
+                let newly_formed = self.mesh_ready_secondaries.insert(secondary_id.clone());
+                if newly_formed {
+                    tracing::info!(
+                        secondary = %secondary_id,
+                        peer_count,
+                        "member reports its peer mesh FORMED (>=1 peer); \
+                         counts toward the mesh-formation deadline"
+                    );
+                }
+            } else {
+                // peer_count == 0 — a degraded secondary that hit its
+                // formation deadline with zero peers. It does NOT count as
+                // a formed mesh; if it never recovers to a positive count,
+                // the operational loop's mesh-formation deadline aborts the
+                // run if no member ever recovers to a positive count.
+                tracing::warn!(
                     secondary = %secondary_id,
-                    "member mesh leg confirmed; it is now assignable to proactive dispatch"
+                    "member reports MeshReady with ZERO peers — its peer mesh \
+                     has not formed; will not satisfy the mesh-formation \
+                     deadline unless it recovers"
                 );
-                // Re-arm the gate's once-per-spell veto WARN: if this
-                // member ever regresses to unconfirmed (a promoted
-                // primary's empty set), the next veto names it again.
-                self.mesh_gate_veto_warned.remove(&secondary_id);
-                // CONFIRMATION-EDGE DISPATCH WAKEUP. A member becoming
-                // confirmed enlarges the assignable set — the exact dual
-                // of `react_to_capacity_growth`'s worker-ready signal —
-                // so dispatch must re-evaluate NOW, not on the next
-                // unrelated event. Emit `TasksAdded` on the
-                // worker-management bus: the operational loop's
-                // worker-management arm (or the pre-loop inline drain
-                // during `wait_for_mesh_ready`) runs the recheck and the
-                // work the gate withheld flows at this edge. Decoupling
-                // law: bus signal only, never a direct dispatch call.
-                self.cluster_state
-                    .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
             }
         }
-    }
-
-    /// THE single dispatch-readiness predicate every assignment path
-    /// consults: may proactive dispatch push work to `secondary_id`, or
-    /// is it a half-joined member whose mesh leg never confirmed?
-    ///
-    /// Returns `true` (assignable) iff the member's frames provably
-    /// reach this primary:
-    ///
-    ///   * the member is CO-LOCATED with this primary (its peer-id IS
-    ///     `config.node_id` — the same-host worker-secondary of a
-    ///     promoted/compute-peer primary). Its frames ride the
-    ///     in-process loopback (`Mesh::deliver_local`), so there is no
-    ///     wire leg for a `MeshReady` to prove — co-location is
-    ///     structural confirmation. This mirrors the self-exclusion
-    ///     `wait_for_mesh_ready` applies to its expected set ("a node
-    ///     never emits MeshReady ABOUT ITSELF to itself") — demanding a
-    ///     self round-trip left the lone-survivor acting primary
-    ///     (run_20260612_035452) vetoing the ONLY dispatchable workers
-    ///     until the co-located secondary finished consuming the setup
-    ///     trio and its loopbacked report landed; OR
-    ///   * the member has confirmed its peer-mesh leg formed
-    ///     (`mesh_ready_secondaries` — a `MeshReady` was received from
-    ///     it).
-    ///
-    /// Nothing else counts: keepalives are liveness, not leg
-    /// confirmation, and "never dispatched to" is not proof of a
-    /// working leg.
-    ///
-    /// # Single owner of the dispatch readiness gate
-    ///
-    /// A member that never confirmed its mesh leg is half-joined: its
-    /// terminals ride a half-formed mesh egress leg that silently
-    /// swallows them (route present at the transport `has_peer` view,
-    /// send returns `Ok`, but the frame never reaches the authority —
-    /// the run_20260610_105906 strand). Pushing work to it strands each
-    /// task and wedges the phase barrier. So it is withheld from EVERY
-    /// proactive path until a `MeshReady` lands.
-    ///
-    /// # No first-dispatch exemption (#360)
-    ///
-    /// This predicate originally exempted a member's FIRST dispatch
-    /// (tracked in a `members_dispatched_to` set), on the theory that
-    /// the bring-up dispatch is what drives a late member operational so
-    /// it can emit `MeshReady`. That theory was stale: a member reaches
-    /// its operational loop by consuming the setup trio — and the
-    /// `InitialAssignment` half of the trio is sent by
-    /// `perform_initial_assignment` to EVERY known secondary (empty
-    /// batches included), a direct fan-out that never consults this
-    /// gate. Once operational, `MeshReady` emission is fully
-    /// dispatch-independent (operational-entry hook, mesh watchdog,
-    /// keepalive tick). A `TaskAssignment` pushed at a member still
-    /// stuck in `wait_for_setup`, by contrast, is DROPPED by its setup
-    /// loop ("unexpected message during setup") while the primary
-    /// records the task `InFlight` — the exemption could only strand,
-    /// never recover. In production (run_20260610_144905) it admitted
-    /// the first work onto unconfirmed secondary-2; the type-shift
-    /// first-bind continuation kept serving it and the terminal
-    /// swallowed on the half-formed leg, in the same second this gate
-    /// was vetoing further pushes. There is no residual window that
-    /// needs it: a healthy-uplink member that somehow never confirmed
-    /// still PULLS work through the request-driven path (its
-    /// `TaskRequest`'s arrival is its own delivery proof), and the
-    /// assigned=0 bring-up recovery is the confirmation-edge wakeup in
-    /// [`Self::handle_mesh_ready`] — the withheld work flows the moment
-    /// the member's `MeshReady` lands, with no unrelated event needed.
-    ///
-    /// The SOLE writer of `mesh_ready_secondaries` is
-    /// [`Self::handle_mesh_ready`] (unconditional, so a late `MeshReady`
-    /// recovers the member into the assignable set). The set is
-    /// deliberately NOT cleared on a member's removal: a re-admission is
-    /// keyed on FRAME INGEST from that member (its frames demonstrably
-    /// reached this primary again), which is the same delivery-proof
-    /// class as a `TaskRequest`'s arrival — so a re-admitted member's
-    /// surviving confirmation is backed by fresh evidence, while the
-    /// member itself (never knowing it was removed) would never re-send
-    /// a `MeshReady` that a cleared entry would wait on.
-    ///
-    /// Read by [`Self::should_skip_worker_for_dispatch`] — the single
-    /// owner of the per-worker dispatch-skip decision — so BOTH
-    /// operational dispatch paths (`dispatch_to_idle_workers` and
-    /// `handle_task_request`) gate on this ONE predicate without either
-    /// site knowing the mesh-readiness rule.
-    pub(super) fn member_mesh_confirmed(&self, secondary_id: &str) -> bool {
-        secondary_id == self.config.node_id || self.mesh_ready_secondaries.contains(secondary_id)
     }
 
     pub(super) async fn handle_welcome(&mut self, msg: DistributedMessage<I>) {

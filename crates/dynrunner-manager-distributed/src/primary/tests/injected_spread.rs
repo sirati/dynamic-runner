@@ -1,40 +1,22 @@
-//! Round-2 dispatch-spread regression: the INJECTED-task dispatch path
-//! composed with the mesh-readiness gate, on the PROMOTED-primary shape
-//! (production: asm-tokenizer run_20260610_130116 — 28 memmap tasks
-//! spawned mid-run via `on_phase_end → spawn_tasks` packed 12/9/4/2/1
-//! onto 5 of 15 secondaries, ten at ZERO, despite the #349 interleave
-//! fix).
+//! Round-2 dispatch-spread regression: the INJECTED-task dispatch path on
+//! the PROMOTED-primary shape (production: asm-tokenizer
+//! run_20260610_130116 — 28 memmap tasks spawned mid-run via
+//! `on_phase_end → spawn_tasks` packed 12/9/4/2/1 onto 5 of 15
+//! secondaries, ten at ZERO, despite the #349 interleave fix).
 //!
-//! The composition defect: a promoted/relocated primary starts with an
-//! EMPTY `mesh_ready_secondaries` set (node-local, nothing seeds it —
-//! deliberately NOT inherited via CRDT, because the predecessor's ledger
-//! proves legs to the OLD node: "mesh-leg confirmed" is PAIRWISE,
-//! member ↔ CURRENT primary). Pre-fix a secondary's `MeshReady` was
-//! one-shot PER PROCESS (`mesh.mesh_ready_sent` latched forever, and the
-//! report went to whichever primary held the role at that moment), so on
-//! the promoted primary the confirmations were structurally
-//! unrecoverable for already-operational members. The gate
-//! (`should_skip_worker_for_dispatch` → `member_mesh_confirmed`) then
-//! withheld 10/15 members from every proactive dispatch (the verbatim
-//! production WARN: "member remains unassignable until its mesh leg
-//! confirms ... skipping proactive dispatch"), and the injected batch
-//! packed onto the confirmed stragglers.
-//!
-//! THE FIX (pinned at the secondary in
-//! `secondary/tests/mesh_ready_reannounce.rs`): a secondary observing a
-//! genuinely-applied `PrimaryChanged` re-arms its one-shot reporter and
-//! RE-ANNOUNCES `MeshReady` to the new primary. This file pins the
-//! PRIMARY-side composition those re-announces ride:
-//!   - the re-announced `MeshReady`s arrive through the real inbound
-//!     path and (duplicate-tolerantly) seed the confirmed set, so a
-//!     mid-run injected batch interleaves across the WHOLE live fleet
-//!     (the #349 spread contract) instead of packing;
-//!   - the gate's original strand-prevention purpose
-//!     (run_20260610_105906) is preserved: a member whose re-announce
-//!     never arrives — its leg is dead, which is exactly what the gate
-//!     exists to detect — still gets NO proactive work, even while it
-//!     keepalives (liveness frames are NOT leg confirmation; only
-//!     `MeshReady` is).
+//! The #349 spread contract — a mid-run injected batch interleaves across
+//! the WHOLE live fleet rather than packing onto a few members — is now
+//! UNCONDITIONAL: dispatch is decoupled from the peer mesh
+//! (`should_skip_worker_for_dispatch` no longer consults `MeshReady`), so
+//! every member with idle workers is an equal spread target the instant
+//! its capacity is known. The historic gate that withheld from
+//! MeshReady-unconfirmed members (which, combined with the promoted
+//! primary's empty `mesh_ready_secondaries`, caused the 10/15-at-zero
+//! pack) is gone; its strand concern is covered by the secondary's
+//! confirmable-replay (a terminal that rides a half-formed leg is retained
+//! and replayed until acked). These tests pin that the injected batch
+//! spreads across the whole live fleet — including members that never
+//! reported `MeshReady`.
 
 use super::*;
 
@@ -565,16 +547,15 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
         .await;
 }
 
-/// Gate-purpose preservation (the eda0f216 contract under the pairwise
-/// design): a member that already got work and whose `MeshReady`
-/// (re-)announce NEVER arrived must still receive NO proactive work —
-/// EVEN while it keepalives. Liveness frames are not leg confirmation:
-/// the half-joined strand member (run_20260610_105906) keepalives
-/// healthily while its mesh egress leg silently swallows terminals, so
-/// only the `MeshReady` arrival may flip the member assignable. The
-/// heard-from-and-confirmed member absorbs the batch.
+/// Injected-batch spread is decoupled from the peer mesh: a member that
+/// never (re-)announced `MeshReady` ALSO receives injected work — the
+/// batch interleaves across the WHOLE live fleet, not just the
+/// MeshReady-confirmed members. The historic gate that withheld from an
+/// unconfirmed member is gone (its strand concern is covered by
+/// confirmable-replay), so an injected batch spreads across every member
+/// with idle workers regardless of MeshReady.
 #[tokio::test(flavor = "current_thread")]
-async fn injected_batch_withholds_from_member_whose_reannounce_never_arrived() {
+async fn injected_batch_spreads_across_members_without_mesh_ready() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -599,12 +580,9 @@ async fn injected_batch_withholds_from_member_whose_reannounce_never_arrived() {
                 2,
             );
 
-            // Only `confirmed`'s re-announced MeshReady arrives;
-            // `unconfirmed` KEEPALIVES (it is alive!) but its
-            // confirmation never lands — its mesh leg is dead, the exact
-            // member the gate exists to withhold from. Post-#360 the
-            // gate keys on confirmation alone (no dispatched-to
-            // precondition).
+            // Only `confirmed`'s re-announced MeshReady arrives; the other
+            // member merely keepalives and never reports MeshReady. Neither
+            // fact gates dispatch any more.
             primary
                 .dispatch_message(mesh_ready_from(&confirmed_id), &mut None)
                 .await
@@ -617,20 +595,28 @@ async fn injected_batch_withholds_from_member_whose_reannounce_never_arrived() {
 
             inject_and_recheck(&mut primary, &mut wm_rx, vec![ptask("t0"), ptask("t1")]).await;
 
+            // Two tasks, four idle workers (2 per member): the spread
+            // interleave places one task on EACH member — including the one
+            // that never reported MeshReady.
+            let confirmed_got = drain_assignments(&mut ends[0].1);
+            let unconfirmed_got = drain_assignments(&mut ends[1].1);
             assert_eq!(
-                drain_assignments(&mut ends[0].1).len(),
-                2,
-                "the confirmed member's two idle workers absorb the batch"
+                confirmed_got.len(),
+                1,
+                "the confirmed member takes one of the two injected tasks; \
+                 got {confirmed_got:?}"
             );
-            assert!(
-                drain_assignments(&mut ends[1].1).is_empty(),
-                "NO task may be pushed to the member whose MeshReady never \
-                 arrived — keepalives are liveness, not leg confirmation; \
-                 its terminals would strand (the run_20260610_105906 class)"
+            assert_eq!(
+                unconfirmed_got.len(),
+                1,
+                "the member that never reported MeshReady ALSO takes one — \
+                 injected spread is decoupled from the peer mesh; \
+                 got {unconfirmed_got:?}"
             );
-            assert!(
-                primary.slot_is_idle_for_test(&unconfirmed_id, 0),
-                "the unconfirmed member's workers stay idle"
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "both injected tasks dispatched across the fleet"
             );
         })
         .await;

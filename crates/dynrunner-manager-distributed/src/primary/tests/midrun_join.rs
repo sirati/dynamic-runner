@@ -549,6 +549,13 @@ async fn midrun_joiner_exits_setup_goes_meshready_and_completes_work() {
                         }
                     }
                 });
+                // Model the production formed peer mesh for the joiner: the
+                // channel fixture wires only primary↔secondary legs, so the
+                // joiner's watchdog would report a degraded (peer_count=0) mesh.
+                // Inject the FORMED-mesh report it WOULD emit on a real QUIC
+                // mesh so the dispatch gate's confirmation set names it (see
+                // `inject_mesh_ready_for`).
+                inject_mesh_ready_for(&incoming_tx, &["sec-1".to_string()]);
                 joiner_handle
             };
 
@@ -938,6 +945,13 @@ async fn midrun_joiner_inherits_pre_staged_mode_and_resolves_bind_mounted_corpus
                         }
                     }
                 });
+                // Model the production formed peer mesh for the joiner: the
+                // channel fixture wires only primary↔secondary legs, so the
+                // joiner's watchdog would report a degraded (peer_count=0) mesh.
+                // Inject the FORMED-mesh report it WOULD emit on a real QUIC
+                // mesh so it reaches MeshReady via the mid-run serve (see
+                // `inject_mesh_ready_for`).
+                inject_mesh_ready_for(&incoming_tx, &["sec-1".to_string()]);
                 joiner_handle
             };
 

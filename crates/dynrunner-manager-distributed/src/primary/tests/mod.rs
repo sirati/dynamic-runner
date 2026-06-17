@@ -384,31 +384,28 @@ pub(super) fn real_secondary_config(
     }
 }
 
-/// Inject the `MeshReady` each named secondary WOULD send on a real mesh,
-/// straight into the primary's inbound channel (the forwarder `incoming_tx`).
+/// Inject the FORMED-mesh `MeshReady` (`peer_count = 1`) each named
+/// secondary WOULD send on a real mesh, straight into the primary's
+/// inbound channel (the forwarder `incoming_tx`).
 ///
-/// # Why a channel-mesh fixture needs this (the concurrent-discovery reality)
+/// # Why a channel-mesh fixture needs this (the mesh-formation abort)
 ///
-/// On a real mesh-always discovery primary, every cert-exchanged member is
-/// operationalized by the op-loop's incremental serve and reports `MeshReady`
-/// once its peer-mesh watchdog settles (a real peer connection, or the
-/// hardcoded 30s formation deadline — `secondary::setup`). The primary's
-/// proactive dispatch is `MeshReady`-gated (`member_mesh_confirmed` /
-/// `should_skip_worker_for_dispatch`), so the discovered corpus is delivered
-/// through the OPERATIONAL pull/recheck path (`handle_mesh_ready`'s
-/// confirmation-edge `TasksAdded` → `dispatch_to_idle_workers`), NOT a
-/// task-bearing `InitialAssignment` push (the incremental serve sends an EMPTY
-/// assignment — `serve_run_start_trio_remainder`).
+/// A channel-transport fixture wires only the primary↔secondary leg, never
+/// the secondary↔secondary legs, so each real secondary's peer-mesh
+/// watchdog reads `alive_secondaries=0` and reports a DEGRADED
+/// `MeshReady(peer_count=0)` after its formation deadline. Under
+/// mesh-always that does NOT count as a formed mesh, so in a ≥2-secondary
+/// fleet the primary's `wait_for_mesh_ready` would abort the run on its
+/// deadline (the peer mesh is the required failover substrate). Injecting
+/// the FORMED-mesh report each secondary would emit on a real QUIC mesh
+/// (where the legs DO form) lets the multi-secondary fixture exercise the
+/// happy path. Idempotent + order-free in the primary (`handle_mesh_ready`
+/// inserts the formed-mesh set entry on `peer_count >= 1`), so the inject
+/// may land before or after the member is known.
 ///
-/// A channel-transport fixture wires only the primary↔secondary leg, never the
-/// secondary↔secondary legs, so each secondary's watchdog reads
-/// `alive_secondaries=0` and the 30s formation deadline never elapses inside a
-/// short test window — the secondary therefore never emits its `MeshReady`.
-/// Injecting it here reproduces the production confirmation a real secondary
-/// sends, so the gated operational dispatch delivers the corpus exactly as on a
-/// real mesh. Idempotent + order-free in the primary
-/// (`handle_mesh_ready` inserts unconditionally and emits the confirmation-edge
-/// `TasksAdded`), so the inject may land before or after the member is known.
+/// Dispatch is NOT affected either way — it no longer gates on `MeshReady`
+/// (dispatch ⊥ peer mesh; see `should_skip_worker_for_dispatch`); this
+/// inject is purely to satisfy the mesh-formation deadline.
 pub(super) fn inject_mesh_ready_for(
     incoming_tx: &tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
     secondary_ids: &[String],

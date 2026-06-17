@@ -140,6 +140,12 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
                     }
                 });
             }
+            // Model the production formed peer mesh (see `inject_mesh_ready_for`):
+            // the channel fixture wires only primary↔secondary legs, so the ≥2
+            // real secondaries would report a degraded mesh and abort the run on
+            // the mesh-formation deadline. Inject the FORMED-mesh report each
+            // secondary emits on a real QUIC mesh.
+            inject_mesh_ready_for(&incoming_tx, &["sec-0".to_string(), "sec-1".to_string()]);
             drop(incoming_tx);
 
             let transport =

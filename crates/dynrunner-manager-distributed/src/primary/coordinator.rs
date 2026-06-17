@@ -1055,30 +1055,18 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// rationale.
     pub(super) fleet_dead_since: Option<Instant>,
 
-    /// Set of secondary ids that have reported `MeshReady`. The
-    /// primary's `wait_for_mesh_ready` step blocks on this set
-    /// growing to the connected-secondaries set before it issues its
-    /// `PrimaryChanged` announcement — without that wait, the
-    /// newly-named primary becomes authoritative against a still-
-    /// forming peer mesh and every pre-mesh-formation message goes
-    /// nowhere. Recorded by `handle_mesh_ready`; consumed by
-    /// `wait_for_mesh_ready` AND the dispatch-readiness predicate
-    /// [`Self::member_mesh_confirmed`].
+    /// Set of secondary ids that have reported a FORMED peer mesh
+    /// (`MeshReady` with `peer_count >= 1`). Input to the operational
+    /// loop's BACKGROUND mesh-formation deadline (`mesh_formation_missing`
+    /// against `config.mesh_ready_timeout`): a >=2-node fleet must have
+    /// every EXPECTED secondary in this set by the deadline, else the run
+    /// ABORTS (a genuinely-never-formed peer mesh means no failover is
+    /// possible). Bring-up does NOT block on it — dispatch proceeds
+    /// immediately. Recorded by `handle_mesh_ready` (formed-mesh reports
+    /// only); consumed SOLELY by `mesh_formation_missing`. Dispatch does
+    /// NOT read it — the peer mesh is failover-only and dispatch is
+    /// independent of it (see `should_skip_worker_for_dispatch`).
     pub(super) mesh_ready_secondaries: HashSet<String>,
-
-    /// Members whose mesh-gate veto has ALREADY been WARN-named this
-    /// unconfirmed spell. The gate's veto
-    /// (`should_skip_worker_for_dispatch` withholding an unconfirmed
-    /// member) is consulted per-worker on every dispatch recheck, and
-    /// during bring-up EVERY member passes through a brief unconfirmed
-    /// window — an unthrottled WARN would name healthy members dozens of
-    /// times before their `MeshReady` lands. One WARN per member per
-    /// spell carries the full diagnostic (the #360 evidence was read off
-    /// this exact line); repeats are DEBUG. Cleared by
-    /// `handle_mesh_ready` when the member confirms, so a member that
-    /// later regresses to unconfirmed (a promoted primary's empty
-    /// confirmation set) is named again.
-    pub(super) mesh_gate_veto_warned: HashSet<String>,
 
     // primary promotion
     pub(super) primary_id: Option<String>,
@@ -1919,7 +1907,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
-            mesh_gate_veto_warned: HashSet::new(),
             primary_id: None,
             pending_observer: None,
             pending_stage_files: Vec::new(),
@@ -2967,14 +2954,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// dispatch tick. Composes the reasons-to-skip the dispatch
     /// pipeline knows about today:
     ///
-    ///   * The worker's secondary is a half-joined member: it never
-    ///     confirmed its peer-mesh leg
-    ///     ([`Self::member_mesh_confirmed`]). PROACTIVE dispatch only — a
-    ///     member whose mesh leg is unformed silently swallows its
-    ///     terminals on the half-formed egress leg, so PUSHING work to
-    ///     it strands the task and wedges the phase barrier (the
-    ///     run_20260610_105906 strand; the first-dispatch variant is the
-    ///     run_20260610_144905 #360 strand).
+    ///   * The worker's secondary is FSM-suspect (an in-flight
+    ///     consensus round, or the lazy local-suspect path) — see the
+    ///     #556 gate below.
     ///   * The worker's secondary is in backpressure backoff
     ///     ([`Self::is_backpressured`]).
     ///   * OOM-bucket single-worker mode is active and this is not
@@ -2998,22 +2980,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// pass `false` so a secondary that just said "no idle worker"
     /// isn't immediately re-hammered by its own request retry.
     ///
-    /// `request_driven` lifts the mesh-confirmation gate: a
-    /// `TaskRequest` that ARRIVED is itself direct proof the member's
-    /// uplink to the primary delivers (the half-joined strand member
-    /// could NOT send requests — they swallowed on the same wedged leg —
-    /// so it never reaches this path). Honouring a request that
-    /// demonstrably reached us can never strand on an unreachable
-    /// member, so the reactive caller (`handle_task_request`) passes
-    /// `true`. The PROACTIVE caller (`dispatch_to_idle_workers`, which
-    /// PUSHES work to an idle worker that did NOT ask) passes `false`:
-    /// that is the bypass the production strand rode, and the gate
-    /// withholds work from a half-joined member there.
+    /// # No peer-mesh-readiness veto (dispatch ⊥ peer mesh)
+    ///
+    /// This predicate deliberately does NOT consult any peer-mesh
+    /// (`MeshReady`) signal. The peer mesh (secondary↔secondary QUIC
+    /// legs, counted by `alive_secondary_count`) exists ONLY for
+    /// failover/inter-secondary keepalive — it is NOT the
+    /// primary↔secondary operational leg a dispatched task's terminal
+    /// rides. Both the dispatch (`TaskAssignment`) and the terminal
+    /// (`TaskComplete`/`TaskFailed`) travel the single
+    /// `Destination::Primary` egress edge over the WSS/QUIC
+    /// primary-secondary transport, INDEPENDENT of peer-mesh formation.
+    /// The historic #360 concern ("a half-formed egress leg swallows the
+    /// terminal → strand") is owned end-to-end by the SECONDARY's
+    /// confirmable-replay layer (`send_to_primary`: a terminal is
+    /// retained `AwaitingAck` and replayed with the same `delivery_seq`
+    /// until a `TerminalAck` lands — including across a blackholed-but-
+    /// live leg and across failover, idempotent at the authority). So
+    /// gating dispatch on `MeshReady` was pure over-conservatism: it
+    /// withheld work for up to the mesh deadline even when the
+    /// operational leg was healthy, and a genuinely-swallowed terminal
+    /// recovers via ack-timeout replay regardless. Mesh formation is now
+    /// a REQUIRED-WITH-DEADLINE condition enforced ONCE as the operational
+    /// loop's background mesh-formation deadline (`mesh_formation_missing`;
+    /// timeout ⇒ run abort), never a per-dispatch veto.
     pub(super) fn should_skip_worker_for_dispatch(
         &mut self,
         worker_idx: usize,
         bypass_backpressure: bool,
-        request_driven: bool,
     ) -> bool {
         let sec_id = self.workers[worker_idx].secondary_id.as_str();
         // #556 LOCAL-suspect gate — the dispatch-altitude consequence of
@@ -3037,41 +3031,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .in_flight_suspects()
             .contains(sec_id)
         {
-            return true;
-        }
-        // Mesh-confirmation gate — PROACTIVE push only (a request that
-        // arrived is its own proof of a working leg, so `request_driven`
-        // lifts it). An unconfirmed member is unassignable to a proactive
-        // push until a `MeshReady` lands (`member_mesh_confirmed` flips
-        // true) and recovers it — including its FIRST dispatch (#360: a
-        // never-dispatched member's half-formed leg swallows terminals
-        // exactly like a dispatched one's). The veto is named per the
-        // silent-branch rule, ONE WARN per member per unconfirmed spell
-        // (every member passes through this window during bring-up and
-        // the predicate runs per-worker per-recheck — unthrottled it
-        // floods); repeats are DEBUG. `handle_mesh_ready` re-arms the
-        // WARN when the member confirms.
-        if !request_driven && !self.member_mesh_confirmed(sec_id) {
-            let sec_id = sec_id.to_string();
-            let worker_id = self.workers[worker_idx].worker_id;
-            if self.mesh_gate_veto_warned.insert(sec_id.clone()) {
-                tracing::warn!(
-                    secondary = %sec_id,
-                    worker_id,
-                    "member remains unassignable until its mesh leg confirms \
-                     (no MeshReady received); skipping proactive dispatch to \
-                     avoid stranding the task on its half-formed egress leg \
-                     (further vetoes for this member logged at DEBUG until it \
-                     confirms)"
-                );
-            } else {
-                tracing::debug!(
-                    secondary = %sec_id,
-                    worker_id,
-                    "member still unconfirmed (no MeshReady received); \
-                     skipping proactive dispatch"
-                );
-            }
             return true;
         }
         if !bypass_backpressure && self.is_backpressured(sec_id) {
@@ -4412,10 +4371,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// assert the resulting `TaskAssignment` routes over the loopback.
     ///
     /// A worker registered here models a FULLY-OPERATIONAL member, so it
-    /// is also marked mesh-confirmed (the `MeshReady` the welcome handshake
-    /// would have delivered) — otherwise the dispatch-readiness gate in
-    /// `should_skip_worker_for_dispatch` would correctly withhold work from
-    /// it. A test that wants to exercise the half-joined (unconfirmed)
+    /// is also recorded as having reported a FORMED peer mesh (the
+    /// `MeshReady` the welcome handshake would have delivered). Dispatch
+    /// no longer consults that set (dispatch ⊥ peer mesh), but the record
+    /// keeps the mesh-formation deadline (`mesh_formation_missing`)-driven
+    /// tests consistent. A test that wants to model a never-formed-mesh
     /// member uses [`Self::mark_member_mesh_unconfirmed_for_test`] to undo
     /// this.
     #[cfg(test)]
@@ -4457,19 +4417,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         .await
     }
 
-    /// Test-only seam: model a HALF-JOINED member by dropping `secondary_id`
-    /// from the mesh-confirmation set, so `should_skip_worker_for_dispatch`
-    /// withholds work from its workers (the unformed-mesh-leg dispatch gate).
-    /// Pairs with [`Self::register_idle_worker_for_test`] (which marks every
-    /// registered member confirmed) to drive the strand-prevention test.
+    /// Test-only seam: model a member whose peer mesh NEVER formed by
+    /// dropping `secondary_id` from the formed-mesh set, so
+    /// the mesh-formation deadline (`mesh_formation_missing`) does not
+    /// count it (and aborts on its deadline). Pairs with
+    /// [`Self::register_idle_worker_for_test`] (which records every
+    /// registered member as having a formed mesh).
     #[cfg(test)]
     pub fn mark_member_mesh_unconfirmed_for_test(&mut self, secondary_id: &str) {
         self.mesh_ready_secondaries.remove(secondary_id);
     }
 
-    /// Test-only seam: deliver a member's `MeshReady` confirmation (the
-    /// late-join recovery edge) so a previously-unconfirmed member becomes
-    /// assignable. Mirrors what `handle_mesh_ready` does on the wire.
+    /// Test-only seam: record a member's FORMED-mesh `MeshReady`
+    /// (`peer_count >= 1`) so the mesh-formation deadline
+    /// (`mesh_formation_missing`) counts it. Mirrors what
+    /// `handle_mesh_ready` does on the wire for a positive report.
     #[cfg(test)]
     pub fn confirm_member_mesh_for_test(&mut self, secondary_id: &str) {
         self.mesh_ready_secondaries.insert(secondary_id.to_string());
@@ -4895,8 +4857,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // so the per-variant reason text stays authoritative. The
                 // remaining Err sites — every `?`-escape of a `RunError::Other`
                 // (queue_initial_staging / staging walks /
-                // send_transfer_complete / wait_for_mesh_ready /
-                // discover_on_promotion failures), `PanikShutdown`,
+                // send_transfer_complete / the operational loop's
+                // mesh-formation abort / discover_on_promotion failures), `PanikShutdown`,
                 // `AbortedByClusterVerdict`, `Deposed`, `GracefulAbort`,
                 // and every future RunError variant — author their FIRST
                 // latch HERE, so the observer's `evaluate_exit` and every
@@ -5133,8 +5095,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `lifecycle/operational_loop.rs:51`); the window between take and
         // put-back is benign here because we're still in `run` before the
         // operational loop has started — no concurrent sender access path
-        // exists. Put-back happens after `wait_for_mesh_ready` so the
-        // loop's own `self.command_rx.take()` re-acquires the same receiver.
+        // exists. Put-back happens right before `bootstrap_tail_dispatch`
+        // so the loop's own `self.command_rx.take()` re-acquires the same
+        // receiver.
         let mut command_rx = self.command_rx.take();
 
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange.
@@ -5226,12 +5189,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // role away in the branch below); the InitialAssignment is the
         // operational primary's (the relocate TARGET's) concern. So gating the
         // setup peer's relocate on `MeshReady` is a circular deadlock —
-        // wait_for_mesh_ready ⇒ secondary-operational ⇒ InitialAssignment ⇒
-        // operational-primary ⇒ relocation ⇒ blocked behind the wait. The
+        // mesh-formation-deadline ⇒ secondary-operational ⇒ InitialAssignment ⇒
+        // operational-primary ⇒ relocation ⇒ blocked behind the deadline. The
         // event the gate actually protects (the role announce landing on a
         // settled peer mesh) is observed where it is satisfiable: the
-        // `BootstrapRole::PromotedDestination` arm runs `wait_for_mesh_ready`
-        // AFTER it has sent `InitialAssignment` + `TransferComplete`, by which
+        // `BootstrapRole::PromotedDestination` arm polls the background
+        // mesh-formation deadline AFTER it has sent `InitialAssignment` +
+        // `TransferComplete`, by which
         // point the secondaries it just drove operational can emit `MeshReady`
         // over the REAL mesh. The peer-mesh links themselves form at the Node
         // mesh-pump (dialed off `PeerInfo`, see `send_peer_lists` above) — a
@@ -5504,31 +5468,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     return self.bail_to_finalize(command_rx).await;
                 }
 
-                // Phase 6.5: wait for the peer mesh to settle before this
-                // operational primary asserts authority and starts driving
-                // dispatch over it. The `PrimaryChanged` self-announce
-                // (`activate_local_primary`) and every subsequent operational
-                // broadcast route over the QUIC peer mesh; the pre-fix gap fired
-                // the announce ~750µs after cert-exchange, against a
-                // still-forming mesh (per-peer dial budget: 10s QUIC + 10s WSS),
-                // so every pre-mesh-formation peer-broadcast routed into the void
-                // for the duration. Holding until every secondary signals
-                // `MeshReady` (mesh formed, watchdog elapsed, or single-secondary
-                // instant) is the event-driven "wait until the mesh is real",
-                // bounded by `config.mesh_ready_timeout` (warning + proceed on
-                // straggler, never deadlock).
+                // Phase 6.5: DECOUPLED bring-up — do NOT block on peer-mesh
+                // formation here. The promoted primary asserts authority
+                // (`activate_local_primary` → `PrimaryChanged` self-announce
+                // over the primary↔secondary leg) and enters its operational
+                // loop + dispatches IMMEDIATELY. The peer mesh (≥2 compute
+                // nodes) is the FAILOVER substrate only — dispatch + terminals
+                // ride the independent primary↔secondary leg
+                // (`should_skip_worker_for_dispatch`: dispatch ⊥ peer mesh) and
+                // terminals self-heal via confirmable-replay, so nothing the
+                // run does to make progress needs the peer mesh. Blocking
+                // bring-up on mesh formation idled the fleet through the whole
+                // formation window — the symptom this decouple removes.
                 //
-                // Non-circular HERE (unlike the old unconditional pre-branch
-                // placement): this runs AFTER `perform_initial_assignment` +
-                // `send_transfer_complete` above, so the secondaries this primary
-                // just drove operational can reach their `process_tasks` loop and
-                // emit `MeshReady`. The gate belongs on THIS
-                // `BootstrapRole::PromotedDestination` arm only — an operational
-                // primary that has already sent the assignment is the sole role
-                // for which `MeshReady` is satisfiable. The setup peer (which
-                // relocated the role away without ever sending an assignment)
-                // must NOT gate on it.
-                self.wait_for_mesh_ready(&mut command_rx).await?;
+                // The ≥2-node mesh-formation REQUIREMENT is not dropped: it is
+                // enforced as a BACKGROUND deadline polled at the top of the
+                // operational loop (`mesh_formation_missing` +
+                // `config.mesh_ready_timeout`). If a ≥2-node fleet's peer mesh
+                // never forms within the deadline, the op-loop returns the
+                // abort `Err` — routed through `run_pipeline`'s #563-Seam-0
+                // chokepoint to the `RunAborted` verdict + worker teardown (the
+                // SAME terminal path the old blocking wait used). A mesh that
+                // forms before the deadline never aborts.
 
                 // Put the command-channel receiver back on `self` so
                 // `operational_loop`'s own `self.command_rx.take()` picks it up
@@ -5540,9 +5501,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // "all initial setup complete, entering steady-state"
                 // milestone: the fleet is connected, staged, peer-linked, the
                 // primary's own membership is recorded, the ledger is seeded +
-                // tasks assigned, transfer-complete is sent, and the peer mesh
-                // has settled. A single emit at this point fires EXACTLY ONCE
-                // per run on the operational primary.
+                // tasks assigned, and transfer-complete is sent. A single emit
+                // at this point fires EXACTLY ONCE per run on the operational
+                // primary.
                 tracing::info!(
                     target: super::important_events::IMPORTANT_TARGET,
                     "initial setup done",
@@ -5550,9 +5511,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
                 // Bootstrap tail: activate THIS node as the local primary and
                 // run the operational loop to completion in place. The
-                // `wait_for_mesh_ready` above held until the peer mesh settled,
-                // so the self-announce warms each replica's role cache to a
-                // real connection.
+                // self-announce routes over the primary↔secondary leg; the
+                // peer mesh forms concurrently and is enforced by the op-loop's
+                // background mesh-formation deadline.
                 self.bootstrap_tail_dispatch().await
             }
         }
@@ -6513,13 +6474,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// phase and false-fires `on_phase_end(.., 0, 0)` for it,
     /// dropping every callback-injected task.
     ///
-    /// The pre-loop waits `wait_for_connections` and `wait_for_mesh_ready`
-    /// pass the LIVE `command_rx` (the `take`n receiver, `Some`): the
-    /// PyPrimaryHandle IS reachable before operational-loop entry (it
-    /// shares the pre-`run` `command_sender()` clone), so an
-    /// `on_phase_end` fired by a TaskComplete arriving during either wait
-    /// can queue `SpawnTasks` and have it drain inline via the same
-    /// `dispatch_message` → cascade path. The post-loop drain
+    /// The pre-loop wait `wait_for_connections` passes the LIVE
+    /// `command_rx` (the `take`n receiver, `Some`): the PyPrimaryHandle IS
+    /// reachable before operational-loop entry (it shares the pre-`run`
+    /// `command_sender()` clone), so an `on_phase_end` fired by a
+    /// TaskComplete arriving during that wait can queue `SpawnTasks` and
+    /// have it drain inline via the same `dispatch_message` → cascade path. The post-loop drain
     /// (`drain_pending_messages`) passes `&mut None` — by then the
     /// operational loop has already exited and won't re-enter, so there is
     /// no in-runtime callback path left to drain.

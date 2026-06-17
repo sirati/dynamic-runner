@@ -504,13 +504,29 @@ async fn mesh_formed_after_watchdog_elapse_restores_failover_path() {
          abandoned at the verdict — the #432 shape)"
     );
 
-    // The settled-report latch is untouched by the recovery: MeshReady
-    // was already sent for this primary identity, no duplicate.
+    // The recovery RE-REPORTS the now-FORMED mesh: the degraded path
+    // already sent MeshReady(peer_count=0), and under mesh-always the
+    // primary's mesh-formation deadline ABORTS the run on a member that
+    // only ever reported zero. So a late-forming mesh must re-arm the
+    // one-shot reporter and re-announce MeshReady(peer_count>=1) — that is
+    // the signal the primary observes to NOT abort a slow-but-formed mesh.
     secondary.drain_egress().await;
+    let mut saw_formed_reannounce = false;
+    while let Ok(msg) = sec_to_pri_rx.try_recv() {
+        if let DistributedMessage::MeshReady { peer_count, .. } = msg {
+            assert!(
+                peer_count >= 1,
+                "the late-formation re-announce must carry a FORMED peer \
+                 count (>=1); got {peer_count}"
+            );
+            saw_formed_reannounce = true;
+        }
+    }
     assert!(
-        sec_to_pri_rx.try_recv().is_err(),
-        "recovery must not re-send MeshReady (one settled report per \
-         primary identity)"
+        saw_formed_reannounce,
+        "a mesh that formed AFTER the degraded report must RE-ANNOUNCE \
+         MeshReady(peer_count>=1) so the primary's mesh-formation deadline \
+         does not abort a since-healed mesh"
     );
 
     // 4. REAL primary silence now trips (the 18:21:16 moment): with a

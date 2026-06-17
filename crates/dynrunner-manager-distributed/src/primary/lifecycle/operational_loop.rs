@@ -503,6 +503,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // explicit fire-once latch).
         let mut discovery_in_flight = self.discovery_in_flight.take();
 
+        // Background peer-mesh-formation deadline (the decoupled-bring-up
+        // replacement for the old blocking pre-loop wait). Dispatch
+        // does NOT block on mesh formation — the op-loop runs + dispatches
+        // immediately — but a ≥2-node fleet whose peer mesh never forms is
+        // still a RUN-ABORT condition: the peer mesh is the failover
+        // substrate and IS required. Arm a one-shot deadline relative to
+        // operational-start; the top-of-loop check below fires the abort if
+        // the mesh has not formed by then. `None` = not yet evaluated /
+        // satisfied; armed lazily on the first iteration that observes an
+        // unmet ≥2-node requirement (so a fleet that grows to ≥2 MID-RUN, or
+        // forms its mesh before this point, is handled uniformly by the live
+        // `mesh_formation_missing` predicate). Persistent `Instant` (not a
+        // `select!`-arm sleep, which is rebuilt every iteration and never
+        // elapses on a live cluster — the 1e914505 lesson the fleet-dead /
+        // reconciliation ticks above also follow).
+        let mut mesh_formation_deadline: Option<Instant> = None;
+
         // Entry sweep — dispatch is a pure function of state, asserted
         // ONCE the moment the loop is entered. The pre-loop chain may have
         // left a ready-task ∩ idle-worker match unfilled: a secondary
@@ -711,6 +728,59 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // grace-period clock so a subsequent fleet-dead
                 // event measures from its own start, not an old one.
                 self.fleet_dead_since = None;
+            }
+
+            // Background peer-mesh-formation deadline. Dispatch is decoupled
+            // from mesh formation (the run dispatches+executes regardless),
+            // but a ≥2-node fleet whose peer mesh never forms is a RUN-ABORT
+            // condition — the peer mesh is the required failover substrate.
+            // `mesh_formation_missing` is the LIVE predicate: `None` when the
+            // requirement is satisfied (mesh formed) or not applicable (<2
+            // compute nodes), `Some(missing)` for a ≥2-node fleet whose mesh
+            // has not formed. Arm the one-shot deadline the first iteration the
+            // requirement is observed unmet; clear it the moment the mesh forms
+            // (slow-but-forms never aborts); on a genuine never-form, the
+            // deadline elapses and we record the TYPED abort outcome
+            // (`RunError::PeerMeshNotFormed`) + break — the SAME structured
+            // write-by-arm / read-by-pipeline channel `worker_mgmt_fail_outcome`
+            // uses for `RunShouldFail`/`PolicyFatalExit`. `run_operational_and_finalize`
+            // then broadcasts the `RunAborted` verdict (each secondary tears down
+            // its workers on the terminal CRDT flag — the existing run-abort
+            // teardown) AND surfaces the typed error so the PyO3 boundary RAISES
+            // non-zero. Returning a bare `Err(String)` here would map to
+            // `RunError::Other`, which is SWALLOWED to exit 0 — the false-green
+            // class the typed variant exists to prevent. Persistent `Instant`
+            // (the fleet-dead / 1e914505 idiom), so it actually elapses on a
+            // live cluster.
+            match self.mesh_formation_missing() {
+                None => {
+                    // Satisfied or not-applicable: disarm so a later mesh
+                    // degradation re-arms from its own start, not a stale one.
+                    mesh_formation_deadline = None;
+                }
+                Some(missing) => {
+                    let now = Instant::now();
+                    let deadline = *mesh_formation_deadline
+                        .get_or_insert_with(|| now + self.config.mesh_ready_timeout);
+                    if now >= deadline {
+                        let reason = self.mesh_formation_abort_reason(&missing);
+                        tracing::error!(
+                            missing = ?missing,
+                            formed = self.mesh_ready_secondaries.len(),
+                            timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
+                            "mesh-formation timeout: the peer mesh (>=2 compute \
+                             nodes, required for failover) never formed within \
+                             the deadline — {} expected secondar(ies) never \
+                             reported a formed mesh; ABORTING the run and killing \
+                             all workers",
+                            missing.len(),
+                        );
+                        self.record_run_fail_outcome(
+                            crate::primary::error::RunError::PeerMeshNotFormed { reason },
+                        );
+                        break;
+                    }
+                }
             }
 
             // Per-task reconciliation-probe tick (#308). Polled at the

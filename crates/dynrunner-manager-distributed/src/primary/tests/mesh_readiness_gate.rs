@@ -1,24 +1,22 @@
-//! Half-A strand prevention: the PROACTIVE dispatch path
-//! (`dispatch_to_idle_workers`) must NOT push work to a half-joined
-//! member — one that never confirmed its peer-mesh leg (`MeshReady`).
-//! In run_20260610_105906 the primary proactively assigned two
-//! post-Ready first-binds to `secondary-2` while it was `missing` from
-//! the mesh-ready set; that member's terminals then swallowed on its
-//! half-formed mesh egress leg, so the tasks stranded and wedged the
-//! phase barrier. In run_20260610_144905 (#360) the then-extant
-//! FIRST-DISPATCH EXEMPTION admitted the original work onto the same
-//! unconfirmed shape — so the gate now keys on confirmation alone.
+//! Dispatch ⊥ peer mesh: PROACTIVE dispatch
+//! (`dispatch_to_idle_workers`) flows to an idle worker regardless of
+//! whether its member ever reported `MeshReady`. The peer mesh
+//! (secondary↔secondary, counted by `MeshReady`'s `peer_count`) is the
+//! FAILOVER substrate only; dispatch + terminals ride the independent
+//! primary↔secondary leg, and a terminal that ever rode a half-formed
+//! leg self-heals via the secondary's confirmable-replay
+//! (`send_to_primary`: retained `AwaitingAck`, replayed with the same
+//! `delivery_seq` until a `TerminalAck` lands). So the historic #360
+//! per-dispatch mesh-confirmation VETO is gone — it was pure
+//! over-conservatism, and removing it cannot re-strand. Mesh formation is
+//! now enforced ONCE as a background run-abort deadline
+//! (`mesh_formation_missing` in the operational loop), never a
+//! per-dispatch gate.
 //!
-//! The gate (`should_skip_worker_for_dispatch` → `member_mesh_confirmed`)
-//! withholds proactive work from such a member until a `MeshReady` lands
-//! (late-join recovery, which also WAKES dispatch via a `TasksAdded` on
-//! the worker-management bus), while the REACTIVE path
-//! (`handle_task_request`) is never gated: a request that arrived is its
-//! own proof the member's uplink delivers (the strand member could not
-//! send requests — they swallowed too).
-//!
-//! These are deterministic direct-handler tests: drive the exact
-//! dispatch-shape at the member and assert what reaches its wire.
+//! These tests pin the decoupling: a member that never reported
+//! `MeshReady` still receives proactive AND reactive work. They are
+//! deterministic direct-handler tests: drive the exact dispatch-shape at
+//! the member and assert what reaches its wire.
 
 use super::*;
 
@@ -102,21 +100,19 @@ async fn run_dispatch_recheck(primary: &mut TestPrimary) {
     primary.react_to_worker_signal_batch(batch, &mut None).await;
 }
 
-/// THE strand-prevention pin. Two members each with one idle worker:
-/// `sec-good` is mesh-confirmed, `sec-half` is the half-joined strand
-/// member (it already got work but never sent `MeshReady`). One ready
-/// task is in the pool.
-///
-/// A proactive `TasksAdded` recheck (`dispatch_to_idle_workers`) must
-/// route the task to `sec-good` and NEVER to `sec-half` — the production
-/// bypass that stranded `secondary-2`. Then a LATE `MeshReady` for
-/// `sec-half` recovers it: a second task in the pool now flows to it.
+/// THE decoupling pin. Two members each with one idle worker:
+/// `sec-confirmed` reported `MeshReady`, `sec-unconfirmed` never did.
+/// Two ready tasks are in the pool. A proactive `TasksAdded` recheck
+/// (`dispatch_to_idle_workers`) must fill BOTH idle workers — one task to
+/// each — including the member that never reported `MeshReady`. Dispatch
+/// does not gate on the peer mesh; a terminal that rides a half-formed
+/// leg self-heals via confirmable-replay, so there is nothing to withhold.
 #[tokio::test(flavor = "current_thread")]
-async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
+async fn proactive_dispatch_flows_to_member_without_mesh_ready() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Two secondaries, one wire end each (ends[0]=sec-good, ends[1]=sec-half).
+            // Two secondaries, one wire end each.
             let (transport, mut ends) = setup_test(2);
             let (mut primary, _mesh) = build_test_primary(
                 test_primary_config(),
@@ -124,17 +120,10 @@ async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            // The wire ids `setup_test` minted, in registration order.
-            let good_id = ends[0].0.clone();
-            let half_id = ends[1].0.clone();
+            let confirmed_id = ends[0].0.clone();
+            let unconfirmed_id = ends[1].0.clone();
 
-            // Two ready tasks seeded up front: `t0` is dispatched in the
-            // first recheck (to `sec-good` only, since `sec-half` is gated);
-            // `t1` stays queued until `sec-half` recovers. (Seeded together
-            // so the roster — registered below via the test seam, NOT via a
-            // `SecondaryCapacity` record — survives: a second
-            // `hydrate_from_cluster_state` would rebuild the roster off the
-            // CRDT and drop these seam-registered workers.)
+            // Two ready tasks seeded up front: one for each idle worker.
             let t0 = one_task("t0");
             let t1 = one_task("t1");
             let hash_t0 = compute_task_hash(&t0);
@@ -159,68 +148,45 @@ async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
         .expect("test fixture: composed task graph is valid");
 
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
-            // `register_idle_worker_for_test` marks BOTH members mesh-confirmed
-            // (it models a fully-operational member).
-            primary.register_idle_worker_for_test(good_id.clone(), 0, budget.clone());
-            primary.register_idle_worker_for_test(half_id.clone(), 0, budget);
+            primary.register_idle_worker_for_test(confirmed_id.clone(), 0, budget.clone());
+            primary.register_idle_worker_for_test(unconfirmed_id.clone(), 0, budget);
 
-            // Make `sec-half` the half-joined strand member: its
-            // `MeshReady` never landed (drop it from the confirmation
-            // set — the only fact the gate keys on).
-            primary.confirm_member_mesh_for_test(&good_id);
-            primary.mark_member_mesh_unconfirmed_for_test(&half_id);
+            // One member reported a formed mesh, the other never did — the
+            // peer-mesh signal must NOT change dispatch either way.
+            primary.confirm_member_mesh_for_test(&confirmed_id);
+            primary.mark_member_mesh_unconfirmed_for_test(&unconfirmed_id);
 
-            // PROACTIVE recheck: exactly ONE task goes to `sec-good`
-            // (one idle worker), and NOTHING to the half-joined `sec-half`.
-            // The scheduler may pick either of the two same-phase tasks, so
-            // the per-member assertions are which-task-agnostic.
+            // PROACTIVE recheck: BOTH idle workers take a task — the
+            // unconfirmed member is dispatched to just like the confirmed one.
             run_dispatch_recheck(&mut primary).await;
             settle_pump().await;
 
-            let good_got = assigned_ids(&mut ends[0].1);
+            let confirmed_got = assigned_ids(&mut ends[0].1);
+            let unconfirmed_got = assigned_ids(&mut ends[1].1);
             assert_eq!(
-                good_got.len(),
+                confirmed_got.len(),
                 1,
-                "exactly one task must dispatch to the mesh-confirmed member's \
-                 single idle worker; got {good_got:?}"
+                "the confirmed member's idle worker takes one task; got {confirmed_got:?}"
             );
-            let first_task = good_got[0].clone();
-            assert!(
-                first_task == "t0" || first_task == "t1",
-                "the dispatched task is one of the two seeded; got {first_task}"
-            );
-            assert!(
-                assigned_ids(&mut ends[1].1).is_empty(),
-                "NO task may be pushed to the half-joined member — its terminals \
-                 would swallow on its half-formed egress leg (the production strand)"
-            );
-            assert!(
-                primary.slot_is_idle_for_test(&half_id, 0),
-                "the half-joined member's worker stays idle: dispatch withheld it"
-            );
-            // The OTHER task is still queued — the gate held it back from the
-            // only remaining idle worker (`sec-half`).
-            let queued_task = if first_task == "t0" { "t1" } else { "t0" };
-
-            // LATE-JOIN RECOVERY. Deliver the member's `MeshReady` — it must
-            // now become assignable and the proactive recheck flows the
-            // queued task to it.
-            primary.handle_mesh_ready(DistributedMessage::MeshReady {
-                target: None,
-                sender_id: half_id.clone(),
-                timestamp: 0.0,
-                secondary_id: half_id.clone(),
-                peer_count: 1,
-            });
-
-            run_dispatch_recheck(&mut primary).await;
-            settle_pump().await;
-
             assert_eq!(
-                assigned_ids(&mut ends[1].1),
-                vec![queued_task.to_string()],
-                "after its MeshReady lands, the recovered member must receive the \
-                 queued task (late join must recover)"
+                unconfirmed_got.len(),
+                1,
+                "the member that never reported MeshReady ALSO takes one task — \
+                 dispatch is decoupled from the peer mesh; got {unconfirmed_got:?}"
+            );
+            // Both seeded tasks dispatched; nothing withheld.
+            let mut all: Vec<String> = confirmed_got.into_iter().chain(unconfirmed_got).collect();
+            all.sort();
+            assert_eq!(
+                all,
+                vec!["t0".to_string(), "t1".to_string()],
+                "both ready tasks dispatched across the two idle workers"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "no task may sit queued while an idle worker exists — even an \
+                 unconfirmed member's"
             );
         })
         .await;
@@ -262,9 +228,8 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             primary.register_idle_worker_for_test(id.clone(), 0, budget);
 
-            // Half-joined shape: unconfirmed. The proactive gate WOULD
-            // withhold work, but a request it sends (which demonstrably
-            // reached us) is honoured anyway.
+            // Never reported MeshReady — irrelevant to dispatch now, but
+            // pin that the reactive (pull) path serves it regardless.
             primary.mark_member_mesh_unconfirmed_for_test(&id);
 
             primary
@@ -276,33 +241,22 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
             assert_eq!(
                 assigned_ids(&mut ends[0].1),
                 vec!["reactive".to_string()],
-                "a TaskRequest that arrived is proof of a working uplink — the reactive \
-                 path is never withheld by the mesh-confirmation gate"
+                "the reactive path serves a TaskRequest regardless of MeshReady \
+                 (dispatch ⊥ peer mesh)"
             );
         })
         .await;
 }
 
-/// #360 — the first-dispatch exemption is GONE: a member that has never
-/// been dispatched to AND has not confirmed its mesh leg gets NOTHING from
-/// the proactive path. In run_20260610_144905 the exemption admitted the
-/// first work onto unconfirmed `secondary-2`; its first-bind continuation
-/// then ran the task and the terminal vanished on the half-formed leg.
-/// "Never dispatched" is not proof of a working leg — only `MeshReady` is.
-///
-/// Bring-up cannot deadlock on this: the cold-start fan-out
-/// (`perform_initial_assignment`) does not consult the gate, MeshReady
-/// emission on a member is dispatch-independent (operational-entry hook +
-/// mesh watchdog + keepalive tick), and the pull path (`TaskRequest`,
-/// request-driven) stays exempt as its own delivery proof.
-///
-/// The recovery half pins the new confirmation→dispatch wakeup: a landing
-/// `MeshReady` emits `TasksAdded` on the worker-management bus (a member
-/// becoming confirmed enlarges the assignable set — dispatch re-evaluates
-/// on every event that can create a match), so the withheld work flows at
-/// the confirmation edge with no unrelated event needed.
+/// First dispatch to a member that never reported `MeshReady` FLOWS — the
+/// historic #360 first-dispatch withholding is gone. The peer mesh is the
+/// failover substrate only; a task's terminal rides the independent
+/// primary↔secondary leg and self-heals via confirmable-replay even if
+/// that leg was momentarily half-formed, so there is nothing to withhold.
+/// A proactive recheck must push the ready task to the member's idle
+/// worker with no `MeshReady` round-trip.
 #[tokio::test(flavor = "current_thread")]
-async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
+async fn first_dispatch_to_member_without_mesh_ready_flows() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -333,66 +287,33 @@ async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             primary.register_idle_worker_for_test(id.clone(), 0, budget);
 
-            // Never dispatched to, never confirmed: the exact member the
-            // deleted exemption used to admit.
+            // Never dispatched to, never reported MeshReady — the member
+            // the deleted #360 veto would have withheld.
             primary.mark_member_mesh_unconfirmed_for_test(&id);
 
             run_dispatch_recheck(&mut primary).await;
             settle_pump().await;
 
-            assert!(
-                assigned_ids(&mut ends[0].1).is_empty(),
-                "NO work may be pushed to a member whose mesh leg is \
-                 unconfirmed — not even its first dispatch (the #360 bypass: \
-                 the first task's terminal swallows on the half-formed leg \
-                 exactly like any later one)"
-            );
-            assert!(
-                primary.slot_is_idle_for_test(&id, 0),
-                "the unconfirmed member's worker stays idle"
-            );
-
-            // CONFIRMATION EDGE: the member's MeshReady lands. It must both
-            // recover the member into the assignable set AND wake dispatch
-            // via the worker-management bus — no manual recheck, no
-            // unrelated event.
-            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
-            primary
-                .cluster_state_mut_for_test()
-                .install_worker_mgmt_sender(wm_tx);
-            primary.handle_mesh_ready(DistributedMessage::MeshReady {
-                target: None,
-                sender_id: id.clone(),
-                timestamp: 0.0,
-                secondary_id: id.clone(),
-                peer_count: 1,
-            });
-            let batch = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                recv_worker_signal_batch(&mut wm_rx),
-            )
-            .await
-            .expect("a landing MeshReady must wake dispatch (TasksAdded on the bus)")
-            .expect("emit must produce a batch");
-            primary.react_to_worker_signal_batch(batch, &mut None).await;
-            settle_pump().await;
-
             assert_eq!(
                 assigned_ids(&mut ends[0].1),
                 vec!["boot".to_string()],
-                "the withheld work flows at the confirmation edge"
+                "the first dispatch to a member without MeshReady FLOWS — \
+                 dispatch is decoupled from the peer mesh, and a terminal that \
+                 rides a half-formed leg self-heals via confirmable-replay"
+            );
+            assert!(
+                !primary.slot_is_idle_for_test(&id, 0),
+                "the member's worker is now busy with the dispatched task"
             );
         })
         .await;
 }
 
 /// Lone-survivor / co-located member (run_20260612_035452): the member
-/// whose peer-id IS this primary's host needs no `MeshReady` round-trip
-/// — its frames ride the in-process loopback (`Mesh::deliver_local`),
-/// so there is no wire leg for a `MeshReady` to prove. The gate must
-/// treat co-location as structural confirmation (the same self rule
-/// `wait_for_mesh_ready` already applies to its expected set: "a node
-/// never emits MeshReady ABOUT ITSELF to itself").
+/// whose peer-id IS this primary's host dispatches without any `MeshReady`
+/// — trivially true now that dispatch is decoupled from the peer mesh, but
+/// pinned here on the lone-survivor self-quorum shape that the old gate
+/// once vetoed until its co-located secondary's loopbacked report landed.
 ///
 /// Production shape: a bootstrap handoff promoted `secondary-1` into a
 /// fleet whose ONLY live member was its own host. The promoted
@@ -498,12 +419,13 @@ async fn co_located_member_is_assignable_without_mesh_ready() {
         .await;
 }
 
-/// The co-location rule must not leak: in a MULTI-member fleet the
-/// REMOTE members keep the existing gate semantics — a remote member
-/// without a landed `MeshReady` stays unassignable (the strand
-/// prevention), while the co-located member dispatches immediately.
+/// In a MULTI-member fleet, BOTH the co-located AND the REMOTE member
+/// receive proactive work without any `MeshReady` — dispatch is uniform
+/// and decoupled from the peer mesh (there is no remote-only gate to
+/// "leak" or "not leak"). The remote's terminal self-heals via
+/// confirmable-replay even if its leg is momentarily half-formed.
 #[tokio::test(flavor = "current_thread")]
-async fn co_located_rule_does_not_lift_gate_for_remote_members() {
+async fn both_co_located_and_remote_members_dispatch_without_mesh_ready() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -573,37 +495,25 @@ async fn co_located_rule_does_not_lift_gate_for_remote_members() {
             assert_eq!(
                 own_got.len(),
                 1,
-                "the co-located member's single idle worker takes one task \
-                 (structurally confirmed); got {own_got:?}"
+                "the co-located member's single idle worker takes one task; \
+                 got {own_got:?}"
             );
-            assert!(
-                assigned_ids(&mut ends[1].1).is_empty(),
-                "the REMOTE unconfirmed member keeps the existing gate \
-                 semantics: NO proactive push until its MeshReady lands"
-            );
-            assert!(
-                primary.slot_is_idle_for_test(&remote_id, 0),
-                "the remote member's worker stays idle while unconfirmed"
-            );
-
-            // The remote member's MeshReady lands — the queued task flows
-            // to it (the unchanged late-join recovery).
-            primary.handle_mesh_ready(DistributedMessage::MeshReady {
-                target: None,
-                sender_id: remote_id.clone(),
-                timestamp: 0.0,
-                secondary_id: remote_id.clone(),
-                peer_count: 1,
-            });
-            run_dispatch_recheck(&mut primary).await;
-            settle_pump().await;
-
             let remote_got = assigned_ids(&mut ends[1].1);
             assert_eq!(
                 remote_got.len(),
                 1,
-                "after its MeshReady lands the remote member receives the \
-                 queued task; got {remote_got:?}"
+                "the REMOTE member — which never reported MeshReady — ALSO \
+                 takes a task: dispatch is decoupled from the peer mesh, no \
+                 remote-only gate; got {remote_got:?}"
+            );
+            assert!(
+                !primary.slot_is_idle_for_test(&remote_id, 0),
+                "the remote member's worker is busy with its dispatched task"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "both ready tasks dispatched across the two idle workers"
             );
             let _ = keepalive;
         })

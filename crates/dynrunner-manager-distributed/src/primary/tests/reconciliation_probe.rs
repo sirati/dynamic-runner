@@ -246,6 +246,15 @@ async fn lost_tasks_are_probed_denied_requeued_and_recovered_e2e() {
             // sec-0: the amnesiac (swallows its initial batch, denies
             // holding); sec-1: a normal completing secondary.
             let (id0, rx0, tx0) = secondary_ends.remove(0);
+            // The amnesiac reports a DEGRADED mesh (peer_count=0) — the
+            // channel fixture wires only primary↔secondary legs, so it sees
+            // no siblings. Inject the FORMED-mesh report it would emit on a
+            // real QUIC mesh so the run clears the mesh-formation deadline
+            // and reaches the probe→requeue→recover chain under test (see
+            // `inject_mesh_ready_for`). sec-1 (`fake_secondary`) already
+            // reports a formed mesh.
+            let id0_for_mesh = id0.clone();
+            inject_mesh_ready_for(&tx0, std::slice::from_ref(&id0_for_mesh));
             tokio::task::spawn_local(fake_amnesiac_secondary(
                 id0,
                 1,

@@ -2,10 +2,8 @@ use std::collections::HashSet;
 
 use dynrunner_core::Identifier;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
-use crate::primary::command_channel::PrimaryCommand;
 
 /// The final-pick rule [`PrimaryCoordinator::select_relocation_target`]
 /// applies within the shared eligibility set (alive ∩ can_be_primary −
@@ -24,211 +22,97 @@ pub(crate) enum RelocationPolicy {
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
-    /// Block on every connected secondary reporting `MeshReady`
-    /// before this operational primary asserts authority
-    /// (`activate_local_primary`) and starts driving dispatch over
-    /// the peer mesh. The 750µs gap
-    /// between "all secondaries cert-exchanged" and the previous
-    /// promotion call left the promoted secondary
-    /// authoritative against a still-forming peer mesh — every
-    /// pre-mesh-formation message went into the void for the
-    /// 30s peer-dial budget. Closing the gap means waiting until
-    /// each secondary has signalled its mesh has settled (mesh
-    /// formed, watchdog elapsed, or no peers were expected for
-    /// single-secondary).
+    /// The LIVE expected peer-mesh roster: the alive PEER secondaries
+    /// (worker_count > 0 ∧ `is_peer_alive`) other than self. NOT
+    /// `config.num_secondaries` — the connect phase may have dropped
+    /// no-show secondaries, so the requirement is keyed on who is actually
+    /// alive RIGHT NOW.
     ///
-    /// CALLED ONLY on the `BootstrapRole::PromotedDestination` arm of
-    /// `run_pipeline`, AFTER `perform_initial_assignment` +
-    /// `send_transfer_complete`. `MeshReady` is the secondary's report
-    /// from its OPERATIONAL loop, which it reaches only after consuming an
-    /// `InitialAssignment` — so the report is satisfiable only once an
-    /// operational primary has sent one. The SETUP PEER (which relocates
-    /// the role away without ever sending an assignment) must NOT call
-    /// this: gating its relocate on a signal it never triggers is a
-    /// circular deadlock. The setup peer relies instead on the
-    /// transport-level peer-mesh formation the Node pump drives off
-    /// `PeerInfo` (transport ⊥ role/operational), which makes its
-    /// `PrimaryChanged { Transferred }` route over the live links without
-    /// any operational handshake.
-    ///
-    /// Bounded by `config.mesh_ready_timeout` (default 60s):
-    /// stragglers past the deadline log a warning and the run
-    /// proceeds anyway. A buggy secondary that never emits
-    /// `MeshReady` must not be able to deadlock the entire
-    /// dispatch pipeline; the post-promotion paths are all
-    /// already failure-tolerant against an absent peer.
-    ///
-    /// Cancellation safety: `transport.recv_peer` is the cancel-safe
-    /// unified inbound demux; `sleep_until` is one-shot cancel-safe per
-    /// tokio docs. The `select!` here mirrors the same shape
-    /// `wait_for_connections` uses one phase up.
-    pub(crate) async fn wait_for_mesh_ready(
-        &mut self,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
-    ) -> Result<(), String> {
-        // The expected set is the LIVE PEER-secondary roster captured
-        // AT this moment (post-quorum, post-cert-exchange). It is
-        // not `config.num_secondaries` because the connect phase
-        // may have dropped no-show secondaries on its own
-        // timeout — we only wait for who's actually here.
-        //
-        // Two ids that `known_secondaries()` (the raw capacity-record
-        // roster) carries must NOT be in the expected set, because neither
-        // can ever satisfy the `MeshReady` this wait blocks on:
-        //   * SELF. The promoted primary is itself a worker-secondary, so
-        //     it holds a `SecondaryCapacity` record and appears in
-        //     `known_secondaries()` — but a node never emits `MeshReady`
-        //     ABOUT ITSELF to itself. Waiting on it always burns the full
-        //     `mesh_ready_timeout`.
-        //   * The DEPARTED ex-primary. `PeerRemoved` marks a dead node
-        //     `peer_state = Dead` but LEAVES its `SecondaryCapacity`
-        //     record in place (the record is sticky; see
-        //     `apply_peer_removed`), so the just-scancelled ex-primary that
-        //     triggered this election still appears in
-        //     `known_secondaries()` — yet it is dead and will never report.
-        // `alive_secondary_members()` is the authoritative live-membership
-        // roster (worker_count > 0 ∧ `is_peer_alive`), which structurally
-        // excludes the dead ex-primary; the `id != node_id` filter excludes
-        // self. So the expected set is exactly the LIVE PEER secondaries —
-        // the only nodes that can emit a `MeshReady` this wait can observe.
-        // (On the cold path this is a strict no-op-or-improvement: it can
-        // only remove ids that would never have reported anyway.)
+    /// Two ids that `known_secondaries()` (the raw capacity-record roster)
+    /// carries are structurally excluded here because neither can ever
+    /// emit a `MeshReady` this gate observes:
+    ///   * SELF. The promoted primary is itself a worker-secondary, so it
+    ///     holds a `SecondaryCapacity` record — but a node never emits
+    ///     `MeshReady` ABOUT ITSELF to itself (the `id != node_id` filter).
+    ///   * The DEPARTED ex-primary. `PeerRemoved` leaves the sticky
+    ///     `SecondaryCapacity` record in place, but `alive_secondary_members()`
+    ///     excludes it (not `is_peer_alive`).
+    fn expected_mesh_roster(&self) -> HashSet<String> {
         let own_id = self.config.node_id.as_str();
-        let expected: HashSet<String> = self
-            .cluster_state
+        self.cluster_state
             .alive_secondary_members()
             .filter(|id| *id != own_id)
             .map(String::from)
-            .collect();
-        if expected.is_empty() {
-            tracing::debug!("no secondaries connected; skipping wait_for_mesh_ready");
-            return Ok(());
-        }
+            .collect()
+    }
 
-        // Fast path: messages may have already arrived before this
-        // step ran (the welcome/cert-exchange/peer-info loop above
-        // is event-driven and a fast secondary can emit MeshReady
-        // before we enter the wait).
+    /// Non-blocking peer-mesh-formation predicate — the BACKGROUND deadline
+    /// the operational loop polls, NOT a blocking pre-operational wait.
+    ///
+    /// # Decoupled bring-up (mesh-ready does NOT stop running)
+    ///
+    /// The promoted primary announces `PrimaryChanged` + enters its
+    /// operational loop + dispatches IMMEDIATELY — it does NOT block on
+    /// peer-mesh formation. Dispatch + terminals ride the independent
+    /// primary↔secondary leg (`should_skip_worker_for_dispatch`: dispatch
+    /// ⊥ peer mesh) and terminals self-heal via confirmable-replay, so the
+    /// peer mesh is needed ONLY as the failover substrate, never to run
+    /// work. Blocking bring-up on it idled the fleet through the whole
+    /// formation window — the symptom this decouple removes.
+    ///
+    /// # The ≥2-node requirement, enforced as a background deadline
+    ///
+    /// Returns:
+    ///   * `None` — the requirement is SATISFIED or NOT APPLICABLE:
+    ///       - a <2-node fleet (lone secondary, with or without the folded
+    ///         primary-host secondary) has NO peer mesh to form and NO
+    ///         failover possible — no requirement; OR
+    ///       - every expected secondary has reported a FORMED mesh
+    ///         (`peer_count >= 1`; `expected ⊆ mesh_ready_secondaries`).
+    ///   * `Some(missing)` — a ≥2-node fleet whose mesh is NOT yet formed;
+    ///     `missing` is the expected secondaries that have not reported.
+    ///     The op-loop's background deadline arms on this and, if it is
+    ///     still `Some` at the deadline, returns the abort `Err` — routed
+    ///     through `run_pipeline`'s #563-Seam-0 chokepoint to the
+    ///     `RunAborted` verdict + the run-wrapper's worker teardown (the
+    ///     SAME terminal path the old blocking-wait Err used). A mesh that
+    ///     forms before the deadline flips this to `None` and clears the
+    ///     deadline — slow-but-forms never aborts.
+    pub(crate) fn mesh_formation_missing(&self) -> Option<Vec<String>> {
+        // <2 compute nodes: no peer mesh, no failover, no requirement.
+        // `alive_secondary_members().count()` is the TOTAL compute-secondary
+        // count INCLUDING this primary's own folded worker-secondary, so it
+        // is the faithful "how many compute nodes can mesh" quantity.
+        if self.cluster_state.alive_secondary_members().count() < 2 {
+            return None;
+        }
+        let expected = self.expected_mesh_roster();
         if expected.is_subset(&self.mesh_ready_secondaries) {
-            tracing::info!(
-                count = expected.len(),
-                "all secondaries reported MeshReady before wait step"
-            );
-            return Ok(());
+            return None;
         }
+        Some(
+            expected
+                .difference(&self.mesh_ready_secondaries)
+                .cloned()
+                .collect(),
+        )
+    }
 
-        let deadline = tokio::time::Instant::now() + self.config.mesh_ready_timeout;
-        tracing::info!(
-            expected = expected.len(),
-            already_reported = self.mesh_ready_secondaries.len(),
-            timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
-            "waiting for peer-mesh formation across secondary fleet before \
-             promoting primary"
-        );
-
-        // Pre-operational keepalive cadence. The bootstrap region
-        // (`perform_initial_assignment` → here → `activate_local_primary`
-        // → `operational_loop`) can outlast the secondary's
-        // primary-silence deadline (`keepalive_interval *
-        // keepalive_miss_threshold`) while waiting for the mesh to form,
-        // yet the operational loop — the only place keepalives ticked —
-        // hasn't started. Tick the SAME emitter here so liveness is
-        // asserted across the whole pre-operational window. Same shape
-        // as `operational_loop`'s `heartbeat_tick`: the immediate first
-        // tick is skipped (secondaries may not have sent their own first
-        // keepalive yet), the cadence is `keepalive_interval`.
-        let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
-        // Skip (not Burst) missed ticks: collapse a suspend/resume backlog to a
-        // single catch-up tick rather than bursting one keepalive per missed
-        // interval. Same rationale as the operational loop's `heartbeat_tick`.
-        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        heartbeat_tick.tick().await;
-
-        loop {
-            if expected.is_subset(&self.mesh_ready_secondaries) {
-                tracing::info!(
-                    count = expected.len(),
-                    "all secondaries reported MeshReady; releasing PrimaryChanged announcement"
-                );
-                return Ok(());
-            }
-
-            tokio::select! {
-                msg = self.inbox.recv() => {
-                    match msg {
-                        // Pre-operational-loop site. See
-                        // `wait_for_connections` for the matching
-                        // rationale: thread `command_rx` through so an
-                        // `on_phase_end` callback fired by a
-                        // TaskComplete arriving during this wait can
-                        // queue `SpawnTasks` and have it applied
-                        // inline, refreshing `total_tasks` BEFORE
-                        // `operational_loop`'s entry-time exit check
-                        // sees the post-spawn ledger.
-                        Some(m) => {
-                            self.dispatch_message(m, command_rx).await?;
-                            // In-wait dispatch servicing: `TasksAdded`
-                            // signals queued DURING this wait would
-                            // otherwise park until the operational loop
-                            // starts (it hasn't). Two emitters fire here:
-                            //
-                            //   * a `SecondaryCapacity` landing mid-wait
-                            //     (`react_to_capacity_growth`) grows the
-                            //     roster with fresh idle slots;
-                            //   * a `MeshReady` landing mid-wait
-                            //     (`handle_mesh_ready`) confirms its member
-                            //     into the assignable set — the
-                            //     confirmation-edge wakeup.
-                            //
-                            // Servicing the bus inline runs the dispatch
-                            // recheck NOW, so ready work flows to every
-                            // member the readiness gate
-                            // (`member_mesh_confirmed`) admits, as each
-                            // confirmation arrives — instead of pooling
-                            // until after the wait. The `MeshReady` this
-                            // wait blocks on is NOT dispatch-driven: a
-                            // secondary reaches its operational loop by
-                            // consuming the setup trio (whose
-                            // `InitialAssignment` fan-out is ungated and
-                            // already ran above) and reports from there
-                            // (entry hook / watchdog / keepalive tick).
-                            // (rc-C's decoupling and the post-assignment
-                            // placement of this wait stay intact — the
-                            // recovery dispatches, it does not move the
-                            // wait.)
-                            self.drain_and_react_to_pending_worker_signals().await;
-                        }
-                        None => return Err("transport closed during wait_for_mesh_ready".into()),
-                    }
-                }
-                _ = heartbeat_tick.tick() => {
-                    // Reuse the heartbeat module's sole emitter so the
-                    // pre-operational window asserts liveness on the
-                    // same cadence the operational loop uses. No
-                    // spawned task, no second send path — one keepalive
-                    // origination point shared across the lifecycle.
-                    self.broadcast_primary_keepalive().await;
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    let missing: Vec<String> = expected
-                        .difference(&self.mesh_ready_secondaries)
-                        .cloned()
-                        .collect();
-                    tracing::warn!(
-                        missing = ?missing,
-                        reported = self.mesh_ready_secondaries.len(),
-                        expected = expected.len(),
-                        timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
-                        "mesh-ready timeout: some secondaries never reported \
-                         MeshReady; proceeding with the PrimaryChanged \
-                         announcement anyway. The newly-named primary may \
-                         briefly route into a partially-formed peer mesh until \
-                         those secondaries finish (or fail) their dials."
-                    );
-                    return Ok(());
-                }
-            }
-        }
+    /// The abort reason a ≥2-node fleet whose peer mesh never formed within
+    /// the background deadline surfaces — the SAME wording the old blocking
+    /// wait returned, so log-grepping ops scripts and the `RunAborted`
+    /// reason text are unchanged across the blocking→background relocation.
+    pub(crate) fn mesh_formation_abort_reason(&self, missing: &[String]) -> String {
+        let expected_len = self.expected_mesh_roster().len();
+        format!(
+            "peer mesh did not form within {:?}: {} of {} expected \
+             secondaries never reported a formed peer mesh ({:?}); \
+             the failover substrate is unavailable — aborting the run",
+            self.config.mesh_ready_timeout,
+            missing.len(),
+            expected_len,
+            missing,
+        )
     }
 
     /// Activate THIS node as the authoritative primary. The single

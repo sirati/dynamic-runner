@@ -348,7 +348,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 let local = primary.local_worker_id_in_secondary(worker_idx);
                 let expect_skip = local != 0;
                 assert_eq!(
-                    primary.should_skip_worker_for_dispatch(worker_idx, false, false),
+                    primary.should_skip_worker_for_dispatch(worker_idx, false),
                     expect_skip,
                     "worker idx {worker_idx} masking mismatch (expect_skip={expect_skip})"
                 );
@@ -399,7 +399,7 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
             );
             for worker_idx in 0..primary.workers.len() {
                 assert!(
-                    !primary.should_skip_worker_for_dispatch(worker_idx, false, false),
+                    !primary.should_skip_worker_for_dispatch(worker_idx, false),
                     "worker idx {worker_idx} must be dispatch-eligible \
                      outside the OOM bucket"
                 );

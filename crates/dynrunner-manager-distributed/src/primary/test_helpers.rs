@@ -725,19 +725,25 @@ pub(super) async fn fake_secondary_with_addrs(
         })
         .unwrap();
 
-    // Mirror the real secondary's behaviour: as soon as the
-    // peer-mesh is settled (or there are no peers — which is the
-    // default for the in-process tests), report MeshReady so the
-    // primary's `wait_for_mesh_ready` step doesn't have to time out
-    // before promoting primary. Fired pre-emptively here
-    // because the in-process fake doesn't model peer-dial latency.
+    // Mirror the real secondary's behaviour: report a FORMED-mesh
+    // MeshReady (`peer_count = 1`) so the primary's `wait_for_mesh_ready`
+    // step is satisfied without timing out. Fired pre-emptively here
+    // because the in-process fake doesn't model peer-dial latency; it
+    // models a fully-operational member whose peer mesh formed (the happy
+    // path these fleet tests exercise). `peer_count = 1` is the
+    // formed-mesh signal under the mesh-always abort contract — a
+    // ≥2-secondary fleet requires every member to report a formed mesh
+    // (else the run aborts), and a <2-node fleet skips the wait so the
+    // value is never consulted there. Tests that exercise the
+    // degraded/never-formed path construct `MeshReady { peer_count: 0 }`
+    // explicitly.
     outgoing_to_primary
         .send(DistributedMessage::MeshReady {
             target: Some(Destination::Primary),
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
-            peer_count: 0,
+            peer_count: 1,
         })
         .unwrap();
 

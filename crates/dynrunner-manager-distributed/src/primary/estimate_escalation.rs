@@ -297,7 +297,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// underlying predicate latches a one-shot mesh-gate WARN; the call is
     /// inside the same `&mut self` reaction, so this is borrow-clean.
     fn is_dispatch_gated_for_estimate_check(&mut self, worker_idx: usize) -> bool {
-        self.should_skip_worker_for_dispatch(worker_idx, false, false)
+        self.should_skip_worker_for_dispatch(worker_idx, false)
     }
 
     /// Run ONE dispatch recheck with EXACTLY ONE idle worker on
@@ -329,16 +329,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// after"; the event-driven primary restores instead).
     async fn dispatch_with_boosted_node_budget(&mut self, secondary: &str, node_cap: ResourceMap) {
         // The largest-capacity idle, assignable worker on the secondary.
-        // `should_skip_worker_for_dispatch` (proactive shape) excludes a
-        // worker the recheck would withhold anyway (unconfirmed mesh leg /
-        // backpressure / OOM mask / run-fail freeze), so the boost lands on
-        // a slot the recheck will actually consider.
+        // `should_skip_worker_for_dispatch` excludes a worker the recheck
+        // would withhold anyway (FSM-suspect / backpressure / OOM mask /
+        // run-fail freeze), so the boost lands on a slot the recheck will
+        // actually consider.
         let mut best: Option<(usize, u64)> = None;
         for idx in 0..self.workers.len() {
             if self.workers[idx].secondary_id != secondary || !self.workers[idx].is_idle() {
                 continue;
             }
-            if self.should_skip_worker_for_dispatch(idx, false, false) {
+            if self.should_skip_worker_for_dispatch(idx, false) {
                 continue;
             }
             let budget = self.workers[idx].reserved_budget_mem();

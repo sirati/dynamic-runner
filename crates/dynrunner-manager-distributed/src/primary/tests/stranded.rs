@@ -422,6 +422,15 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
                 .collect();
             let total = binaries.len();
 
+            // The fixture reports a DEGRADED mesh (peer_count=0) — the channel
+            // fixture wires only primary↔secondary legs, so each fake sees no
+            // siblings. Inject the FORMED-mesh report each WOULD emit on a real
+            // QUIC mesh so the run clears the mesh-formation deadline and
+            // reaches the assignment-time collapse path this test asserts (the
+            // fakes still die post-mesh-ready). See `inject_mesh_ready_for`.
+            for (id, _rx, tx) in &secondary_ends {
+                inject_mesh_ready_for(tx, std::slice::from_ref(id));
+            }
             for (id, rx, tx) in secondary_ends {
                 tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
                     id,
@@ -545,6 +554,13 @@ async fn strand_broadcasts_run_aborted_not_run_complete() {
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
                 .collect();
 
+            // The fixture reports a DEGRADED mesh (peer_count=0); inject the
+            // FORMED-mesh report each WOULD emit on a real QUIC mesh so the run
+            // clears the mesh-formation deadline and reaches the assignment-time
+            // collapse path this test asserts (see `inject_mesh_ready_for`).
+            for (id, _rx, tx) in &secondary_ends {
+                inject_mesh_ready_for(tx, std::slice::from_ref(id));
+            }
             for (id, rx, tx) in secondary_ends {
                 tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
                     id,
@@ -818,6 +834,14 @@ async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
             // longer exists, but the SAME regression is guarded: a stale
             // pre-discovery `total = 0` snapshot would still false-green
             // `stranded = 0 ⇒ RunComplete`.
+            // The fixture reports a DEGRADED mesh (peer_count=0); inject the
+            // FORMED-mesh report each WOULD emit on a real QUIC mesh so the run
+            // clears the mesh-formation deadline and reaches the op-loop where
+            // the post-discovery collapse this test asserts occurs (see
+            // `inject_mesh_ready_for`).
+            for (id, _rx, tx) in &secondary_ends {
+                inject_mesh_ready_for(tx, std::slice::from_ref(id));
+            }
             for (id, rx, tx) in secondary_ends {
                 tokio::task::spawn_local(fake_secondary_dies_after_discovery_dispatch(
                     id,

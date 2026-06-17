@@ -222,9 +222,12 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
             let config = PrimaryConfig {
                 num_secondaries: 2,
                 connect_timeout: Duration::from_secs(5),
-                // Short straggler window for the unconfirmed survivor:
-                // `wait_for_mesh_ready` proceeds without sec-1's report.
-                mesh_ready_timeout: Duration::from_secs(2),
+                // Bring-up is non-blocking: dispatch proceeds immediately and
+                // the run completes (fast fakes) before the background
+                // mesh-formation deadline could fire for the unconfirmed
+                // survivor sec-1. Generous deadline so the clean completion is
+                // the exit, not a mesh-formation abort.
+                mesh_ready_timeout: Duration::from_secs(30),
                 ..test_primary_config()
             };
             let (mut promoted, _mesh) = build_test_primary(
@@ -340,39 +343,57 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
                 "no inherited-pool task may ride the bring-up InitialAssignment \
                  batch at an operational member (the frame is dropped unhandled)"
             );
-            // Gate pin: the operational dispatch path consults the
-            // mesh-confirmation gate, so the unconfirmed survivor received
-            // NOTHING while the confirmed one carried the whole pool.
+            // DISPATCH ⊥ MESH (the decouple): the per-dispatch
+            // mesh-confirmation veto is GONE. A live survivor whose MeshReady
+            // re-announce was lost is still a normal worker host — operational
+            // dispatch rides the primary↔secondary leg and does NOT gate on the
+            // peer mesh, so BOTH survivors carry work and the two assignment
+            // counts partition the whole inherited pool. (The peer mesh is the
+            // failover substrate only; its formation is enforced by the
+            // op-loop's background deadline, not by withholding dispatch.)
+            let confirmed_n = confirmed_obs.task_assignments.load(Ordering::SeqCst);
+            let unconfirmed_n = unconfirmed_obs.task_assignments.load(Ordering::SeqCst);
             assert_eq!(
-                unconfirmed_obs.task_assignments.load(Ordering::SeqCst),
-                0,
-                "the mesh-confirmation gate must withhold proactive dispatch \
-                 from the survivor whose MeshReady re-announce was lost"
-            );
-            assert_eq!(
-                confirmed_obs.task_assignments.load(Ordering::SeqCst),
+                confirmed_n + unconfirmed_n,
                 N,
-                "the confirmed survivor carried the whole inherited pool via \
-                 the operational TaskAssignment path"
+                "the two survivors' operational TaskAssignment counts must \
+                 partition the whole inherited pool (dispatch decoupled from \
+                 the peer mesh); confirmed={confirmed_n} unconfirmed={unconfirmed_n}"
+            );
+            assert!(
+                unconfirmed_n >= 1,
+                "the survivor whose MeshReady re-announce was lost must STILL \
+                 receive operational work — the per-dispatch mesh gate is gone \
+                 (dispatch ⊥ peer mesh); got {unconfirmed_n}"
             );
         })
         .await;
 }
 
-/// Multi-secondary mesh-ready gate: the primary must NOT issue its
-/// bootstrap primary announcement (`ClusterMutation::PrimaryChanged
-/// { new = primary }`) until every connected secondary has reported
-/// `MeshReady`. Pre-fix the announcement fired ~750µs after cert-
-/// exchange completed; the newly-named primary then became
-/// authoritative against a still-forming peer mesh, and every
-/// pre-mesh-formation peer-broadcast routed into the void for up
-/// to 30s. This test pins the new ordering: the `PrimaryChanged`
-/// frame arrives at every fake secondary AFTER all of them have sent
-/// their own `MeshReady`. Implementation uses a per-secondary
-/// `tokio::sync::oneshot` to gate the MeshReady send so the test
-/// can drive the order deterministically.
+/// Non-blocking bring-up (the decouple): a multi-secondary primary
+/// announces `PrimaryChanged` + goes operational + dispatches IMMEDIATELY
+/// — it does NOT block on peer-mesh formation. The peer mesh is the
+/// failover substrate, enforced as a BACKGROUND deadline in the
+/// operational loop; it never gates dispatch or the announcement.
+///
+/// This test pins the NEW contract (it REPLACES the old
+/// `promote_primary_held_until_every_secondary_reports_mesh_ready`, which
+/// asserted the now-removed BLOCKING behavior — the primary holding its
+/// `PrimaryChanged` announcement until all secondaries reported MeshReady).
+///
+/// Setup: 3 fake secondaries that DEFER their `MeshReady` indefinitely
+/// (the triggers are never fired) but complete all assigned work. Each
+/// records whether it observed the primary's `PrimaryChanged` announcement
+/// BEFORE its own (never-sent) MeshReady. Under the new contract the
+/// primary dispatches the whole pool over the primary↔secondary leg and
+/// the run COMPLETES — proving dispatch did not block on mesh formation.
+/// Because the secondaries complete every task fast (well within the
+/// generous mesh-formation deadline), the operational loop exits on
+/// run-complete before the background deadline could fire, so there is no
+/// abort. (The genuine never-form → abort path is pinned separately by
+/// `mesh_never_forms_aborts_the_run_and_kills_workers`.)
 #[tokio::test(flavor = "current_thread")]
-async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
+async fn bringup_is_nonblocking_dispatch_proceeds_before_mesh_ready() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
@@ -380,13 +401,15 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             const N_SECONDARIES: u32 = 3;
             let (transport, secondary_ends) = setup_test(N_SECONDARIES);
 
-            // Per-secondary oneshot triggers. Test drives them in
-            // order to enforce: the primary doesn't announce
-            // PrimaryChanged until ALL three have flipped.
+            // Per-secondary oneshot triggers — DELIBERATELY never fired, so
+            // no secondary ever sends MeshReady. The run must STILL complete:
+            // dispatch is decoupled from mesh formation.
             let mut mesh_triggers: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
-            // Per-secondary observation: did this secondary see the
-            // primary's `PrimaryChanged` announcement BEFORE it was
-            // allowed to send MeshReady? (true = bug present)
+            // Per-secondary observation: did this secondary see the primary's
+            // `PrimaryChanged` announcement BEFORE its own MeshReady was sent?
+            // Under the NEW non-blocking contract this is EXPECTED to be true
+            // (the announcement is not gated on mesh formation) — the inverse
+            // of the old blocking assertion.
             let mut promote_seen_pre_mesh_observers: Vec<tokio::sync::oneshot::Receiver<bool>> =
                 Vec::new();
 
@@ -410,8 +433,8 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 num_secondaries: N_SECONDARIES,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
-                // Generous timeout so the test can fire triggers
-                // sequentially without racing the deadline.
+                // Generous mesh-formation deadline: the run completes long
+                // before it, so the background deadline never fires.
                 mesh_ready_timeout: std::time::Duration::from_secs(10),
                 ..test_primary_config()
             };
@@ -427,64 +450,150 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 .map(|i| make_binary(&format!("bin_{i}"), 100))
                 .collect();
 
-            // Drive the primary's coordination pipeline on a child
-            // task so the test body can release MeshReady triggers
-            // in sequence and observe the gate.
-            let primary_handle = tokio::task::spawn_local(async move {
-                let (deps, ops, ope) = noop_phase_args();
-                // Operational primary (mesh-always): seed the inherited ledger
-                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
-                // away, never running the dispatch loop this test asserts).
-                seed_operational_ledger(&mut primary, binaries, deps);
-                primary
-                    .run(
-                        SeedSource::PromotionSnapshot {
-                            kind: crate::process::BootstrapKind::Failover,
-                        },
-                        ops,
-                        ope,
-                    )
-                    .await
-                    .unwrap();
-                primary.completed_count()
-            });
+            let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
+            // The run must complete WITHOUT any MeshReady ever arriving — the
+            // bring-up is non-blocking. If dispatch still gated on mesh
+            // formation, this would hang until the deadline (then abort).
+            primary
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .expect("non-blocking bring-up: the run must complete without MeshReady");
+            assert_eq!(primary.completed_count(), 6, "all 6 tasks should complete");
 
-            // Release MeshReady triggers one at a time. Between
-            // each release, yield enough times for the primary's
-            // wait loop to observe the freshly-arrived
-            // MeshReady. The primary must NOT have advanced past
-            // `wait_for_mesh_ready` until all three triggers have
-            // fired — otherwise the per-secondary "did I see the
-            // PrimaryChanged announcement before being allowed to
-            // MeshReady?" observer would have reported true for some
-            // of them.
-            for trigger in mesh_triggers {
-                trigger.send(()).expect("trigger send");
-                // Yield repeatedly so the primary task gets a
-                // chance to dequeue & process the MeshReady. A
-                // single `yield_now` isn't enough on a
-                // current_thread runtime when the primary is
-                // mid-message, so spam it.
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
+            // The run completed WITHOUT any MeshReady ever arriving — that is
+            // the whole proof: dispatch + the `PrimaryChanged` announcement are
+            // NOT gated on mesh formation (had they been, this run would have
+            // hung to the 10s deadline and then aborted). The per-secondary
+            // ordering observers are vestigial under the new contract (they
+            // only fire on a MeshReady that never sends), so drop them along
+            // with the triggers — dropping the triggers unblocks the fakes'
+            // recv loops to exit cleanly.
+            drop(mesh_triggers);
+            drop(promote_seen_pre_mesh_observers);
+        })
+        .await;
+}
+
+/// The mesh-formation ABORT contract (the positive half of the decouple):
+/// a ≥2-node fleet whose peer mesh NEVER forms is a RUN-ABORT condition.
+/// Dispatch proceeds (decoupled), but the operational loop's BACKGROUND
+/// mesh-formation deadline fires when no secondary reports a FORMED mesh
+/// (`peer_count >= 1`) within `config.mesh_ready_timeout` of operational
+/// start — returning the abort `Err`, which `run_pipeline`'s #563-Seam-0
+/// chokepoint turns into the `RunAborted` verdict + worker teardown (the
+/// run-wrapper's cleanup-on-exit).
+///
+/// Setup: 2 fake secondaries that complete the handshake but NEVER report
+/// `MeshReady` (`fake_secondary_transport_only_no_meshready` — the channel
+/// fixture wires no secondary↔secondary leg, so no formed-mesh report can
+/// arrive), and they SWALLOW assigned work (no completions). So the run
+/// cannot complete on its own and the background mesh-formation deadline is
+/// the only exit. The short `mesh_ready_timeout` keeps the test fast; the
+/// tight keepalive cadence wakes the op-loop to poll the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn mesh_never_forms_aborts_the_run_and_kills_workers() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
+
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                // Short background mesh-formation deadline so the abort fires
+                // in test time; tight keepalive so the op-loop wakes to poll
+                // the deadline before it would otherwise idle.
+                mesh_ready_timeout: Duration::from_millis(400),
+                keepalive_interval: Duration::from_millis(50),
+                // Long fleet-dead window so the abort under test (mesh) is the
+                // exit, not a fleet-dead strand.
+                fleet_dead_timeout: Duration::from_secs(600),
+                ..test_primary_config()
+            };
+
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Two fakes that handshake but NEVER report MeshReady (no formed
+            // mesh ever) and swallow assigned work (no completions), so the
+            // ≥2-node mesh-formation requirement is never satisfied AND the run
+            // cannot complete on its own.
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary_transport_only_no_meshready(
+                    id,
+                    1,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
             }
 
-            // Collect the per-secondary observations. None of
-            // them should have seen the PrimaryChanged announcement
-            // before being allowed to send MeshReady.
-            for (i, obs) in promote_seen_pre_mesh_observers.into_iter().enumerate() {
-                let saw = obs.await.expect("observer recv");
-                assert!(
-                    !saw,
-                    "secondary {i} observed the PrimaryChanged announcement \
-                     BEFORE its own MeshReady was allowed to send — primary's \
-                     wait_for_mesh_ready step is not gating the announcement"
-                );
-            }
+            // A couple of tasks so the pool is non-empty: with no completions
+            // the run cannot finish, so the ONLY exit is the background
+            // mesh-formation deadline → abort.
+            let binaries: Vec<TaskInfo<TestId>> = (0..2)
+                .map(|i| make_binary(&format!("bin_{i}"), 100))
+                .collect();
 
-            let completed = primary_handle.await.unwrap();
-            assert_eq!(completed, 6, "all 6 tasks should complete");
+            let (deps, ops, ope) = noop_phase_args();
+            seed_operational_ledger(&mut primary, binaries, deps);
+            let outcome = primary
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
+                .await;
+
+            // ABORT, not clean complete: a ≥2-node fleet whose peer mesh never
+            // formed within the deadline must error out — with the TYPED
+            // `RunError::PeerMeshNotFormed`, NOT a generic `Other` (the latter
+            // is swallowed to exit 0 at the PyO3 boundary — the false-green the
+            // typed variant exists to prevent).
+            let err = outcome.expect_err(
+                "a >=2-node fleet whose peer mesh never forms must abort the run, \
+                 not complete",
+            );
+            assert!(
+                matches!(err, RunError::PeerMeshNotFormed { .. }),
+                "the abort must be the TYPED PeerMeshNotFormed variant (raises \
+                 non-zero, never the Other swallow); got: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("peer mesh did not form"),
+                "the abort must carry the mesh-formation reason; got: {err}"
+            );
+            // The authoritative RunAborted verdict was broadcast (the #563
+            // Seam-0 chokepoint) — observed via the local apply, the faithful
+            // record of what the fleet received (each secondary then tears
+            // down its workers on the terminal CRDT flag).
+            let state = primary.cluster_state_for_test();
+            assert!(
+                state.run_aborted().is_some(),
+                "the mesh-formation timeout must broadcast the RunAborted verdict"
+            );
+            assert!(
+                !state.run_complete(),
+                "a mesh-formation abort must NOT latch RunComplete"
+            );
         })
         .await;
 }
@@ -2064,34 +2173,32 @@ async fn promoted_inherited_failed_not_double_counted_against_pending() {
         .await;
 }
 
-/// (SMELL 1/2) The promoted primary's `wait_for_mesh_ready` expected set
-/// must be the LIVE PEER secondaries only — EXCLUDING self and the
-/// departed ex-primary. Pre-fix it read the raw `known_secondaries()`
-/// capacity roster, which carries (a) self (the promoted host is itself a
-/// worker-secondary) and (b) the just-scancelled ex-primary (whose
-/// `SecondaryCapacity` record survives `PeerRemoved`). Neither can ever
-/// emit a `MeshReady` this wait observes, so the wait burned the full
-/// `mesh_ready_timeout` (the ~2-min resume latency).
+/// (SMELL 1/2) The promoted primary's mesh-formation EXPECTED set
+/// (`expected_mesh_roster`, read by the background `mesh_formation_missing`
+/// deadline predicate) must be the LIVE PEER secondaries only — EXCLUDING
+/// self and the departed ex-primary. Pre-fix it read the raw
+/// `known_secondaries()` capacity roster, which carries (a) self (the
+/// promoted host is itself a worker-secondary) and (b) the just-scancelled
+/// ex-primary (whose `SecondaryCapacity` record survives `PeerRemoved`).
+/// Neither can ever emit a `MeshReady`, so a wrongly-inclusive set would
+/// keep the requirement permanently UNMET and abort the run on the
+/// background deadline even though the real mesh formed.
 ///
-/// Modelled like `setup_promote`'s BUG-C pin: an ABSURDLY HIGH
-/// `mesh_ready_timeout` (1 hour) with a tight outer `timeout(2s)`. With
-/// the fix the expected set is exactly the one LIVE PEER (which HAS
-/// reported `MeshReady`), so the fast-path subset check returns `Ok`
-/// instantly. With the bug, self + the dead ex-primary are in the
-/// expected set, never report, and the wait blocks the full hour — the
-/// outer timeout trips and the test fails.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+/// With the fix the expected set is exactly the one LIVE PEER (which HAS
+/// reported `MeshReady`), so `mesh_formation_missing()` returns `None`
+/// (requirement satisfied) — synchronously, no wait. With the bug, self +
+/// the dead ex-primary are in the expected set, never report, and the
+/// predicate returns `Some` forever.
+#[tokio::test(flavor = "current_thread")]
 async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
             // The promoted host IS `secondary-1` (a worker-secondary that
-            // won the election), with an absurd mesh-ready timeout so a
-            // wrongly-included id would block for an hour.
+            // won the election).
             let config = PrimaryConfig {
                 node_id: "secondary-1".into(),
-                mesh_ready_timeout: Duration::from_secs(3600),
                 ..PrimaryConfig::default()
             };
             let (mut primary, _mesh) = build_test_primary(
@@ -2170,21 +2277,17 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                 peer_count: 1,
             });
 
-            // With the fix the expected set = {secondary-2} ⊆ reported, so
-            // the fast path returns Ok immediately. The tight 2s timeout
-            // (virtual clock) would trip if self/secondary-0 were wrongly
-            // expected (1-hour block).
-            let waited = tokio::time::timeout(
-                Duration::from_secs(2),
-                primary.wait_for_mesh_ready(&mut None),
-            )
-            .await;
-            assert!(
-                matches!(waited, Ok(Ok(()))),
-                "wait_for_mesh_ready must return promptly: the expected set is \
-                 the live peer (which reported), NOT self or the departed \
-                 ex-primary (which never report). A timeout means the buggy \
-                 expected-set is back. got: {waited:?}"
+            // With the fix the expected set = {secondary-2} ⊆ reported, so the
+            // mesh-formation requirement is SATISFIED → `None`. If self or the
+            // departed secondary-0 were wrongly expected, they never report and
+            // the predicate would return `Some([...])`.
+            assert_eq!(
+                primary.mesh_formation_missing(),
+                None,
+                "mesh_formation_missing must read the live-peer expected set \
+                 (secondary-2, which reported), NOT self or the departed \
+                 ex-primary (which never report). A non-None result means the \
+                 buggy expected-set is back."
             );
         })
         .await;

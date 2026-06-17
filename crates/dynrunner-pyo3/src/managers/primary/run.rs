@@ -905,6 +905,14 @@ impl PyPrimaryCoordinator {
                                 // (run_20260611_131736).
                                 fatal_policy_exit = Some(e);
                             }
+                            e @ RunError::PeerMeshNotFormed { .. } => {
+                                // Mesh-formation abort: a >=2-node fleet whose
+                                // failover peer mesh never formed within the
+                                // deadline. RAISE — never the `Other` swallow's
+                                // false rc=0 (same false-green class as
+                                // `BringUpFailed`).
+                                fatal_policy_exit = Some(e);
+                            }
                             e @ (RunError::AbortedByClusterVerdict { .. }
                             | RunError::Deposed { .. }) => {
                                 // Run-authority terminals (zombie split-brain

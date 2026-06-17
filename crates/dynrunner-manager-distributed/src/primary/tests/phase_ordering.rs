@@ -369,11 +369,13 @@ async fn run_producer_zero_dispatch_scenario(
     let mut outgoing = HashMap::new();
     let mut sec_handles = Vec::new();
 
+    let mut sec_ids = Vec::new();
     for i in 0..2u32 {
         let sec_id = format!("sec-{i}");
         let (pri_to_sec_tx, sec_to_pri_rx, handle) =
             spawn_real_secondary(sec_id.clone(), 1, max_res.clone());
-        outgoing.insert(sec_id, pri_to_sec_tx);
+        outgoing.insert(sec_id.clone(), pri_to_sec_tx);
+        sec_ids.push(sec_id);
         sec_handles.push(handle);
 
         let tx = incoming_tx.clone();
@@ -386,6 +388,12 @@ async fn run_producer_zero_dispatch_scenario(
             }
         });
     }
+    // Model the production formed peer mesh: the channel fixture wires only
+    // primary↔secondary legs, so the ≥2 real secondaries would report a
+    // degraded mesh and abort the run on the mesh-formation deadline. Inject
+    // the FORMED-mesh report each WOULD emit on a real QUIC mesh (see
+    // `inject_mesh_ready_for`).
+    inject_mesh_ready_for(&incoming_tx, &sec_ids);
     drop(incoming_tx);
 
     let transport = ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
@@ -946,11 +954,13 @@ async fn run_phase_ordering_scenario(
     let mut outgoing = HashMap::new();
     let mut sec_handles = Vec::new();
 
+    let mut sec_ids = Vec::new();
     for i in 0..2u32 {
         let sec_id = format!("sec-{i}");
         let (pri_to_sec_tx, sec_to_pri_rx, handle) =
             spawn_real_secondary_slow(sec_id.clone(), 1, max_res.clone(), slow_markers.clone());
-        outgoing.insert(sec_id, pri_to_sec_tx);
+        outgoing.insert(sec_id.clone(), pri_to_sec_tx);
+        sec_ids.push(sec_id);
         sec_handles.push(handle);
 
         let tx = incoming_tx.clone();
@@ -963,6 +973,12 @@ async fn run_phase_ordering_scenario(
             }
         });
     }
+    // Model the production formed peer mesh: the channel fixture wires only
+    // primary↔secondary legs, so the ≥2 real secondaries would report a
+    // degraded mesh and abort the run on the mesh-formation deadline. Inject
+    // the FORMED-mesh report each WOULD emit on a real QUIC mesh (see
+    // `inject_mesh_ready_for`).
+    inject_mesh_ready_for(&incoming_tx, &sec_ids);
     drop(incoming_tx);
 
     let transport = ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
@@ -1201,6 +1217,7 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             let mut outgoing = HashMap::new();
             let mut sec_handles = Vec::new();
 
+            let mut sec_ids = Vec::new();
             for i in 0..2u32 {
                 let sec_id = format!("sec-{i}");
                 let (pri_to_sec_tx, sec_to_pri_rx, handle) = spawn_real_secondary_slow(
@@ -1209,7 +1226,8 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
                     max_res.clone(),
                     vec![("/tmp/work_slow".to_string(), Duration::from_millis(300))],
                 );
-                outgoing.insert(sec_id, pri_to_sec_tx);
+                outgoing.insert(sec_id.clone(), pri_to_sec_tx);
+                sec_ids.push(sec_id);
                 sec_handles.push(handle);
 
                 let tx = incoming_tx.clone();
@@ -1222,6 +1240,12 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
                     }
                 });
             }
+            // Model the production formed peer mesh: the channel fixture wires
+            // only primary↔secondary legs, so the ≥2 real secondaries would
+            // report a degraded mesh and abort the run on the mesh-formation
+            // deadline. Inject the FORMED-mesh report each WOULD emit on a real
+            // QUIC mesh (see `inject_mesh_ready_for`).
+            inject_mesh_ready_for(&incoming_tx, &sec_ids);
             drop(incoming_tx);
 
             let transport =
