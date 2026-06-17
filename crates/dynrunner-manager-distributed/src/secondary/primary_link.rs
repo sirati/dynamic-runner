@@ -10,7 +10,7 @@
 //! single source of "who is primary") and resolved at the egress edge
 //! via `send_to(Destination::Primary, ..)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use dynrunner_core::WorkerId;
@@ -98,6 +98,22 @@ pub(super) struct PrimaryLink {
     /// reason.
     failure_window: Duration,
 
+    /// Failover slot-reconfirmation window. `Some(confirmed)` while a
+    /// just-applied `PrimaryChanged` leaves the (possibly newly-promoted)
+    /// primary holding stale `InFlight` occupancy guesses for inherited
+    /// slots: every idle worker must re-issue ITS OWN `TaskRequest` so the
+    /// primary's `handle_task_request` reconciles each inherited slot
+    /// against ground truth (request.rs: `reconcile_inherited_slot`). The
+    /// set accumulates the workers that have re-confirmed (issued a request
+    /// while the window was open). `None` in STEADY STATE — there is no
+    /// inherited-slot debt, so the live primary's event-driven push
+    /// (`dispatch_to_idle_workers` on `TasksAdded` / a completion) assigns
+    /// every idle worker without any periodic re-poll. The window auto-
+    /// closes (→ `None`) once every currently-idle worker is in the set
+    /// (every inherited slot this node could reconcile has been
+    /// reconfirmed).
+    failover_reconfirm: Option<HashSet<WorkerId>>,
+
     /// When the breach was last REPORTED to a caller (the `true` return
     /// of [`Self::record_recv_failure`]). `None` while no breach has
     /// been reported this failure window. The probe-breach accounting
@@ -129,6 +145,7 @@ impl PrimaryLink {
             failure_count: 0,
             failure_threshold,
             failure_window,
+            failover_reconfirm: None,
             last_breach_report: None,
         }
     }
@@ -159,6 +176,13 @@ impl PrimaryLink {
         let next = (prev * 2).min(MAX_BACKOFF);
         self.last_request_time.insert(worker_id, now);
         self.request_backoff.insert(worker_id, next);
+        // A request issued during an open reconfirmation window IS this
+        // worker's ground-truth confirmation to the (possibly newly-
+        // promoted) primary: record it so the window can auto-close once
+        // every idle worker has reconfirmed.
+        if let Some(confirmed) = self.failover_reconfirm.as_mut() {
+            confirmed.insert(worker_id);
+        }
     }
 
     /// Reset rate limiting for a worker after a successful task
@@ -180,6 +204,46 @@ impl PrimaryLink {
     pub(super) fn reset_all_backoff(&mut self) {
         self.request_backoff.clear();
         self.last_request_time.clear();
+    }
+
+    /// Open a failover slot-reconfirmation window. Called on a genuinely
+    /// applied `PrimaryChanged`: the new primary holds stale `InFlight`
+    /// guesses for inherited slots, so the periodic re-poll
+    /// ([`Self::periodic_repoll_pending`]) is re-enabled until every idle
+    /// worker has re-issued its `TaskRequest` (the per-worker ground-truth
+    /// reconciliation). Idempotent — a fresh window restarts the
+    /// confirmed-set so a SECOND failover before the first settled
+    /// re-confirms cleanly.
+    pub(super) fn arm_failover_reconfirm(&mut self) {
+        self.failover_reconfirm = Some(HashSet::new());
+    }
+
+    /// Failover-only gate for the SECONDARY's PERIODIC keepalive re-poll.
+    /// Returns `true` iff a reconfirmation window is open AND at least one
+    /// of the currently-idle workers (`idle_worker_ids`) has not yet
+    /// re-issued its `TaskRequest` since the window opened — i.e. an
+    /// inherited slot this node can still reconcile is outstanding. In
+    /// STEADY STATE (no window) this is always `false`: the live primary's
+    /// event-driven push assigns idle workers, so the keepalive re-poll is
+    /// redundant and stays silent. The window AUTO-CLOSES (→ `None`) the
+    /// moment every idle worker is confirmed, so a single drained run never
+    /// re-enables polling once failover settled.
+    pub(super) fn periodic_repoll_pending(
+        &mut self,
+        idle_worker_ids: impl IntoIterator<Item = WorkerId>,
+    ) -> bool {
+        let Some(confirmed) = self.failover_reconfirm.as_ref() else {
+            return false;
+        };
+        let any_unconfirmed = idle_worker_ids
+            .into_iter()
+            .any(|wid| !confirmed.contains(&wid));
+        if !any_unconfirmed {
+            // Every idle worker has reconfirmed — the inherited-slot debt
+            // this node could settle is cleared; close the window.
+            self.failover_reconfirm = None;
+        }
+        any_unconfirmed
     }
 
     /// Record one observation of "the primary's transport recv()
@@ -395,6 +459,72 @@ mod tests {
         assert!(
             link.record_recv_failure(),
             "a fresh breach after recovery reports immediately"
+        );
+    }
+
+    /// STEADY STATE: with no reconfirmation window armed, the periodic
+    /// re-poll gate is ALWAYS closed — the live primary's event-driven
+    /// push assigns idle workers, so the keepalive re-poll is redundant
+    /// and stays silent regardless of how many workers are idle.
+    #[test]
+    fn periodic_repoll_silent_without_a_failover_window() {
+        let mut link = PrimaryLink::with_failover_threshold(5, Duration::from_secs(30));
+        assert!(
+            !link.periodic_repoll_pending([0, 1, 2]),
+            "no window armed → periodic re-poll never fires in steady state"
+        );
+        // Idempotent: still closed.
+        assert!(!link.periodic_repoll_pending([0, 1, 2]));
+    }
+
+    /// FAILOVER: once `arm_failover_reconfirm` opens a window, the periodic
+    /// re-poll fires until EVERY idle worker has re-issued its request
+    /// (`note_request_sent` records the confirmation), then auto-closes —
+    /// and stays closed thereafter (steady state restored).
+    #[test]
+    fn failover_window_repolls_until_every_idle_worker_reconfirms() {
+        let mut link = PrimaryLink::with_failover_threshold(5, Duration::from_secs(30));
+        link.arm_failover_reconfirm();
+        // Three idle workers, none reconfirmed yet → pending.
+        assert!(
+            link.periodic_repoll_pending([0, 1, 2]),
+            "armed window with unconfirmed idle workers must re-poll"
+        );
+        // Two of them issue their reconfirming request.
+        link.note_request_sent(0);
+        link.note_request_sent(1);
+        assert!(
+            link.periodic_repoll_pending([0, 1, 2]),
+            "still pending while worker 2 has not reconfirmed"
+        );
+        // The last one reconfirms → the gate reports false on the next
+        // check AND closes the window.
+        link.note_request_sent(2);
+        assert!(
+            !link.periodic_repoll_pending([0, 1, 2]),
+            "every idle worker reconfirmed → window closes"
+        );
+        // Window closed: steady-state silence even if a worker frees later.
+        assert!(
+            !link.periodic_repoll_pending([0, 1, 2, 3]),
+            "after the window auto-closed the periodic re-poll stays silent"
+        );
+    }
+
+    /// A SECOND failover before the first settled re-arms cleanly: a fresh
+    /// window discards the prior confirmed-set, so the same workers must
+    /// reconfirm against the new primary.
+    #[test]
+    fn re_arming_resets_the_confirmed_set() {
+        let mut link = PrimaryLink::with_failover_threshold(5, Duration::from_secs(30));
+        link.arm_failover_reconfirm();
+        link.note_request_sent(0);
+        assert!(link.periodic_repoll_pending([0, 1]));
+        // Second PrimaryChanged before the first window settled.
+        link.arm_failover_reconfirm();
+        assert!(
+            link.periodic_repoll_pending([0]),
+            "a fresh window makes even a previously-confirmed worker reconfirm"
         );
     }
 

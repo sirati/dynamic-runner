@@ -1500,4 +1500,38 @@ where
             }
         }
     }
+
+    /// FAILOVER-ONLY periodic keepalive re-poll. The live-primary push
+    /// (`dispatch_to_idle_workers`, fired event-driven on every task-state
+    /// change) assigns idle workers fleet-wide WITHOUT any pull, so the
+    /// periodic re-poll is redundant in STEADY STATE and would only re-emit
+    /// the unassignable-`TaskRequest` churn the primary drops. Its sole
+    /// genuine role is the FAILOVER ground-truth gap: a just-applied
+    /// `PrimaryChanged` leaves the (possibly newly-promoted) primary
+    /// holding stale `InFlight` guesses for inherited slots, which only the
+    /// worker's OWN `TaskRequest` reconciles. So this driver fires ONLY
+    /// while a reconfirmation window is open
+    /// (`PrimaryLink::periodic_repoll_pending`, armed on `PrimaryChanged`,
+    /// auto-closed once every idle worker reconfirms). The IMMEDIATE,
+    /// event-driven re-polls (the post-`PrimaryChanged` repoll in
+    /// `react_to_primary_identity_change`, the post-task re-poll in the
+    /// worker-event arm) are untouched — they serve failover/own-worker
+    /// management and run regardless of this gate.
+    pub(super) async fn repoll_idle_workers_periodic(&mut self) {
+        let n = self.op_mut().pool.workers.len();
+        let idle: Vec<WorkerId> = (0..n)
+            .filter(|&wid| self.op_mut().pool.workers[wid].is_idle_state())
+            .map(|wid| wid as WorkerId)
+            .collect();
+        if !self
+            .op_mut()
+            .primary_link
+            .periodic_repoll_pending(idle.iter().copied())
+        {
+            return;
+        }
+        for wid in idle {
+            let _ = self.request_task_for_worker(wid).await;
+        }
+    }
 }

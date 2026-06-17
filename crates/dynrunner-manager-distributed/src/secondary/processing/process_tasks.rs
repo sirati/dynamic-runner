@@ -686,31 +686,30 @@ where
                     // failure window has elapsed. If yes, arm
                     // failover the same way the recv-arm path does.
                     self.check_primary_link_threshold();
-                    // Re-poll any worker that's been idle since its
-                    // last unsatisfied request. The secondary holds no
-                    // retry machine: per-phase retry re-injection is the
-                    // AUTHORITY's concern (the live primary, or this
-                    // node's same-peer primary once promoted), driven by
-                    // its phase-drain cascade — so this keepalive arm
-                    // needs no retry-pass call, only the safety-net
-                    // idle-worker re-poll.
-                    // Re-poll any worker that's been idle since its
-                    // last unsatisfied request. The per-worker rate
-                    // limit (in `primary_link`, doubles on each
-                    // empty-response, capped at 60s) keeps this
-                    // cheap; without the periodic call, an idle
-                    // worker that got "no work" once sits forever
-                    // because the only other re-poll trigger is its
-                    // OWN task completion (processing.rs:193) and an
-                    // idle worker by definition has no task to
-                    // complete. Most-load case: regular primary fires
-                    // `dispatch_to_idle_workers` after every other
-                    // worker's TaskComplete to push assignments,
-                    // which mostly shadows this — but the
-                    // primary path doesn't track per-peer worker
-                    // idleness, so the periodic re-poll is the
-                    // failover-safe wakeup.
-                    self.repoll_idle_workers().await;
+                    // FAILOVER-ONLY periodic re-poll. The secondary holds
+                    // no retry machine: per-phase retry re-injection is the
+                    // AUTHORITY's concern (the live primary, or this node's
+                    // same-peer primary once promoted), driven by its
+                    // phase-drain cascade — so this keepalive arm needs no
+                    // retry-pass call.
+                    //
+                    // In STEADY STATE the periodic re-poll is REDUNDANT: the
+                    // live primary's event-driven push
+                    // (`dispatch_to_idle_workers`, fired on every
+                    // task-state change — completion, unblock-cascade,
+                    // requeue, spawn) iterates EVERY idle worker fleet-wide
+                    // and assigns what fits, with no pull. A periodic
+                    // re-poll there only re-emits the unassignable-
+                    // `TaskRequest` churn the primary drops. So
+                    // `repoll_idle_workers_periodic` self-gates on the
+                    // FAILOVER reconfirmation window
+                    // (`PrimaryLink::periodic_repoll_pending`): it fires
+                    // only while a just-applied `PrimaryChanged` leaves the
+                    // (possibly newly-promoted) primary holding stale
+                    // `InFlight` guesses for inherited slots — the one case
+                    // the worker's OWN `TaskRequest` must reconcile — and
+                    // goes silent once every idle worker has reconfirmed.
+                    self.repoll_idle_workers_periodic().await;
                     // #556 — drive the secondary mesh-consensus FSM on
                     // the keepalive cadence (~1s, same as this arm)
                     // so per-target probe deadlines fire on time even
