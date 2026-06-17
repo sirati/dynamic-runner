@@ -937,6 +937,37 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// `spawn_container`, retrying on `ETXTBSY` ("Text file busy").
+    ///
+    /// Test-harness hygiene only (default PARALLEL execution): the
+    /// fake-podman SCRIPT this test just wrote is exec'd as the container
+    /// runtime. An UNRELATED concurrent test's `Command` `fork` can duplicate
+    /// the still-open WRITE fd of its own freshly-written fake-podman into its
+    /// child; until that child `exec`s, the kernel sees a writer open on a
+    /// file being exec'd and returns `ETXTBSY`. The condition is transient —
+    /// it clears the instant the foreign child execs — and cannot arise in
+    /// production (no concurrent process writes the podman binary). A bounded
+    /// retry waits it out without masking any real spawn failure (a genuine
+    /// bad path/permission yields a different, non-retried errno).
+    fn spawn_container_retry_etxtbsy(
+        podman: &str,
+        argv: &[String],
+        layout: &Layout,
+    ) -> std::io::Result<tokio::process::Child> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match spawn_container(podman, argv, layout) {
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+
     fn test_layout(root: &std::path::Path) -> Layout {
         let podman_run = root.join("run");
         std::fs::create_dir_all(&podman_run).unwrap();
@@ -977,7 +1008,7 @@ mod tests {
         );
         let layout = test_layout(tmp.path());
         let (mut monitor, _inject) = signals::SignalMonitor::for_test();
-        let child = spawn_container(&podman, &[], &layout).unwrap();
+        let child = spawn_container_retry_etxtbsy(&podman, &[], &layout).unwrap();
         let code = tokio::time::timeout(
             Duration::from_secs(15),
             run_to_completion(child, &mut monitor, &podman, &layout),
@@ -1000,7 +1031,7 @@ mod tests {
         let podman = write_fake_podman(tmp.path(), "exit 37");
         let layout = test_layout(tmp.path());
         let (mut monitor, _inject) = signals::SignalMonitor::for_test();
-        let child = spawn_container(&podman, &[], &layout).unwrap();
+        let child = spawn_container_retry_etxtbsy(&podman, &[], &layout).unwrap();
         let code = tokio::time::timeout(
             Duration::from_secs(15),
             run_to_completion(child, &mut monitor, &podman, &layout),
@@ -1042,7 +1073,7 @@ mod tests {
         let podman = write_fake_podman(tmp.path(), &body);
         let layout = test_layout(tmp.path());
         let (mut monitor, inject) = signals::SignalMonitor::for_test();
-        let child = spawn_container(&podman, &[], &layout).unwrap();
+        let child = spawn_container_retry_etxtbsy(&podman, &[], &layout).unwrap();
 
         let sigterm = nix::sys::signal::Signal::SIGTERM as i32;
         inject

@@ -107,6 +107,40 @@ pub fn is_live(scratch_root: &Path) -> bool {
     }
 }
 
+/// Test-only: poll until `scratch_root` probes DEAD, up to a short
+/// deadline. Shared by the `scratch_lock` and `preflight` test modules —
+/// both assert a just-released orphan lock probes dead under the default
+/// PARALLEL harness, where the assertion races a transient false-positive.
+///
+/// `flock`(2) locks live on the open file description, which `fork`(2)
+/// duplicates into children; the dup keeps the lock alive until the child
+/// closes it (at `execve`, via the default `O_CLOEXEC`). So after a guard is
+/// dropped, an UNRELATED concurrent test's `Command` fork — taken in the
+/// fork→exec window while this fd was still open — can transiently pin the
+/// OFD and make a just-released lock probe LIVE for a few microseconds, even
+/// though THIS process no longer holds any fd to it. Once those pre-existing
+/// children exec, the lock is dead and stays dead (no open fd remains to
+/// re-duplicate, so no later fork can resurrect it).
+///
+/// This races ONLY the transient false-POSITIVE: a genuinely-held lock never
+/// probes dead (its owner holds the fd for the whole test), so the poll
+/// cannot mask a real regression — it only waits out cross-test fork
+/// interference. Returning `true` means the root has settled DEAD and will
+/// stay dead, so callers may then run a one-shot sweep against it safely.
+#[cfg(test)]
+pub(crate) fn wait_until_dead(scratch_root: &Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !is_live(scratch_root) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,8 +164,12 @@ mod tests {
             "a held wrapper.lock must probe as live"
         );
         drop(guard);
+        // `wait_until_dead` (not a bare `is_live`): a concurrent test's
+        // fork→exec window can transiently keep the just-dropped OFD alive
+        // (see the helper). A genuinely-held lock never probes dead, so this
+        // only waits out cross-test fork interference, never masks a bug.
         assert!(
-            !is_live(tmp.path()),
+            super::wait_until_dead(tmp.path()),
             "a released wrapper.lock must probe as dead (orphan)"
         );
     }

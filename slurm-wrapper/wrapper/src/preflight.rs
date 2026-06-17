@@ -476,6 +476,39 @@ mod tests {
         root
     }
 
+    /// Run a fake-podman-driven sweep/run `op`, retrying (with a FRESH
+    /// `calls_log` each attempt) until `done(&calls)` holds or a short
+    /// deadline elapses; returns the final `calls` log.
+    ///
+    /// Test-harness hygiene only (default PARALLEL execution): the sweep
+    /// `exec`s the fake-podman SCRIPT this test wrote. An UNRELATED concurrent
+    /// test's `Command` `fork` can duplicate the still-open WRITE fd of its
+    /// own freshly-written fake-podman into its child; until that child
+    /// `exec`s, exec'ing that inode fails `ETXTBSY` ("Text file busy"). The
+    /// sweep SWALLOWS podman errors by design, so an ETXTBSY'd scoped call
+    /// simply logs nothing and a positive "the orphan was swept" assertion
+    /// transiently fails. The condition is transient (clears when the foreign
+    /// child execs) and CANNOT arise in production (no concurrent process
+    /// writes the podman binary), so retrying the sweep only waits it out —
+    /// it never masks a real regression (a genuinely-skipped root never logs
+    /// the call no matter how many times the sweep runs).
+    fn run_until_calls<F>(op: F, calls_log: &Path, done: impl Fn(&str) -> bool) -> String
+    where
+        F: Fn(),
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let _ = std::fs::remove_file(calls_log);
+            let _ = std::fs::remove_file(env_log_path(calls_log));
+            op();
+            let calls = std::fs::read_to_string(calls_log).unwrap_or_default();
+            if done(&calls) || std::time::Instant::now() >= deadline {
+                return calls;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// An `own_scratch_root` that is NOT one of the scanned roots — for
     /// the legacy tests that exercise sibling/orphan handling and do not
     /// involve the wrapper's own root. A path that does not exist
@@ -510,10 +543,37 @@ mod tests {
         let orphan = make_scratch_root(&scan, "asm-dead5678");
         drop(crate::scratch_lock::acquire(&orphan).expect("acquire+release orphan lock"));
 
-        let outcome =
-            sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
+        // Run the sweep, retrying (fresh calls log per attempt) until the dead
+        // orphan is acted upon. TWO transient parallel-harness interferences
+        // can spare the orphan on any single pass; both are one-sided and
+        // cannot mask a real regression (a genuinely-live root is never
+        // falsely reported dead — a fork only ADDS a lock holder — and a
+        // genuinely-skipped root never logs the call):
+        //   - `is_live`'s probe momentarily `flock`s the DEAD orphan; a
+        //     concurrent test's `fork` can dup that fd and pin the OFD until
+        //     it execs, so the probe spuriously reports the orphan LIVE.
+        //   - the swallowed scoped `exec` of the fake-podman script can
+        //     `ETXTBSY` (see `run_until_calls`), logging nothing.
+        // The live-untouched assertion below is checked against the clean
+        // single pass `run_until_calls` returns.
+        let orphan_storage = orphan.join("storage").to_string_lossy().into_owned();
+        let outcome = std::cell::Cell::new(SweepOutcome::default());
+        let calls = run_until_calls(
+            || {
+                outcome.set(sweep_scratch_roots(
+                    &podman.to_string_lossy(),
+                    &scan,
+                    Path::new(NO_OWN_ROOT),
+                ));
+            },
+            &calls_log,
+            |c| {
+                c.lines()
+                    .any(|l| l.contains(&orphan_storage) && l.contains(" stop "))
+            },
+        );
+        let outcome = outcome.get();
 
-        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
         let live_storage = live.join("storage");
         assert!(
             !calls.contains(&live_storage.to_string_lossy().into_owned()),
@@ -521,7 +581,6 @@ mod tests {
              (gutting it kills the running secondary's exec context); \
              podman calls:\n{calls}",
         );
-        let orphan_storage = orphan.join("storage").to_string_lossy().into_owned();
         let orphan_lines: Vec<&str> = calls
             .lines()
             .filter(|l| l.contains(&orphan_storage))
@@ -655,12 +714,26 @@ mod tests {
         // A markerless orphan root: swept (ps + stop + rm), so every
         // scoped helper runs against it.
         let orphan = make_scratch_root(&scan, "asm-tokenizer-cafe1234");
+        let want_runroot = orphan.join("run").to_string_lossy().into_owned();
 
-        sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
+        // Retry until the orphan is actually swept (a scoped call carrying
+        // its runroot is logged): the fake-podman exec can transiently
+        // ETXTBSY under the parallel harness (see `run_until_calls`).
+        run_until_calls(
+            || {
+                sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
+            },
+            &calls_log,
+            |_| {
+                std::fs::read_to_string(env_log_path(&calls_log))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.contains(&want_runroot))
+            },
+        );
 
         // The fake podman logged `<XDG_RUNTIME_DIR>\t<argv>` per call.
         let env_log = std::fs::read_to_string(env_log_path(&calls_log)).unwrap_or_default();
-        let want_runroot = orphan.join("run").to_string_lossy().into_owned();
 
         // Every SCOPED call (one carrying `--runroot <orphan>/run`) must
         // have run with `XDG_RUNTIME_DIR == <orphan>/run`.
@@ -698,10 +771,14 @@ mod tests {
 
         let orphan = make_scratch_root(&scan, "asm-prefix9abc");
 
-        sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
-
-        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
         let storage = orphan.join("storage").to_string_lossy().into_owned();
+        let calls = run_until_calls(
+            || {
+                sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
+            },
+            &calls_log,
+            |c| c.lines().any(|l| l.contains(&storage) && l.contains(" rm ")),
+        );
         assert!(
             calls.lines().any(|l| l.contains(&storage) && l.contains(" rm ")),
             "a markerless (pre-fix / true-orphan) root must still be swept; \
@@ -990,9 +1067,17 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
 
-        run_in(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
-
-        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        // Retry until the default-storage teardown is logged: the fake-podman
+        // exec can transiently ETXTBSY under the parallel harness (see
+        // `run_until_calls`). With no live sibling the sweep is deterministic,
+        // so a clean attempt always logs it.
+        let calls = run_until_calls(
+            || {
+                run_in(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
+            },
+            &calls_log,
+            |c| c.lines().any(is_default_storage_teardown),
+        );
         assert!(
             calls.lines().any(is_default_storage_teardown),
             "with no live sibling the default-storage sweep must still run \
