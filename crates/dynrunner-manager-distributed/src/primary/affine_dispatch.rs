@@ -86,6 +86,34 @@ enum AffineGateOutcome {
     Unsatisfiable,
 }
 
+/// Whether a WORK unit may be APPENDED to a per-secondary affine queue right
+/// now — the SINGLE placement predicate shared by the live placement trigger
+/// ([`PrimaryCoordinator::place_dependency_satisfied_affine_tasks`]) and the
+/// failover rebuild ([`PrimaryCoordinator::affine_rebuild_placements`]). The
+/// two paths placed work asymmetrically before this verdict existed (the live
+/// path gated on satisfiability + ready-in-bucket; the rebuild placed EVERY
+/// affine-dep work), so a promoted primary dispatched an import before its own
+/// upstream completed → the import ran with missing inputs → spurious cascade.
+/// Folding both callers through this one verdict makes the two paths unable to
+/// drift again. Computed by [`PrimaryCoordinator::affine_work_placeability`].
+enum AffinePlaceability {
+    /// Every affine prereq is ready-in-bucket AND the unit is satisfiable on
+    /// some roster secondary — append the whole unit to its chosen queue.
+    Placeable,
+    /// The unit is `Unsatisfiable` (its affine import is globally-failed, the
+    /// EXACT #648 `failed_tasks` predicate) — never placeable. The live path
+    /// collects it for terminalization; the rebuild simply does not place it
+    /// (the live placement trigger terminalizes it on its next pass, and the
+    /// readiness gate's `Unsatisfiable` arm covers it even if it were placed).
+    Doomed,
+    /// Satisfiable but a prereq is not yet ready-in-bucket (still blocked on
+    /// its own non-affine upstream) — DEFER. A later `TasksAdded` re-evaluates
+    /// it once the import becomes ready; the per-secondary blocked set is
+    /// re-derived lazily by the readiness gate, so a not-placed-now unit is
+    /// correctly handled when it becomes ready.
+    NotReady,
+}
+
 /// The outcome of [`PrimaryCoordinator::dispatch_affine_unit`], reported to the
 /// CALLER so the caller — not the shared dispatch seam — owns recovery. The
 /// dispatch seam knows only "did this assignment commit / was it skipped /
@@ -171,6 +199,59 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// Returns the doomed `(work_hash, phase)` set for the caller to terminalize;
     /// empty when every ready candidate was satisfiable (the common path).
+    /// The set of affine-prereq hashes the pool has marked READY (a
+    /// `SecondaryAffine` task sitting in a bucket = its own non-affine deps are
+    /// met). `pool().iter()` yields only queued (bucket) items, never blocked
+    /// ones, so a still-blocked affine prereq is correctly NOT ready. The SOLE
+    /// owner of the ready-in-bucket computation — both the live placement
+    /// trigger and the failover rebuild read THIS set so neither can drift to a
+    /// different notion of "import ready".
+    fn affine_ready_in_bucket_imports(&self) -> HashSet<String> {
+        self.pool()
+            .iter()
+            .filter(|t| t.kind.is_secondary_affine())
+            .map(compute_task_hash)
+            .collect()
+    }
+
+    /// THE single placement predicate (see [`AffinePlaceability`]): may this
+    /// WORK unit be appended to a per-secondary affine queue now? Shared by the
+    /// live placement trigger and the failover rebuild so the two paths cannot
+    /// drift. `ready_affine` is the caller-supplied ready-in-bucket set (built
+    /// once via [`Self::affine_ready_in_bucket_imports`] and reused across all
+    /// candidates in a pass).
+    ///
+    /// DOOMED takes precedence over readiness: a unit whose import is
+    /// globally-failed is `Doomed` regardless of prereq-readiness — its prereq
+    /// can NEVER become ready-in-bucket, so the `all_ready` gate alone would
+    /// never see it; the doomed unit must be diverted at its own work-readiness,
+    /// not gated behind a prereq that can never become ready.
+    fn affine_work_placeability(
+        &self,
+        placement: &WorkPlacement,
+        ready_affine: &HashSet<String>,
+    ) -> AffinePlaceability {
+        // DOOMED: the unit is `Unsatisfiable` — its affine import is
+        // globally-failed (the EXACT #648 predicate, which reads
+        // `failed_tasks`). Checked INDEPENDENTLY of `ready_affine`.
+        if self
+            .affine_unit_satisfiable_secondaries(placement)
+            .is_empty()
+        {
+            return AffinePlaceability::Doomed;
+        }
+        // PLACEABLE: every affine prereq is ready-in-bucket.
+        let all_ready = placement
+            .affine_deps
+            .iter()
+            .all(|(_, hash)| ready_affine.contains(hash));
+        if all_ready {
+            AffinePlaceability::Placeable
+        } else {
+            AffinePlaceability::NotReady
+        }
+    }
+
     pub(crate) async fn place_dependency_satisfied_affine_tasks(
         &mut self,
     ) -> Vec<(String, dynrunner_core::PhaseId)> {
@@ -181,41 +262,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return Vec::new();
         }
 
-        // The set of affine-prereq hashes the pool has marked READY (a
-        // `SecondaryAffine` task sitting in a bucket = its own deps are met).
-        // `pool().iter()` yields only queued (bucket) items, never blocked
-        // ones, so a still-blocked affine prereq is correctly NOT ready.
-        let ready_affine: HashSet<String> = self
-            .pool()
-            .iter()
-            .filter(|t| t.kind.is_secondary_affine())
-            .map(compute_task_hash)
-            .collect();
+        // The ready-in-bucket import set, built once and reused across every
+        // candidate this pass (the SAME set the failover rebuild reads, via the
+        // shared owner — neither path computes a different notion of "ready").
+        let ready_affine = self.affine_ready_in_bucket_imports();
 
-        // Find every WORK candidate, partitioning each into PLACEABLE vs DOOMED.
-        // A candidate qualifies on EITHER of two independent conditions:
+        // Find every WORK candidate and route it through the SHARED placement
+        // predicate ([`Self::affine_work_placeability`], the SOLE owner of the
+        // placeable-vs-doomed-vs-deferred decision, shared with the rebuild):
         //
-        //   * PLACEABLE: every affine prereq is ready-in-bucket (`ready_affine`)
-        //     — the whole schedulable unit is runnable; place it as today. A unit
-        //     not yet wholly ready (a prereq still blocked) is deferred (a later
-        //     `TasksAdded` re-evaluates it).
-        //   * DOOMED (#650): the unit is `Unsatisfiable` — its affine import is
-        //     globally-failed (the EXACT #648 predicate, which reads
-        //     `failed_tasks`). This is checked INDEPENDENTLY of `ready_affine`,
-        //     because a globally-failed import will NEVER be a ready-in-bucket
-        //     prereq, so the `all_ready` placeable gate alone can never see it —
-        //     the doomed unit must be terminalized at its own work-readiness, not
-        //     gated behind a prereq that can never become ready.
+        //   * PLACEABLE — every affine prereq is ready-in-bucket and the unit is
+        //     satisfiable: place it as today.
+        //   * DOOMED (#650) — `Unsatisfiable` (its affine import is
+        //     globally-failed): collected here for terminalization; the caller
+        //     (which holds `command_rx`) routes the returned set through the same
+        //     batch terminalization the #648 bridge uses.
+        //   * NOTREADY — satisfiable but a prereq still blocked: simply deferred;
+        //     a later `TasksAdded` re-evaluates it.
         //
-        // A SATISFIABLE-but-not-yet-ready candidate (a live/in-flight import not
-        // yet in a bucket) is neither: it is simply deferred. Only the
-        // `failed_tasks`-globally-failed case diverts to terminalization — a live
-        // import still places normally once ready.
-        //
-        // `affine_unit_satisfiable_secondaries` is computed once per candidate and
-        // reused for both the doomed decision and (for a placeable one) is not
-        // needed again — so the predicate runs at most once per candidate.
-        // COST (MED-3b): the discriminators run on `state.def()` / the resolved
+        // COST (MED-3b): the predicate runs on `state.def()` / the resolved
         // dep-refs IN PLACE, never on a full `task_to_info` clone. The placement
         // construction reads ONLY the task's content hash (the iteration's `hash`
         // key) + the affine subset of its deps, so the whole-`TaskInfo` clone the
@@ -223,9 +288,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // filter dropped the vast majority) is never materialized. The placed-set
         // is identical: `affine_placement_for_state` produces the same
         // `WorkPlacement` as the prior `affine_placement_for(&task_to_info(state))`
-        // for the same logical task, and every downstream gate (the doomed
-        // predicate, the `all_ready` check) reads only that placement plus the
-        // entry's `phase_id` (read from `def()` for the doomed set, no clone).
+        // for the same logical task, and the predicate reads only that placement.
         let mut doomed: Vec<(String, dynrunner_core::PhaseId)> = Vec::new();
         let placements: Vec<(String, super::affine_scheduler::WorkPlacement)> = self
             .cluster_state
@@ -239,22 +302,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if placement.affine_deps.is_empty() {
                     return None;
                 }
-                // DOOMED takes precedence: a unit whose import is globally-failed
-                // is collected for terminalization regardless of prereq-readiness
-                // (its prereq can never become ready-in-bucket).
-                if self
-                    .affine_unit_satisfiable_secondaries(&placement)
-                    .is_empty()
-                {
-                    doomed.push((placement.hash.clone(), def.phase_id.clone()));
-                    return None;
+                match self.affine_work_placeability(&placement, &ready_affine) {
+                    AffinePlaceability::Placeable => {
+                        Some((placement.hash.clone(), placement))
+                    }
+                    AffinePlaceability::Doomed => {
+                        doomed.push((placement.hash.clone(), def.phase_id.clone()));
+                        None
+                    }
+                    AffinePlaceability::NotReady => None,
                 }
-                // PLACEABLE: every affine prereq is ready-in-bucket.
-                let all_ready = placement
-                    .affine_deps
-                    .iter()
-                    .all(|(_, hash)| ready_affine.contains(hash));
-                all_ready.then(|| (placement.hash.clone(), placement))
             })
             .collect();
 
@@ -1510,13 +1567,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// Build the rank-selection placement list for the failover rebuild: the
-    /// [`super::affine_scheduler::WorkPlacement`] of every WORK task with ≥1
-    /// affine dep, in a DETERMINISTIC (hash-sorted) order so the rebuild
+    /// [`super::affine_scheduler::WorkPlacement`] of every PLACEABLE WORK task
+    /// with ≥1 affine dep, in a DETERMINISTIC (hash-sorted) order so the rebuild
     /// reproduces the same per-secondary layout on every promoted primary
     /// (the bitvector — incl. `Queued` — is replicated, so re-placing against
     /// it lands each unit on the same secondary up to the deterministic
     /// tie-break). Consumed by [`Self::rebuild_affine_schedule`].
+    ///
+    /// Each candidate is gated through the SAME placement predicate the live
+    /// trigger uses ([`Self::affine_work_placeability`], over the SAME
+    /// ready-in-bucket set [`Self::affine_ready_in_bucket_imports`]): only
+    /// `Placeable` works are returned. A `NotReady` work — its affine import not
+    /// yet ready-in-bucket because the import's own non-affine upstream is still
+    /// incomplete — is NOT placed; placing it would let a pop dispatch the
+    /// not-ready import with partial inputs → failure → spurious cascade (the
+    /// live-vs-failover asymmetry this gate closes). It is placed LATER by the
+    /// live `place_dependency_satisfied_affine_tasks` once its import becomes
+    /// ready (the per-secondary blocked set is re-derived lazily by the
+    /// readiness gate). A `Doomed` work is likewise NOT placed at rebuild — the
+    /// rebuild is a sync constructor-time pass with no `command_rx` to
+    /// terminalize through, so it mirrors the live path by NOT placing it; the
+    /// live trigger's continuous doomed complement terminalizes it on its next
+    /// pass (and the readiness gate's `Unsatisfiable` arm covers it even were it
+    /// placed). Either way no not-ready import is dispatched off a rebuilt queue.
     pub(crate) fn affine_rebuild_placements(&self) -> Vec<super::affine_scheduler::WorkPlacement> {
+        let ready_affine = self.affine_ready_in_bucket_imports();
         let mut placements: Vec<super::affine_scheduler::WorkPlacement> = self
             .cluster_state
             .tasks_iter()
@@ -1527,7 +1602,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 let task: TaskInfo<I> = self.cluster_state.task_to_info(state);
                 let placement = self.affine_placement_for(&task);
-                (!placement.affine_deps.is_empty()).then_some(placement)
+                if placement.affine_deps.is_empty() {
+                    return None;
+                }
+                match self.affine_work_placeability(&placement, &ready_affine) {
+                    AffinePlaceability::Placeable => Some(placement),
+                    AffinePlaceability::Doomed | AffinePlaceability::NotReady => None,
+                }
             })
             .collect();
         placements.sort_by(|a, b| a.hash.cmp(&b.hash));
