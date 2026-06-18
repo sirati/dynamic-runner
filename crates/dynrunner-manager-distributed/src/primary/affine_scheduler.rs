@@ -344,40 +344,41 @@ impl AffineScheduler {
         self.queues.get(secondary).map_or(0, Vec::len)
     }
 
-    /// DIAGNOSTIC: how many work hashes are recorded PLACED (`placed_work`) yet
-    /// sit in NO secondary's queue as a `Work` unit — the affine-dep-work STRAND
-    /// signature. A correctly-placed work hash is queued somewhere (or in flight
-    /// after a pop); a hash that is `placed_work`-marked but appears in no queue
-    /// AND is not in flight is exactly the trap this requeue-recovery fixes (the
-    /// dedup guard blocks re-placement while the unit is gone). Pop-then-dispatch
-    /// briefly drains a queued unit, so this count is an UPPER BOUND on the
-    /// genuinely-stranded set — it is operator diagnostic only (greppable on the
-    /// unassignable-park line), never a control input. Owned here because both
-    /// `placed_work` and `queues` are this module's private state.
-    pub(crate) fn placed_but_unqueued_count(&self) -> usize {
-        self.placed_unqueued_iter().count()
-    }
-
-    /// DIAGNOSTIC: up to `limit` of the work hashes counted by
-    /// [`Self::placed_but_unqueued_count`] — the per-hash list the
-    /// unassignable-park strand line emits so a future strand names its stranded
-    /// work in ONE greppable line (not just a count). Bounded so a large strand
-    /// set never floods the log; the count line carries the full magnitude. Same
-    /// upper-bound caveat as the count (a momentarily popped unit may appear).
-    pub(crate) fn placed_but_unqueued_hashes(&self, limit: usize) -> Vec<String> {
-        self.placed_unqueued_iter().take(limit).cloned().collect()
+    /// DIAGNOSTIC (raw, scheduler-side): every work hash recorded PLACED
+    /// (`placed_work`) yet sitting in NO secondary's queue as a `Work` unit and
+    /// NOT `block_until_import`-blocked here — the candidate set the coordinator
+    /// further narrows (it drops still-in-flight hashes the ledger holds) into
+    /// the genuinely-stranded affine-dep-work signal. Unbounded: the caller owns
+    /// the in-flight filter AND the log bound, so count and per-hash list can
+    /// never disagree about "stranded". Owned here because `placed_work`,
+    /// `queues`, and `blocked_per_secondary` are all this module's private state;
+    /// the in-flight (ledger) exclusion is deliberately NOT here (no ledger
+    /// knowledge crosses into the scheduler).
+    pub(crate) fn placed_but_unqueued_hashes_all(&self) -> Vec<String> {
+        self.placed_unqueued_iter().cloned().collect()
     }
 
     /// The shared filter behind both diagnostics: each `placed_work` hash that
-    /// sits in NO secondary's queue as a `Work` unit. One owner so the count and
-    /// the per-hash list can never disagree about what "stranded" means.
+    /// sits in NO secondary's queue as a `Work` unit AND is not legitimately
+    /// `block_until_import`-blocked here (a blocked work is intentionally absent
+    /// from the queue — `on_cell_finished` re-enqueues it when its imports
+    /// complete — so it is NOT stranded). One owner so the count and the per-hash
+    /// list can never disagree about what "stranded" means. Both exclusions read
+    /// this module's own private state (`queues`, `blocked_per_secondary`); the
+    /// orthogonal in-flight (ledger) exclusion is applied by the coordinator,
+    /// which owns the ledger — this iterator carries no ledger knowledge.
     fn placed_unqueued_iter(&self) -> impl Iterator<Item = &String> {
         self.placed_work.iter().filter(|hash| {
-            !self
+            let queued_somewhere = self
                 .queues
                 .values()
                 .flatten()
-                .any(|unit| matches!(unit, QueuedUnit::Work { hash: h } if h == *hash))
+                .any(|unit| matches!(unit, QueuedUnit::Work { hash: h } if h == *hash));
+            let blocked_on_import = self
+                .blocked_per_secondary
+                .keys()
+                .any(|(_secondary, work_hash)| work_hash == *hash);
+            !queued_somewhere && !blocked_on_import
         })
     }
 
