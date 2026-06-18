@@ -3812,7 +3812,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 } else if entry.task.kind.is_reassignable() {
                     // WORK task: recover it to `Pending` for another worker
                     // (`InFlight → Pending`, the dead-secondary requeue).
-                    self.pool_mut().requeue(entry.task);
+                    // Affine-aware (the mid-run-leg-drop case of the SAME
+                    // recovery as the backpressure arm): an affine-dependent
+                    // work task whose holder died must clear the affine
+                    // scheduler's `placed_work` dedup on requeue, or it is
+                    // hidden from the global view AND blocked from re-placement
+                    // — permanently unassignable. `requeue_affine_aware` clears
+                    // the guard so the placement pass re-derives its
+                    // per-secondary unit; a non-affine-dep task takes the
+                    // unchanged `pool.requeue`.
+                    self.requeue_affine_aware(entry.task);
                     requeue_mutations.push(ClusterMutation::TaskRequeued {
                         hash,
                         // Stamped at the origination choke point (apply_locally_for_broadcast).
@@ -4450,6 +4459,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 super::affine_scheduler::QueuedUnit::Work { hash } => hash.clone(),
             })
             .collect()
+    }
+
+    /// Test-only inspector: is `work_hash` currently recorded in the affine
+    /// scheduler's `placed_work` placement-dedup guard? Lets the
+    /// affine-dep-work requeue-recovery test assert the guard is SET after a
+    /// placement and CLEARED by the requeue recovery (the strand it fixes is
+    /// "guard set but the queue unit gone").
+    #[cfg(test)]
+    pub fn affine_work_is_placed_for_test(&self, work_hash: &str) -> bool {
+        self.affine_scheduler.is_work_placed(work_hash)
+    }
+
+    /// Test-only inspector: the affine-dep-work STRAND-signature count (work
+    /// hashes recorded placed yet sitting in no affine queue) the
+    /// unassignable-park diagnostic reports. Lets the requeue-recovery test
+    /// assert the strand is cleared after recovery.
+    #[cfg(test)]
+    pub fn affine_scheduler_placed_but_unqueued_for_test(&self) -> usize {
+        self.affine_scheduler.placed_but_unqueued_count()
     }
 
     /// Test-only inspector: does the `(secondary_id, worker_id)` slot
