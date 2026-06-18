@@ -961,13 +961,15 @@ where
     pub(in crate::secondary) consensus_fsm:
         crate::secondary::consensus::SecondaryConsensusFsm<I>,
 
-    /// #556 mixed-version warning gate: peer ids we have already warned
-    /// about for a missing `slurm_job_id` in their
-    /// `PeerConnectionInfo`. A peer connecting from a pre-Layer 1 build
-    /// presents no `slurm_job_id` — consensus restart for that peer will
-    /// be unable to scancel its job in Layer 5, so the operator must
-    /// scancel manually. We emit one WARN per peer at first observation
-    /// and then stay silent (a chatty per-frame WARN is operator-spam).
-    pub(in crate::secondary) consensus_mixed_version_warned:
-        std::collections::HashSet<String>,
+    /// #658 scancel-self-heal-pending notice gate: whether we have already
+    /// emitted the once-per-run operator notice that a consensus-declared-
+    /// dead mid-run peer's SLURM job will NOT be auto-scancelled. This is
+    /// NOT a version mismatch — `slurm_job_id` is wire-only at this rev and
+    /// always `None`, because its value-source population (Layer 4) and the
+    /// consensus-restart scancel self-heal (Layer 5) are both unimplemented
+    /// fleet-wide. The condition therefore holds for every peer, so the
+    /// notice is informational about a pending feature, not a per-peer
+    /// fault — we emit it ONCE per run and then stay silent (a per-peer,
+    /// per-frame WARN would be operator-spam saying the same thing N times).
+    pub(in crate::secondary) consensus_scancel_pending_warned: bool,
 }

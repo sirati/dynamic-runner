@@ -664,31 +664,38 @@ where
                     "peer list received (operational); the mesh-pump re-runs \
                      the peer-dial sweep off it"
                 );
-                // #556 mixed-version warning: any peer connecting from a
-                // pre-Layer 1 build presents no `slurm_job_id`. The
-                // operator MUST know — Layer 5 cannot scancel that peer's
-                // SLURM job through the consensus pipeline; a manual
-                // scancel will be required on a real death. One WARN per
-                // peer-id (the gate is `consensus_mixed_version_warned`)
-                // so an operator sees the upgrade-window mismatch but
-                // not a per-frame spam.
-                for peer in &peers {
-                    if peer.slurm_job_id.is_none()
-                        && !peer.secondary_id.is_empty()
-                        && peer.secondary_id != self.config.secondary_id
-                        && self
-                            .consensus_mixed_version_warned
-                            .insert(peer.secondary_id.clone())
-                    {
-                        tracing::warn!(
-                            target: "dynrunner_consensus",
-                            peer = %peer.secondary_id,
-                            "#556 mixed-version: peer joined without slurm_job_id \
-                             (pre-Layer 1 build); consensus-driven restart for \
-                             this peer will skip scancel — operator must scancel \
-                             the peer's SLURM job manually if it actually dies"
-                        );
-                    }
+                // #658 scancel-self-heal-pending notice: peers present no
+                // `slurm_job_id` because that field is wire-only at this rev
+                // (always `None`) — its value-source population (Layer 4)
+                // and the consensus-restart scancel self-heal (Layer 5) are
+                // both unimplemented. This is NOT a version mismatch; the
+                // condition holds for every same-version peer fleet-wide.
+                // So the operator MUST know that, until those layers land, a
+                // consensus-declared-dead mid-run peer's SLURM job will not
+                // be auto-scancelled and must be scancelled manually. Emit
+                // the notice ONCE per run (gated on
+                // `consensus_scancel_pending_warned`) — a per-peer,
+                // per-frame WARN would just repeat the same pending-feature
+                // statement N times.
+                if !self.consensus_scancel_pending_warned
+                    && peers.iter().any(|peer| {
+                        peer.slurm_job_id.is_none()
+                            && !peer.secondary_id.is_empty()
+                            && peer.secondary_id != self.config.secondary_id
+                    })
+                {
+                    self.consensus_scancel_pending_warned = true;
+                    tracing::warn!(
+                        target: "dynrunner_consensus",
+                        "scancel self-heal not yet implemented: peer \
+                         slurm_job_id population (Layer 4) and the \
+                         consensus-restart scancel self-heal (Layer 5) are \
+                         unshipped, so a consensus-declared-dead mid-run \
+                         peer's SLURM job will NOT be auto-scancelled — \
+                         scancel such a peer's SLURM job manually until those \
+                         layers land (this is expected on current builds, not \
+                         a version mismatch)"
+                    );
                 }
                 self.ingest_peer_liveness_addrs(&peers);
                 Ok(())

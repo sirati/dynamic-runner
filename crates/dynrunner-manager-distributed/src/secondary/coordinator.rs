@@ -235,7 +235,7 @@ where
             // the keepalive arm drives `poll(now)` ~once per second.
             consensus_fsm:
                 crate::secondary::consensus::SecondaryConsensusFsm::new(consensus_self_id),
-            consensus_mixed_version_warned: std::collections::HashSet::new(),
+            consensus_scancel_pending_warned: false,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
