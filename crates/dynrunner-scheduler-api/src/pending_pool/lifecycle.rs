@@ -36,7 +36,7 @@ use std::sync::Arc;
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 
 use super::pool::PendingPool;
-use super::types::{Bucket, PhaseState, affinity_key};
+use super::types::{Bucket, DrainAffineToken, DrainEligibilityRow, PhaseState, affinity_key};
 
 impl<I: Identifier> PendingPool<I> {
     /// Notify the pool that an item completed successfully (or that
@@ -276,12 +276,38 @@ impl<I: Identifier> PendingPool<I> {
         // un-complete source. Non-affine ids fall through to the unchanged
         // dependent-reblocking path below.
         if self.affine_prereq_ids.contains(id) {
+            // DIAGNOSTIC (throwaway): an affine token was reinjected and OPT-2
+            // skipped its un-complete — so if Gate B somehow still strands, this
+            // line proves the funnel SAW the affine and did NOT un-complete it
+            // (ruling the un-complete OUT as the cause). Behaviour-neutral.
+            tracing::info!(
+                target: "phase_drain_probe",
+                uncompleted = %id,
+                is_secondary_affine = true,
+                was_completed = self.completed_tasks.contains(id),
+                "PHASE-DRAIN-PROBE reblock-skip-affine uncompleted={} is_secondary_affine=true \
+                 was_completed={} (OPT-2: affine global terminal NOT un-completed)",
+                id,
+                self.completed_tasks.contains(id),
+            );
             return;
         }
         // Only a previously-completed id has dependents to re-block.
         if !self.completed_tasks.remove(id) {
             return;
         }
+        // DIAGNOSTIC (throwaway): a non-affine completed id was un-completed by
+        // a reinject (the remove ACTUALLY hit). If a barrier token ever reaches
+        // here it is mis-classified (not in `affine_prereq_ids`) — the line
+        // names the culprit. Behaviour-neutral.
+        tracing::info!(
+            target: "phase_drain_probe",
+            uncompleted = %id,
+            is_secondary_affine = false,
+            "PHASE-DRAIN-PROBE reblock-uncomplete uncompleted={} is_secondary_affine=false \
+             (completed_tasks.remove hit)",
+            id,
+        );
         // Every LIVE direct dependent — queued OR blocked — whose declared
         // `task_depends_on` names `id` (bare task_id, the keying
         // `commit_item` resolves on). The blocked side closes the hole a
@@ -870,6 +896,84 @@ impl<I: Identifier> PendingPool<I> {
         phases.sort();
         phases.dedup();
         phases
+    }
+
+    /// DIAGNOSTIC (throwaway): a pure read-only, per-phase, per-term
+    /// breakdown of every input [`Self::phases_stuck_drainable`] evaluates,
+    /// for EVERY phase that is not yet [`PhaseState::Done`]. The pool —
+    /// which owns the gate counters and the private gate accessors — composes
+    /// each [`DrainEligibilityRow`] from EXACTLY those accessors
+    /// (`queued_count`, `in_flight`, `live_blocked_count`,
+    /// `predecessors_done`, `phase_has_live_affine_prereq`) so the manager
+    /// can log the precise vetoing term without learning any pool internals.
+    /// Re-evaluates the SAME gates, relaxes NONE — a snapshot read, no
+    /// mutation. The `first_live_affine_token` scans ALL buckets (not just
+    /// the queried phase's) so a reader can tell an own-phase barrier from
+    /// cross-phase token leakage.
+    pub fn drain_eligibility_report(&self) -> Vec<DrainEligibilityRow> {
+        let stuck: std::collections::HashSet<PhaseId> =
+            self.phases_stuck_drainable().into_iter().collect();
+        let first_live_affine_token = self.first_live_affine_token();
+        let mut rows: Vec<DrainEligibilityRow> = self
+            .phase_state
+            .iter()
+            .filter(|(_, state)| !matches!(state, PhaseState::Done))
+            .map(|(phase_id, state)| {
+                let predecessors = self
+                    .phase_deps
+                    .get(phase_id)
+                    .map(|deps| {
+                        deps.iter()
+                            .map(|d| {
+                                (
+                                    d.clone(),
+                                    self.phase_state.get(d).copied().unwrap_or(PhaseState::Blocked),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                DrainEligibilityRow {
+                    phase_id: phase_id.clone(),
+                    phase_state: *state,
+                    queued_count: self.queued_count(phase_id),
+                    in_flight: self.in_flight(phase_id),
+                    live_blocked_count: self.live_blocked_count(phase_id),
+                    predecessors_done: self.predecessors_done(phase_id),
+                    predecessors,
+                    phase_has_live_affine_prereq: self.phase_has_live_affine_prereq(phase_id),
+                    first_live_affine_token: first_live_affine_token.clone(),
+                    stuck_drainable: stuck.contains(phase_id),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.phase_id.cmp(&b.phase_id));
+        rows
+    }
+
+    /// DIAGNOSTIC: the FIRST live (`affine_prereq_ids` ∧ not in
+    /// `completed_tasks`/`failed_tasks`) `SecondaryAffine` token across ALL
+    /// buckets, with the identity of its holding bucket's phase — the same
+    /// liveness predicate [`Self::phase_has_live_affine_prereq`] applies, but
+    /// not phase-filtered, so a reader can see whether the token holding a
+    /// phase's affine guard belongs to that phase (an own-phase barrier) or
+    /// leaked from another phase. Pure read.
+    fn first_live_affine_token(&self) -> Option<DrainAffineToken> {
+        self.buckets.iter().find_map(|((bucket_phase, _, _), b)| {
+            b.items.iter().find_map(|item| {
+                let id = item.task_id.as_str();
+                (item.kind.is_secondary_affine()
+                    && self.affine_prereq_ids.contains(id)
+                    && !self.completed_tasks.contains(id)
+                    && !self.failed_tasks.contains(id))
+                .then(|| DrainAffineToken {
+                    task_id: item.task_id.clone(),
+                    bucket_phase_id: bucket_phase.clone(),
+                    in_completed: self.completed_tasks.contains(id),
+                    in_failed: self.failed_tasks.contains(id),
+                })
+            })
+        })
     }
 
     /// Re-push every phase currently in state `Drained` (the transition

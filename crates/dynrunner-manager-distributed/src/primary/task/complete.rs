@@ -397,6 +397,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .cluster_state
             .task_state(&task_hash)
             .is_some_and(|s| s.is_terminal());
+        // DIAGNOSTIC (throwaway): the affine-complete decision — hash, first_run,
+        // and `recorded` (whether the pool-mirror re-assertion ran this call). A
+        // `first_run=false, recorded=true` line is the OPT-1 repair firing; a
+        // `recorded=false` line means the global state was not terminal (no mirror
+        // touched). Behaviour-neutral.
+        tracing::info!(
+            target: "phase_drain_probe",
+            hash = %task_hash,
+            first_run,
+            recorded = affine_global_terminal && affine_identity.is_some(),
+            "PHASE-DRAIN-PROBE affine-complete hash={} first_run={} recorded={}",
+            task_hash,
+            first_run,
+            affine_global_terminal && affine_identity.is_some(),
+        );
         if affine_global_terminal && let Some((phase, task_id)) = &affine_identity {
             self.pool_mut().note_affine_terminal(phase, task_id);
             // The freshly-drained phase needs the lifecycle cascade to observe it

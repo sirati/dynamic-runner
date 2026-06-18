@@ -392,6 +392,20 @@ where
         // Active for this binary's phase, putting the item back into
         // the bucket head so the next dispatch tick picks it up.
         self.failed_tasks.remove(&hash);
+        // DIAGNOSTIC (throwaway): tag the OPERATOR reinject path when it touches
+        // an affine token, so a frozen run names WHICH reinject path bounced the
+        // barrier. OPT-2 at the `reblock_dependents_on_uncompleted` funnel keeps
+        // the un-complete from happening; this is purely for attribution.
+        // Behaviour-neutral.
+        if binary.kind.is_secondary_affine() {
+            tracing::info!(
+                target: "phase_drain_probe",
+                site = "operator",
+                task = %binary.task_id,
+                "PHASE-DRAIN-PROBE AFFINE-REINJECT-PATH site=operator task={}",
+                binary.task_id,
+            );
+        }
         self.pool_mut().reinject(std::sync::Arc::new(binary));
 
         // Originate the bumped used count (P3) ONLY when a cap is set —
@@ -1083,6 +1097,18 @@ where
                 Some(state @ TaskState::Pending { .. }) => {
                     // L5: resolve dep refs via the store.
                     let task = self.cluster_state.task_to_info(state);
+                    // DIAGNOSTIC (throwaway): tag the SPAWN-BATCH reinject path
+                    // when it touches an affine token (see the operator-path tag
+                    // above for rationale). Behaviour-neutral.
+                    if task.kind.is_secondary_affine() {
+                        tracing::info!(
+                            target: "phase_drain_probe",
+                            site = "spawn_batch",
+                            task = %task.task_id,
+                            "PHASE-DRAIN-PROBE AFFINE-REINJECT-PATH site=spawn_batch task={}",
+                            task.task_id,
+                        );
+                    }
                     self.pool_mut().reinject(std::sync::Arc::new(task));
                     pool_grew = true;
                 }

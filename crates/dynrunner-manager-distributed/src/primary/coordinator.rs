@@ -1068,6 +1068,14 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// rationale.
     pub(super) fleet_dead_since: Option<Instant>,
 
+    /// DIAGNOSTIC (throwaway): last-emit clock for the rate-limited
+    /// `PHASE-DRAIN-PROBE` trace in [`Self::process_phase_lifecycle`]. `None`
+    /// until the first emit; the trace fires at most once per ~30s off this
+    /// stored `Instant` (the same throttle shape the heartbeat starvation arm
+    /// uses) so the empty-poll branch — hit on every cascade entry — never
+    /// spams the oploop. Behaviour-neutral; remove with the probe.
+    pub(super) phase_drain_probe_last_emit: Option<Instant>,
+
     /// Set of secondary ids that have reported a FORMED peer mesh
     /// (`MeshReady` with `peer_count >= 1`). Input to the operational
     /// loop's BACKGROUND mesh-formation deadline (`mesh_formation_missing`
@@ -1922,6 +1930,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
+            phase_drain_probe_last_emit: None,
             mesh_ready_secondaries: HashSet::new(),
             primary_id: None,
             pending_observer: None,
@@ -6694,6 +6703,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if self.resurface_stuck_drainable_phases() {
                     continue;
                 }
+                // DIAGNOSTIC (throwaway): the empty-poll terminus — nothing
+                // drained, no soft-finalize, no resurface. Emit the per-phase
+                // per-term drain-eligibility breakdown (rate-limited) so a frozen
+                // run reveals the EXACT vetoing term for a phase that looks
+                // all-clear yet is not drain-eligible. Behaviour-neutral.
+                self.emit_phase_drain_probe();
                 break;
             }
             for p in &drained {
@@ -6935,6 +6950,76 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // short and items in the final phase never dispatch.
             self.pool_mut().drain_empty_active_phases();
         }
+    }
+
+    /// DIAGNOSTIC (throwaway): emit the per-phase, per-term drain-eligibility
+    /// breakdown for EVERY not-`Done` phase at the empty-poll terminus of
+    /// [`Self::process_phase_lifecycle`] — the line a frozen run needs to name
+    /// the EXACT term keeping an all-clear-looking phase out of the resurface
+    /// arm. RATE-LIMITED to at most once per ~30s off the stored
+    /// `phase_drain_probe_last_emit` (the empty-poll branch is hit on every
+    /// cascade entry; throttling keeps it off the oploop hot path). Pure read +
+    /// log + one `Instant` write — NO drain/transition behaviour changes.
+    fn emit_phase_drain_probe(&mut self) {
+        const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+        let due = self
+            .phase_drain_probe_last_emit
+            .is_none_or(|last| last.elapsed() >= PROBE_INTERVAL);
+        if !due {
+            return;
+        }
+        // Pure read of the pool's per-phase gate snapshot.
+        let report = self.pool().drain_eligibility_report();
+        for row in &report {
+            // The predecessor list as `id=State` pairs so a reader sees WHICH
+            // predecessor (if any) is not yet Done.
+            let preds: Vec<String> = row
+                .predecessors
+                .iter()
+                .map(|(p, s)| format!("{p}={s:?}"))
+                .collect();
+            // The first live affine token, if any — own-phase barrier vs
+            // cross-phase leakage discriminator.
+            let (affine_hold_token, affine_hold_token_phase) = match &row.first_live_affine_token {
+                Some(tok) => (
+                    format!(
+                        "{}(in_completed={},in_failed={})",
+                        tok.task_id, tok.in_completed, tok.in_failed
+                    ),
+                    tok.bucket_phase_id.to_string(),
+                ),
+                None => ("none".to_string(), "none".to_string()),
+            };
+            tracing::info!(
+                target: "phase_drain_probe",
+                phase = %row.phase_id,
+                state = ?row.phase_state,
+                queued = row.queued_count,
+                in_flight = row.in_flight,
+                blocked = row.live_blocked_count,
+                preds_done = row.predecessors_done,
+                preds = ?preds,
+                live_affine = row.phase_has_live_affine_prereq,
+                affine_hold_token = %affine_hold_token,
+                affine_hold_token_phase = %affine_hold_token_phase,
+                stuck_drainable = row.stuck_drainable,
+                "PHASE-DRAIN-PROBE phase={} state={:?} queued={} in_flight={} \
+                 blocked={} preds_done={} preds={:?} live_affine={} \
+                 affine_hold_token={} affine_hold_token_phase={} stuck_drainable={}",
+                row.phase_id,
+                row.phase_state,
+                row.queued_count,
+                row.in_flight,
+                row.live_blocked_count,
+                row.predecessors_done,
+                preds,
+                row.phase_has_live_affine_prereq,
+                affine_hold_token,
+                affine_hold_token_phase,
+                row.stuck_drainable,
+            );
+        }
+        self.phase_drain_probe_last_emit = Some(Instant::now());
     }
 
     /// Break the cross-phase drain-edge DEADLOCK by driving the

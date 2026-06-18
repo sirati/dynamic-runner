@@ -123,6 +123,47 @@ impl<I: Identifier> Bucket<I> {
     }
 }
 
+/// DIAGNOSTIC (throwaway): a per-phase, per-term snapshot of every input
+/// [`super::PendingPool::phases_stuck_drainable`] evaluates for ONE phase
+/// that is not yet [`PhaseState::Done`]. Pure read-only data — the pool
+/// composes it from the SAME private gate accessors the drain transition
+/// uses (`queued_count`, `in_flight`, `live_blocked_count`,
+/// `predecessors_done`, `phase_has_live_affine_prereq`), so the manager
+/// can LOG the exact vetoing term without learning any pool internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainEligibilityRow {
+    pub phase_id: PhaseId,
+    pub phase_state: PhaseState,
+    pub queued_count: usize,
+    pub in_flight: u32,
+    pub live_blocked_count: usize,
+    pub predecessors_done: bool,
+    /// Each declared predecessor `(phase_id, its current PhaseState)`, so a
+    /// reader sees WHICH predecessor (if any) is not yet `Done`.
+    pub predecessors: Vec<(PhaseId, PhaseState)>,
+    pub phase_has_live_affine_prereq: bool,
+    /// The FIRST live affine token found across ALL buckets (not just this
+    /// phase's) — `(token_task_id, token_bucket_phase_id, in_completed,
+    /// in_failed)`. Exposes whether the held token is an own-phase barrier
+    /// or evidence of cross-phase leakage, and whether the pool mirror lost
+    /// its terminal. `None` when no live affine token exists anywhere.
+    pub first_live_affine_token: Option<DrainAffineToken>,
+    /// Whether this phase is in
+    /// [`super::PendingPool::phases_stuck_drainable`] (the resurface arm's
+    /// input). The final included/excluded verdict.
+    pub stuck_drainable: bool,
+}
+
+/// DIAGNOSTIC: the identity of one live affine ledger token, surfaced by
+/// [`DrainEligibilityRow::first_live_affine_token`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainAffineToken {
+    pub task_id: String,
+    pub bucket_phase_id: PhaseId,
+    pub in_completed: bool,
+    pub in_failed: bool,
+}
+
 /// Errors produced by `PendingPool::new` (phase-graph validation) and
 /// `PendingPool::extend` (per-task dependency validation).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
