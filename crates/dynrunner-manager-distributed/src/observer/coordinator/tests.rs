@@ -3908,8 +3908,11 @@ async fn observer_twin_executes_upload_and_reports_success() {
 /// module access):
 ///   - (no terminal, transport_closed=true, peer_count>0) ⇒ None — KEEP OBSERVING.
 ///   - (run_complete, transport_closed=true, peer_count>0) ⇒ Done.
+///   - (run_complete, transport_closed=true, peer_count>0, mid_transfer) ⇒ None
+///     — HOLD (arm-2 symmetry: no Done off a half-merged mirror).
 ///   - (run_aborted, transport_closed=true, peer_count>0) ⇒ Aborted.
-/// A revert that removes the gate re-fails the first assertion.
+/// A revert that removes the #542 gate re-fails the first assertion; a
+/// revert that removes the mid-transfer hold re-fails the third.
 #[tokio::test(flavor = "current_thread")]
 async fn evaluate_exit_closed_tail_requires_observed_terminal() {
     let local = tokio::task::LocalSet::new();
@@ -3951,6 +3954,37 @@ async fn evaluate_exit_closed_tail_requires_observed_terminal() {
                 Some(ObserverTerminal::Done)
             ),);
 
+            // POST run_complete BUT a snapshot stream is mid-transfer: arm 3
+            // holds (symmetry with arm 2's mid-transfer hold). The terminal
+            // latched on the stream's HEAD; the transport then closed mid-
+            // stream with a stale-HIGH peer_count. Exiting Done here would
+            // report the complete run off a half-merged mirror (partial per-
+            // task narration), so arm 3 must KEEP OBSERVING until the stream
+            // releases. Drive a partially-applied inbound stream: a minted
+            // request + one applied (not-done) package ⇒ received>0, !done,
+            // fresh last_progress ⇒ mid_transfer true.
+            let mut cs_complete_mt = ClusterState::<TestId>::new();
+            cs_complete_mt.apply(ClusterMutation::RunComplete { counts: Default::default() });
+            let (transport4, _inb4, _peers4) = transport_with_peers("obs4", 1);
+            let (client4, inbox4, pump4) = observer_mesh(transport4, "obs4");
+            let pump4_handle = tokio::task::spawn_local(pump4);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let mut observer_complete_mt =
+                ObserverCoordinator::new(client4, inbox4, cs_complete_mt, observer_config("obs4"));
+            let (stream_id, _resume) =
+                observer_complete_mt.inbound_snapshots.request_params("responder");
+            observer_complete_mt.inbound_snapshots.note_package(
+                "responder",
+                &stream_id,
+                Some("cursor-0"),
+                false,
+            );
+            assert!(
+                observer_complete_mt.evaluate_exit(true).is_none(),
+                "arm 3 must HOLD Done while a snapshot stream is mid-transfer \
+                 (symmetry with arm 2) — got an early Done off a half-merged mirror",
+            );
+
             // POST run_aborted: arm 3 (via arm 1) fires Aborted. (Arm 1
             // wins on RunAborted; this pins the bracketing case.)
             let mut cs_aborted = ClusterState::<TestId>::new();
@@ -3972,6 +4006,7 @@ async fn evaluate_exit_closed_tail_requires_observed_terminal() {
             pump_handle.abort();
             pump2_handle.abort();
             pump3_handle.abort();
+            pump4_handle.abort();
         })
         .await;
 }
