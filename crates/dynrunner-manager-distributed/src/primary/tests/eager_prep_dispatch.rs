@@ -521,3 +521,78 @@ async fn eager_prep_runs_at_most_once_per_secondary() {
         })
         .await;
 }
+
+// ── #668 generalization: dead-secondary EAGER-PREP discrimination ──────────
+//
+// An eager-prep IMPORT in-flight on a secondary that DIES must be treated
+// PER-SECONDARY (its terminal is the bitvector cell), NEVER as a global task
+// terminal — IDENTICAL to the affine-import case. Eager-prep dispatch shares
+// the kind-blind `dispatch_one_assignment` → `commit_assignment` path, so it
+// seeds the in-flight ledger the same way; and `SecondaryEagerPrep` is likewise
+// NOT `is_reassignable()`, so before the generalized `has_secondary_cell()` arm
+// it fell into the non-reassignable `else` and emitted a GLOBAL
+// `ClusterMutation::TaskFailed` — a spurious doom (latent until a failover
+// hydrate loads the CRDT `Failed` into `failed_tasks`). Unlike affine, eager-prep
+// has NO dependents, so the recovery is suppress-only — nothing to re-route.
+
+/// The dead-secondary recovery returns NO global `TaskFailed` for an in-flight
+/// eager-prep, and drops its in-flight ledger entry — its death is
+/// per-secondary, not a global terminal.
+///
+/// RED with `is_secondary_affine` (the pre-generalization #668 arm) instead of
+/// `has_secondary_cell`: the eager-prep (is_reassignable == false, not affine)
+/// falls into the non-reassignable `else` and the returned mutation set carries a
+/// `ClusterMutation::TaskFailed { hash: prep }`.
+#[tokio::test(flavor = "current_thread")]
+async fn dead_secondary_eager_prep_emits_no_global_task_failed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let prep = eager_prep("prep");
+            let prep_hash = compute_task_hash(&prep);
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_one_secondary_with(vec![prep]);
+            confirm_one(&mut primary).await;
+
+            // Stage a GENUINELY in-flight eager-prep: the idle filler dispatches
+            // it, claiming the cell `Queued` and seeding the in-flight ledger +
+            // holding slot on the dispatching secondary. Do NOT feed a terminal —
+            // it stays in-flight, the exact pre-death state the recovery must
+            // discriminate.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let dispatched = assignments(&mut ends[0].1);
+            let (_, sec, _worker, h) = dispatched
+                .into_iter()
+                .find(|(_, _, _, h)| *h == prep_hash)
+                .expect("the idle filler dispatched the eager-prep");
+            assert_eq!(h, prep_hash);
+            assert!(
+                primary.in_flight.contains_key(&prep_hash),
+                "the in-flight ledger holds the eager-prep after dispatch"
+            );
+            assert_eq!(
+                primary.in_flight[&prep_hash].secondary_id, sec,
+                "the ledger entry points at the dispatching secondary"
+            );
+
+            let mutations = primary.recover_inflight_for_dead_secondary(&sec);
+
+            // No global terminal for the eager-prep — its terminal is the
+            // per-secondary cell, never `failed_tasks`/CRDT `Failed`.
+            assert!(
+                !mutations.iter().any(|m| matches!(
+                    m,
+                    ClusterMutation::TaskFailed { hash, .. } if *hash == prep_hash
+                )),
+                "an in-flight eager-prep on a dead secondary must NOT emit a \
+                 global TaskFailed (its terminal is per-secondary); got {mutations:?}"
+            );
+            // The in-flight ledger entry is dropped consistently (its per-dispatch
+            // type slot was released at the loop head), so no phantom prep lingers.
+            assert!(
+                !primary.in_flight.contains_key(&prep_hash),
+                "the dead secondary's in-flight eager-prep entry is dropped"
+            );
+        })
+        .await;
+}

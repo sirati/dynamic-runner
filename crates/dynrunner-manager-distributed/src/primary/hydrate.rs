@@ -267,7 +267,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     started_phases.insert(def.phase_id.clone());
                     phases_with_terminal.insert(def.phase_id.clone());
                     soft_failed_seed.push((def.task_id.clone(), def.phase_id.clone()));
-                    failed_tasks.insert(hash.clone(), kind.clone());
+                    // #668 defense-in-depth (generalized): a CELL-BEARING
+                    // per-secondary task's terminal is PER-SECONDARY (the
+                    // bitvector cell), never the global `failed_tasks` gate — that
+                    // gate is what the affine readiness check reads to DOOM every
+                    // dependent as `Unsatisfiable`, which is exactly the bug. No
+                    // `has_secondary_cell()` hash may enter it. Eager-prep already
+                    // `continue`s above (so only `SecondaryAffine` can REACH this
+                    // arm — the kind-blind predicate is harmless-but-redundant
+                    // here, kept uniform with the other two guard sites); Part A
+                    // stops the root that flips a cell-bearing CRDT `Failed` on
+                    // death, this guard makes the projection unconditionally
+                    // cell-safe for any other path that ever lands such a `Failed`.
+                    if !def.kind.has_secondary_cell() {
+                        failed_tasks.insert(hash.clone(), kind.clone());
+                    }
                 }
                 // The ONLY dispatch-observed terminal that satisfies
                 // dependents' deps: a completed prereq produced its
@@ -467,7 +481,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     started_phases.insert(entry.phase_id.clone());
                     phases_with_terminal.insert(entry.phase_id.clone());
                     soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
-                    failed_tasks.insert(hash.clone(), kind.clone());
+                    // #668 defense-in-depth (generalized, settled twin of the fat
+                    // `Failed` arm): a CELL-BEARING per-secondary task's terminal
+                    // is PER-SECONDARY, never the global `failed_tasks` doom-gate.
+                    // Neither a `SecondaryAffine` import NOR a `SecondaryEagerPrep`
+                    // filler may enter it. This site keys on the carried
+                    // `entry.category` (a `TaskCountCategory`, not a kind — the
+                    // settled base does not replay fat bodies), so it reads the
+                    // category-level `has_secondary_cell()` twin. A cell-bearing
+                    // token never reaches a settle-eligible terminal in practice
+                    // (both are gates/fillers, never executed-and-settled by the
+                    // primary — see `SettledEntry::category`); the guard keeps the
+                    // projection cell-safe for totality regardless.
+                    if !entry.category.has_secondary_cell() {
+                        failed_tasks.insert(hash.clone(), kind.clone());
+                    }
                 }
                 SettledClass::InvalidTask => {
                     started_phases.insert(entry.phase_id.clone());
