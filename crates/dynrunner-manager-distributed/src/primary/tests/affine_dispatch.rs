@@ -4822,3 +4822,380 @@ async fn hydrate_excludes_failed_affine_import_from_failed_tasks() {
         })
         .await;
 }
+
+/// A GENUINE RECOVERABLE `TaskFailed` from `secondary`/`worker` for `task_hash`
+/// — NOT a backpressure bounce (its message is NOT in `is_backpressure_shaped`),
+/// so `handle_task_failed` takes the genuine-terminal arm: `failed_tasks` insert
+/// (Recoverable), `drop_local_terminal_residue`, `note_item_failed`. This is the
+/// shape a CROSS-PHASE affine-dep WORK build emits when its import did not land
+/// on the chosen secondary (or any recoverable build failure).
+fn task_failed_recoverable(
+    secondary: &str,
+    worker: u32,
+    task_hash: &str,
+) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: secondary.into(),
+        timestamp: 0.0,
+        secondary_id: secondary.into(),
+        worker_id: worker,
+        task_hash: task_hash.into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "import did not land".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    }
+}
+
+/// #672 UNIT: the SINGLE placement predicate ([`affine_work_placeability`])
+/// treats an affine dep whose import is ALREADY COMPLETE as SATISFIED. Three
+/// cases over one cross-phase topology (import phase "import" → build phase
+/// "build"):
+///   * import NOT-ready-in-bucket AND NOT-completed (its own upstream still
+///     blocking it / it never ran) → `NotReady` — the #669 defer is preserved.
+///   * import ready-in-bucket (token live in its Active phase) → `Placeable`
+///     (the pre-#672 placeable path, unchanged).
+///   * import COMPLETED (ran, global `TaskCompleted` originated, token dropped
+///     at its phase's `Drained → Done` edge) → `Placeable` (the #672 fix: the
+///     completed import is a met dependency even though it is no longer
+///     ready-in-bucket).
+#[tokio::test(flavor = "current_thread")]
+async fn placeability_treats_completed_import_as_satisfied() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut import = affine_import("import");
+            import.phase_id = PhaseId::from("import");
+            let import_hash = compute_task_hash(&import);
+            let mut build = make_binary("build", 20);
+            build.phase_id = PhaseId::from("build");
+            build.type_id = TypeId::from("default");
+            build.task_depends_on = vec![TaskDep {
+                task_id: "import".into(),
+                phase_id: PhaseId::from("import"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, _ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with_phase_deps(
+                    vec![import, build.clone()],
+                    HashMap::from([
+                        (PhaseId::from("import"), vec![]),
+                        (PhaseId::from("build"), vec![PhaseId::from("import")]),
+                    ]),
+                );
+            confirm_two(&mut primary).await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // CASE 1 — the import is ready-in-bucket (its phase is Active, its
+            // token sits in the pool bucket). Placeable, the pre-#672 path.
+            assert!(
+                primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == import_hash),
+                "the import must be a ready bucket item (its phase is Active)"
+            );
+            assert_eq!(
+                primary.affine_placeability_label_for_test(&build),
+                "Placeable",
+                "a ready-in-bucket import is a satisfied dep (pre-#672 path)"
+            );
+
+            // ── Run the import to completion on BOTH secondaries + drain its
+            // phase to Done, so its bucket token is DROPPED but it is COMPLETED.
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id for the import");
+            for sec in ["sec-0", "sec-1"] {
+                // Claim + run the import on this secondary (cell Queued → Done).
+                primary
+                    .apply_and_broadcast_cluster_mutations(vec![
+                        ClusterMutation::SecondaryCellQueued {
+                            secondary: sec.into(),
+                            cell_id: affine_id.0,
+                            generation: 0,
+                        },
+                    ])
+                    .await;
+                primary
+                    .handle_task_complete(task_complete(sec, 0, &import_hash), &mut None)
+                    .await;
+                settle_pump().await;
+            }
+            // Drive the lifecycle so the import phase drains Done (drops token).
+            primary.process_phase_lifecycle(&mut None).await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // The token is gone (the import is no longer ready-in-bucket) but the
+            // import COMPLETED (its global TaskState is terminal + completed_tasks
+            // holds it).
+            assert!(
+                !primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == import_hash),
+                "the import bucket token must be DROPPED at its phase's Done edge"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&import_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "the completed import's GLOBAL TaskState must be terminal \
+                 (Completed) — the #672 satisfaction signal"
+            );
+
+            // CASE 3 (#672) — a completed import (no longer ready-in-bucket) is a
+            // SATISFIED dep → Placeable. RED without the fix: NotReady (the
+            // cross-phase wedge — the work could never re-place).
+            assert_eq!(
+                primary.affine_placeability_label_for_test(&build),
+                "Placeable",
+                "#672: a COMPLETED import (token dropped) must be a satisfied dep \
+                 → Placeable, not NotReady"
+            );
+
+            // CASE 2 (#669 stays correct) — an import that is NEITHER
+            // ready-in-bucket NOR terminal must still defer (`NotReady`). The
+            // authoritative integration proof is
+            // `rebuild_defers_work_whose_import_upstream_incomplete`, which keeps
+            // its import upstream-incomplete (neither ready-in-bucket nor
+            // terminal) and asserts the rebuild defers — proving the fix turns
+            // ONLY a terminal import into newly-`Placeable` and never loosens the
+            // defer. (We cannot stage that shape inline here without un-completing
+            // the just-run import, which the ledger is monotone against.)
+            let _ = build_hash;
+        })
+        .await;
+}
+
+/// #672 CROSS-PHASE WEDGE + RECOVERY (the CRITICAL): an affine-dep WORK build W
+/// whose import I is in an EARLIER phase that has reached `Done` (I completed,
+/// its bucket token DROPPED via `drop_affine_items`). W runs, fails RECOVERABLE,
+/// and is reinjected by the retry bucket. With the #672 fix W is RE-PLACED
+/// (`Placeable`, because I is completed) → re-dispatched → recovers. Without the
+/// fix W is `NotReady` (the dropped token is no longer ready-in-bucket and the
+/// old predicate did not consult `completed_tasks`) → parked → never placed —
+/// the flat cross-phase wedge (idle workers, zero drain).
+///
+/// The recovery loop is exactly the consumer-v18 path: the reinject lands W back
+/// in the pool (withheld from the global view by `has_affine_dep`); the
+/// reconcile sweep drains the orphan + `unrecord_placed_work` clears its
+/// placement guard; the next placement pass re-runs `affine_work_placeability`,
+/// which under the fix returns `Placeable` (the predicate is the SINGLE failure
+/// point the owner flagged), so W re-dispatches.
+#[tokio::test(flavor = "current_thread")]
+async fn recoverable_cross_phase_affine_work_recovers_after_reinject() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut import = affine_import("import");
+            import.phase_id = PhaseId::from("import");
+            let import_hash = compute_task_hash(&import);
+            let mut build = make_binary("build", 20);
+            build.phase_id = PhaseId::from("build");
+            build.type_id = TypeId::from("default");
+            build.task_depends_on = vec![TaskDep {
+                task_id: "import".into(),
+                phase_id: PhaseId::from("import"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with_phase_deps(
+                    vec![import, build],
+                    HashMap::from([
+                        (PhaseId::from("import"), vec![]),
+                        (PhaseId::from("build"), vec![PhaseId::from("import")]),
+                    ]),
+                );
+            let on_start: OnPhaseStart = Box::new(|_p: &PhaseId| {});
+            let on_end: OnPhaseEnd = Box::new(move |_p, _c, _f, _o| {});
+            primary.register_phase_lifecycle_callbacks(on_start, on_end);
+            confirm_two(&mut primary).await;
+
+            // ── Drive the arc until the BUILD W is dispatched. The import runs +
+            // completes per-secondary, its phase drains Done (DROPPING the token),
+            // and W is placed + popped onto a worker. Capture W's first
+            // assignment, complete the import terminals, and DO NOT complete W —
+            // it will fail recoverable instead.
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id for the import");
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut build_secondary: Option<(String, u32)> = None;
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == build_hash {
+                        // W dispatched — record where, leave it in flight (do NOT
+                        // complete it; it fails recoverable below).
+                        build_secondary = Some((sec.clone(), *worker));
+                        continue;
+                    }
+                    // Everything else (the import) completes normally.
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                if build_secondary.is_some() {
+                    break;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+            // The import completed on both secondaries and its phase drained to
+            // `Done` NATURALLY (inside the per-completion lifecycle cascade)
+            // BEFORE W could dispatch — W's affine dep is in an EARLIER phase, so
+            // W's build phase only became Active after the import phase ended,
+            // by which point `drop_affine_items` had already dropped the token.
+            // (Driving `process_phase_lifecycle` again here is WRONG: it requeues
+            // the in-flight W back to Pending, masking the failure path.)
+
+            let (w_sec, w_worker) =
+                build_secondary.expect("the build W must have dispatched");
+
+            // PRECONDITIONS of the wedge: the import is COMPLETED (token dropped,
+            // recorded in completed_tasks) and the build W is in flight on its
+            // chosen secondary.
+            assert!(
+                !primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == import_hash),
+                "the import token must be DROPPED (its phase reached Done)"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&import_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "the import must be COMPLETED (global TaskState terminal)"
+            );
+
+            // ── W FAILS RECOVERABLE (a genuine terminal — NOT backpressure). This
+            // routes through `handle_task_failed`'s genuine-terminal arm:
+            // failed_tasks.insert(W, Recoverable), drop_local_terminal_residue
+            // clears placed_work, then `note_item_failed` drains the build phase
+            // and runs its Recoverable retry bucket INLINE (retry_max_passes=1):
+            // `try_phase_retry_bucket_core` REINJECTS W to the pool (the path at
+            // retry_bucket.rs:186, a plain `pool.reinject`) and REMOVES it from
+            // failed_tasks (revival). So after this single call W is back in the
+            // pool as `Pending` — the faithful production reinject, withheld from
+            // the global worker view by `has_affine_dep`.
+            assert!(
+                primary.in_flight.contains_key(&build_hash),
+                "precondition: W is in flight before its terminal"
+            );
+            primary
+                .handle_task_failed(
+                    task_failed_recoverable(&w_sec, w_worker, &build_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+
+            // The Recoverable retry bucket reinjected W: it is back in the pool as
+            // a ready bucket item (Pending, NOT terminal, NOT in failed_tasks) and
+            // its placement-dedup guard is cleared. This is the consumer-v18 state
+            // — W reinjected, withheld from the global view by `has_affine_dep`.
+            assert!(
+                !primary.failed_tasks.contains_key(&build_hash),
+                "the inline Recoverable retry reinject must REVIVE W (cleared from \
+                 failed_tasks)"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "W must be reinjected (non-terminal / Pending), not left failed"
+            );
+            assert!(
+                primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == build_hash),
+                "the reinjected W must be a ready bucket item in the pool"
+            );
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "W's placement guard must be cleared (so placement can re-derive it)"
+            );
+
+            // ── RECOVERY: run the reconcile sweep (drains any orphan + clears a
+            // stale placement guard) + the placement/dispatch recheck, exactly the
+            // consumer-v18 loop. With the #672 fix W is `Placeable` (its import
+            // COMPLETED) → re-placed → re-dispatched. Without the fix W is
+            // `NotReady` (token dropped, predicate ignored the completion) →
+            // parked forever (the flat cross-phase wedge).
+            let w_info = primary
+                .cluster_state_for_test()
+                .task_info_for_hash(&build_hash)
+                .expect("W is in the ledger");
+            assert_eq!(
+                primary.affine_placeability_label_for_test(&w_info),
+                "Placeable",
+                "#672: the reinjected cross-phase W must be Placeable (its import \
+                 COMPLETED) — RED without the fix (NotReady → permanent wedge)"
+            );
+            primary.reconcile_orphaned_blocked_work().await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // W RE-DISPATCHES (recovery) — it is assigned to a worker again, on a
+            // secondary whose import cell is Done (the readiness gate dispatches
+            // it `Ready`). Without the fix no assignment ever lands.
+            let mut w_redispatched = false;
+            for _ in 0..4 {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == build_hash {
+                        w_redispatched = true;
+                        // Complete it so the run can finish cleanly.
+                        primary
+                            .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                            .await;
+                        settle_pump().await;
+                    }
+                }
+                if w_redispatched {
+                    break;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+            assert!(
+                w_redispatched,
+                "#672: the reinjected cross-phase affine-dep work must RE-DISPATCH \
+                 (recover) — RED without the fix (W is NotReady → parked → never \
+                 placed → the flat cross-phase wedge: idle workers, zero drain)"
+            );
+            // The import cell on W's eventual secondary is Done — proving W ran
+            // through the readiness gate's `Ready`/`StrandedHere` arm correctly.
+            let import_done_somewhere = ["sec-0", "sec-1"].iter().any(|sec| {
+                primary.cluster_state_for_test().affine_state(sec, affine_id)
+                    == SecondaryCell::Done
+            });
+            assert!(
+                import_done_somewhere,
+                "the completed import's cell must be Done on at least one secondary"
+            );
+        })
+        .await;
+}

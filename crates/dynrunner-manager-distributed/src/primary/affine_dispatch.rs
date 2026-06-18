@@ -226,6 +226,53 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// can NEVER become ready-in-bucket, so the `all_ready` gate alone would
     /// never see it; the doomed unit must be diverted at its own work-readiness,
     /// not gated behind a prereq that can never become ready.
+    ///
+    /// ## An affine dep is SATISFIED when ready-in-bucket OR already COMPLETE (#672)
+    /// "Ready-in-bucket" only catches an import that has NOT YET run — it is a
+    /// `SecondaryAffine` token still sitting in its (Active) phase's pool bucket.
+    /// But that token is DROPPED at the import's phase's `Drained → Done` edge
+    /// (`pool::mark_phase_done → drop_affine_items`), so once the import's phase
+    /// is `Done` the import is no longer ready-in-bucket — even though it
+    /// COMPLETED (its first per-secondary run originated a global `TaskCompleted`
+    /// at `complete.rs`, driving the import's GLOBAL `TaskState` terminal). A
+    /// CROSS-PHASE affine-dep work whose import already completed in an earlier,
+    /// now-`Done` phase would therefore read `all_ready = false` → `NotReady` →
+    /// never placeable. That is benign on the FIRST placement (the work places
+    /// while its import's phase is still Active, so the token is live), but it
+    /// strands the work PERMANENTLY on a RECOVERABLE-failure REINJECT: the
+    /// retry-bucket reinject (`retry_bucket::try_phase_retry_bucket_core`) returns
+    /// the work to the pool AFTER its import's phase already reached `Done`, so
+    /// the token is gone — the reinjected work is withheld from the global worker
+    /// view by `has_affine_dep` AND can no longer re-place, a flat cross-phase
+    /// wedge (idle workers, zero drain). Treating an ALREADY-COMPLETE import as a
+    /// satisfied dep — symmetric with the `failed_tasks` read the DOOMED arm and
+    /// the readiness gate already do — closes that gap at the single predicate
+    /// root, and is strictly more correct (a completed import IS a met
+    /// dependency). A `completed`-import work re-placed on a secondary whose cell
+    /// is `NotDone` re-imports on-demand there via the ordinary per-secondary
+    /// readiness gate (`StrandedHere`), so "completed somewhere (global)" is
+    /// exactly the right Placeable signal — the chosen secondary's gate handles
+    /// the rest.
+    ///
+    /// ### Why `task_view().is_terminal()`, NOT `completed_tasks`
+    /// The coordinator's `completed_tasks` HashSet does NOT hold affine imports:
+    /// `handle_task_complete` routes an affine terminal to `handle_affine_task_complete`
+    /// BEFORE the `completed_tasks.insert` (an affine import legitimately
+    /// completes on N secondaries, so it is deliberately kept OUT of the global
+    /// completed-dedup). The import's completion lives in the REPLICATED ledger
+    /// instead — its global `TaskState` reaches `Completed`. We read it via
+    /// `task_view` (not `task_state`) so a SETTLED/spilled completed import (at
+    /// scale its fat body leaves the in-memory map) is still seen as terminal —
+    /// `task_state` would return `None` for it and re-introduce the wedge for a
+    /// settled cross-phase import. A terminal view here is necessarily a
+    /// SUCCESS: a globally-FAILED import is in `failed_tasks`, which the DOOMED
+    /// arm above already diverted (early-return), so any dep still reaching this
+    /// `all_ready` walk is non-failed — its terminal can only be `Completed`.
+    ///
+    /// This does NOT loosen the #669 defer: that case is an import whose OWN
+    /// non-affine upstream is still incomplete, so the import is neither
+    /// ready-in-bucket NOR terminal → still `NotReady`. Only an import that has
+    /// genuinely COMPLETED becomes newly-`Placeable`.
     fn affine_work_placeability(
         &self,
         placement: &WorkPlacement,
@@ -233,18 +280,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ) -> AffinePlaceability {
         // DOOMED: the unit is `Unsatisfiable` — its affine import is
         // globally-failed (the EXACT #648 predicate, which reads
-        // `failed_tasks`). Checked INDEPENDENTLY of `ready_affine`.
+        // `failed_tasks`). Checked INDEPENDENTLY of `ready_affine`. Also makes
+        // the `all_ready` terminal-read below SUCCESS-only: a globally-failed
+        // import is diverted here, so any dep that survives to the walk is
+        // non-failed and its terminal can only be `Completed`.
         if self
             .affine_unit_satisfiable_secondaries(placement)
             .is_empty()
         {
             return AffinePlaceability::Doomed;
         }
-        // PLACEABLE: every affine prereq is ready-in-bucket.
-        let all_ready = placement
-            .affine_deps
-            .iter()
-            .all(|(_, hash)| ready_affine.contains(hash));
+        // PLACEABLE: every affine prereq is SATISFIED — ready-in-bucket (not yet
+        // run, token live in its Active phase's pool bucket) OR already COMPLETE
+        // (#672: ran in an earlier phase whose `Drained → Done` edge dropped the
+        // token, so it is no longer ready-in-bucket but its GLOBAL `TaskState` is
+        // terminal — read via `task_view` so a settled completion still counts).
+        let all_ready = placement.affine_deps.iter().all(|(_, hash)| {
+            ready_affine.contains(hash)
+                || self
+                    .cluster_state
+                    .task_view(hash)
+                    .is_some_and(|v| v.is_terminal())
+        });
         if all_ready {
             AffinePlaceability::Placeable
         } else {
@@ -1687,6 +1744,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             AffineGateOutcome::StrandedHere => "StrandedHere".into(),
             AffineGateOutcome::Reroute(target) => format!("Reroute({target})"),
             AffineGateOutcome::Unsatisfiable => "Unsatisfiable".into(),
+        }
+    }
+
+    /// Test-only inspector: the [`AffinePlaceability`] verdict the SINGLE
+    /// placement predicate ([`Self::affine_work_placeability`]) produces for
+    /// `task`, as a stable label, built over the live ready-in-bucket set. Lets
+    /// the #672 / #669 unit tests assert the predicate directly (completed-import
+    /// ⇒ `Placeable`; not-ready-not-completed ⇒ `NotReady`; ready-in-bucket ⇒
+    /// `Placeable`; globally-failed ⇒ `Doomed`) without exposing the private
+    /// outcome enum across the module boundary.
+    #[cfg(test)]
+    pub(crate) fn affine_placeability_label_for_test(&self, task: &TaskInfo<I>) -> String {
+        let ready_affine = self.affine_ready_in_bucket_imports();
+        let placement = self.affine_placement_for(task);
+        match self.affine_work_placeability(&placement, &ready_affine) {
+            AffinePlaceability::Placeable => "Placeable".into(),
+            AffinePlaceability::Doomed => "Doomed".into(),
+            AffinePlaceability::NotReady => "NotReady".into(),
         }
     }
 }
