@@ -191,17 +191,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `affine_unit_satisfiable_secondaries` is computed once per candidate and
         // reused for both the doomed decision and (for a placeable one) is not
         // needed again — so the predicate runs at most once per candidate.
+        // COST (MED-3b): the discriminators run on `state.def()` / the resolved
+        // dep-refs IN PLACE, never on a full `task_to_info` clone. The placement
+        // construction reads ONLY the task's content hash (the iteration's `hash`
+        // key) + the affine subset of its deps, so the whole-`TaskInfo` clone the
+        // old path paid for EVERY non-affine task (before the `affine_deps`
+        // filter dropped the vast majority) is never materialized. The placed-set
+        // is identical: `affine_placement_for_state` produces the same
+        // `WorkPlacement` as the prior `affine_placement_for(&task_to_info(state))`
+        // for the same logical task, and every downstream gate (the doomed
+        // predicate, the `all_ready` check) reads only that placement plus the
+        // entry's `phase_id` (read from `def()` for the doomed set, no clone).
         let mut doomed: Vec<(String, dynrunner_core::PhaseId)> = Vec::new();
         let placements: Vec<(String, super::affine_scheduler::WorkPlacement)> = self
             .cluster_state
             .tasks_iter()
-            .filter_map(|(_, state)| {
+            .filter_map(|(hash, state)| {
                 let def = state.def();
                 if def.kind.is_secondary_affine() {
                     return None;
                 }
-                let task = self.cluster_state.task_to_info(state);
-                let placement = self.affine_placement_for(&task);
+                let placement = self.affine_placement_for_state(hash, state);
                 if placement.affine_deps.is_empty() {
                     return None;
                 }
@@ -212,7 +222,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .affine_unit_satisfiable_secondaries(&placement)
                     .is_empty()
                 {
-                    doomed.push((placement.hash.clone(), task.phase_id.clone()));
+                    doomed.push((placement.hash.clone(), def.phase_id.clone()));
                     return None;
                 }
                 // PLACEABLE: every affine prereq is ready-in-bucket.

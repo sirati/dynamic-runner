@@ -156,12 +156,17 @@ const CLUSTER_GONE_CONSULT_INTERVAL: Duration = Duration::from_secs(90);
 /// never strands stale, yet ingesting a burst of mutations costs at most ONE
 /// rebuild per drained burst plus one per cadence tick, NOT one per frame.
 ///
-/// 1s mirrors the reporter's own idle-detector cadence granularity (the
-/// operator never reads the cell faster than its 1-minute / 10-minute
-/// emit cadences, so 1s freshness is already far tighter than any consumer
-/// needs) while keeping the worst-case idle rebuild rate to ~1/s — O(ledger)
-/// at most once a second, versus once per ingested frame.
-const STATS_PROJECTION_MAX_STALENESS: Duration = Duration::from_secs(1);
+/// 5s is the SOLE bound on the sustained O(live-ledger) rebuild cost under a
+/// never-quiescent ledger: when mutations never stop arriving the
+/// `state_generation` dirty-gate is always dirty, so this rate-limit — not the
+/// gate — is what caps the rebuild rate. The reporter emits the live feed on a
+/// ~10-minute cadence (`reporting/reporter.rs` `STATS_INTERVAL`, with a
+/// 1-minute idle poll), so a 5s projection refresh is still far finer than any
+/// cadence a consumer ever observes; widening 1s→5s cuts the sustained idle
+/// rebuild cost 5× at 120k tasks with zero observable freshness/latency loss.
+/// Do NOT widen beyond 5s — keep the live feed responsive when an operator
+/// reads the freshly-projected cell out-of-band.
+const STATS_PROJECTION_MAX_STALENESS: Duration = Duration::from_secs(5);
 
 /// Configuration for a standalone observer. Carries only the values the
 /// observer's own concerns read: the node identity, the lost-visibility
