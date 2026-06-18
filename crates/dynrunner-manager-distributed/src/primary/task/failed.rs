@@ -545,6 +545,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &task_hash) {
                 self.apply_and_broadcast_cluster_mutations(vec![m]).await;
             }
+            // PER-SECONDARY UNBLOCK on bounce (#652 concern B): a work blocked
+            // on this import here is waiting on a cell that just went `Queued →
+            // NotDone` (the import never ran). Re-enqueue it so it re-pops
+            // `StrandedHere` and re-derives the import on-demand — otherwise it
+            // would wait forever on a cell no terminal will ever flip `Done`
+            // (the bounce already consumed the only in-flight run). Reuses the
+            // cell-finished re-enqueue seam (it re-appends + re-gates uniformly).
+            if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+                self.reenqueue_affine_unblocked_on_cell(&secondary_id, affine_id)
+                    .await;
+            }
             tracing::debug!(
                 secondary = %secondary_id,
                 worker_id,
@@ -573,6 +584,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // whose overflow would drop dependents at scale.
             self.fast_fail_affine_dependents_if_unsatisfiable(&task_hash, command_rx)
                 .await;
+            // PER-SECONDARY BLOCKED RE-ROUTE on genuine fail (#652 concern B's
+            // import-FAIL edge): a work BLOCKED on this import HERE must not wait
+            // for the 5-min reconcile — its cell is now `Failed`, so drain it
+            // from the per-secondary blocked map and re-decide RIGHT NOW: re-route
+            // to a still-eligible secondary (clear its placement guard so the
+            // next placement pass re-derives it), or terminalize it if the import
+            // failed on every eligible secondary (the shared #648/#650 batch).
+            // The fast-fail above already terminalized the bucket entries of the
+            // globally-doomed dependents; this additionally clears their stale
+            // blocked-map overlay and re-routes the still-satisfiable ones.
+            if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+                self.reroute_affine_blocked_on(&secondary_id, Some(affine_id), command_rx)
+                    .await;
+            }
             self.drop_supplanted_holder(&task_hash);
             // POOL TERMINAL-FAILURE MIRROR (the failed twin of the complete
             // path's `note_affine_terminal`). The per-secondary cell flip above

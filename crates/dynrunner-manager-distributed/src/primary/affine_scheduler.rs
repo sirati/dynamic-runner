@@ -121,6 +121,25 @@ pub(crate) struct AffineScheduler {
     /// (returns `false` if already placed — the gate) and undoes it via
     /// [`Self::unrecord_placed_work`].
     placed_work: std::collections::HashSet<String>,
+    /// PER-SECONDARY blocked WORK tasks (#652 concern B): `(secondary, work
+    /// hash) → the set of affine import cells still NOT `Done` on that
+    /// secondary`. A work task whose import is not yet imported on its chosen
+    /// secondary is NOT enqueued onto that secondary's queue (which would
+    /// spin-requeue on every `TasksAdded`); it WAITS here until every pending
+    /// import cell flips `Done` ([`Self::on_cell_finished`] empties its set and
+    /// returns it for enqueue). The edge is PER-SECONDARY because the same
+    /// affine work runs on multiple secondaries — a block on `(S, W)` is
+    /// independent of `(S', W)`.
+    ///
+    /// Co-located with `queues` + `placed_work` (the same scheduling-state
+    /// concern, reset together by [`Self::clear`] on failover rebuild). The
+    /// pool's global-`task_id`-keyed `blocked` map cannot express the
+    /// `(import D, secondary S)` readiness this needs (#652 FLAG #3), and the
+    /// work task STAYS in the pool bucket as its phase-drain token while blocked
+    /// here — this map is a pure per-secondary scheduling overlay, never the
+    /// phase-drain authority.
+    blocked_per_secondary:
+        HashMap<(String, String), std::collections::HashSet<SecondaryCellId>>,
 }
 
 impl AffineScheduler {
@@ -130,6 +149,106 @@ impl AffineScheduler {
     pub(crate) fn clear(&mut self) {
         self.queues.clear();
         self.placed_work.clear();
+        self.blocked_per_secondary.clear();
+    }
+
+    /// Block work `work_hash` on `secondary` until every cell in
+    /// `pending_imports` is `Done` there (#652 concern B). Records the
+    /// per-secondary blocked entry; the work is NOT enqueued onto the
+    /// secondary's queue (the caller dispatches the missing import on-demand and
+    /// returns — the work re-enters the queue via [`Self::on_cell_finished`]
+    /// when its imports complete). An empty `pending_imports` is a no-op (the
+    /// caller should enqueue directly via `place` in that all-`Done` case).
+    /// Idempotent: re-blocking the same `(secondary, work_hash)` overwrites with
+    /// the current pending set (the freshest gate read).
+    pub(crate) fn block_until_import(
+        &mut self,
+        secondary: &str,
+        work_hash: &str,
+        pending_imports: Vec<SecondaryCellId>,
+    ) {
+        if pending_imports.is_empty() {
+            return;
+        }
+        self.blocked_per_secondary.insert(
+            (secondary.to_string(), work_hash.to_string()),
+            pending_imports.into_iter().collect(),
+        );
+    }
+
+    /// Bitvector-cell-`Finished` handler (#652 concern B): an affine import's
+    /// cell just flipped `Done` on `secondary`. Return + UNBLOCK every work on
+    /// THIS secondary that was waiting on `affine_id` — the caller re-enqueues
+    /// each onto the secondary's queue via `place` so it RE-POPS + re-gates.
+    ///
+    /// Why unblock EVERY waiter (not only the now-fully-`Done` ones): a
+    /// multi-import work (e.g. `[base, delta]`) waits on the FIRST not-`Done`
+    /// import in list order — `dispatch_affine_import_on_demand` kicked only
+    /// `base`. When `base` flips `Done` the work must re-pop so the gate sees
+    /// `delta` is now the first not-`Done` import and kicks IT (then re-blocks
+    /// the work on `delta`). Re-enqueuing on EACH cell-finish drives that
+    /// list-order progression one import per real `Finished` EVENT — never a
+    /// spin (the work leaves the queue again immediately on the re-block, and
+    /// every cycle makes forward progress on exactly one import). A work whose
+    /// imports are now ALL `Done` re-pops `Ready` and dispatches. Removing the
+    /// entry keeps the map free of stale blocks; the re-pop re-blocks it on its
+    /// remaining imports if any.
+    pub(crate) fn on_cell_finished(
+        &mut self,
+        secondary: &str,
+        affine_id: SecondaryCellId,
+    ) -> Vec<String> {
+        let mut freed = Vec::new();
+        self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
+            if sec == secondary && pending.contains(&affine_id) {
+                freed.push(work_hash.clone());
+                false // unblock — the caller re-enqueues for a re-pop + re-gate
+            } else {
+                true
+            }
+        });
+        freed
+    }
+
+    /// Bitvector-cell-`Failed` / dead-secondary drain (#652 concern B's
+    /// import-FAIL + dead-secondary edges): remove + RETURN every blocked work
+    /// on `secondary` (optionally filtered to those waiting on `affine_id`) so
+    /// the caller can make a fresh route/terminalize decision RIGHT NOW — never
+    /// leaving the work stranded until the 5-min reconcile. `affine_id = None`
+    /// drains the whole secondary (dead-secondary); `Some(aid)` drains only the
+    /// works waiting on that import (one import failed). The returned works are
+    /// no longer blocked here; the caller is responsible for re-placing or
+    /// terminalizing them.
+    pub(crate) fn drain_blocked_on(
+        &mut self,
+        secondary: &str,
+        affine_id: Option<SecondaryCellId>,
+    ) -> Vec<String> {
+        let mut drained = Vec::new();
+        self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
+            if sec != secondary {
+                return true;
+            }
+            let hit = match affine_id {
+                Some(aid) => pending.contains(&aid),
+                None => true,
+            };
+            if hit {
+                drained.push(work_hash.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drained
+    }
+
+    /// Whether `(secondary, work_hash)` is currently blocked-on-import — the
+    /// read seam the concern-B tests assert against.
+    #[cfg(test)]
+    pub(crate) fn is_blocked_on_import(&self, secondary: &str, work_hash: &str) -> bool {
+        self.blocked_per_secondary
+            .contains_key(&(secondary.to_string(), work_hash.to_string()))
     }
 
     /// Record `work_hash` as PLACED (the placement trigger queued its unit) and
@@ -385,9 +504,17 @@ impl AffineScheduler {
         C: Fn(&str, &str) -> bool,
     {
         // Pick the donor T: longest queue, name tie-break, never S itself, must
-        // be non-empty AND its head schedulable unit's work must be steal-eligible
-        // (no in-flight import on T). The eligibility is an ADDED filter; the
-        // longest/name `max_by` tie-break is unchanged.
+        // be non-empty AND CONTAIN A WORK unit whose import is steal-eligible (no
+        // in-flight import on T). A queue with NO work unit is NOT a donor (#652
+        // concern B): under lazy import a queue normally holds only work units,
+        // but a refused on-demand import dispatch can leave a BARE `Affine`
+        // import unit requeued at its front. That import is per-secondary —
+        // committed to T because a dependent there triggered it — so it must
+        // NEVER migrate to S (stealing it would dispatch the import on a
+        // secondary whose dependent's earlier deps are not yet met — e.g. a
+        // delta whose base is still `NotDone` on S). The eligibility +
+        // has-work filter is an ADDED filter; the longest/name `max_by`
+        // tie-break is unchanged.
         let donor = self
             .queues
             .iter()
@@ -396,7 +523,10 @@ impl AffineScheduler {
                     && !q.is_empty()
                     && match q.iter().find(|u| u.is_work()) {
                         Some(QueuedUnit::Work { hash }) => can_steal_work(t, hash),
-                        _ => true,
+                        // No work unit (only a bare requeued import) → NOT a
+                        // donor: nothing schedulable to steal, and the import
+                        // must stay on its own secondary.
+                        _ => false,
                     }
             })
             .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(a.0)))

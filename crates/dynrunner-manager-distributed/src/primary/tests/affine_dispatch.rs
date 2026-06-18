@@ -3019,3 +3019,252 @@ async fn placement_waves_with_dead_import_do_not_grow_placed_but_unqueued() {
         })
         .await;
 }
+
+// ── #652 concern B: affine-dep-as-blocked (per-secondary) ──
+
+/// #652 B core: an affine-dep WORK task whose per-secondary import is NOT yet
+/// `Done` WAITS in the per-secondary blocked map (it is NOT enqueued + spun on
+/// the per-secondary queue, the old `InFlightHere => requeue_front` churn). It is
+/// enqueued + dispatched ONLY once its import cell flips `Done`. While it waits,
+/// its phase stays open (the blocked work is still its pool phase-drain token —
+/// owner requirement #3: a blocked-in-affine-map work must NOT let the phase
+/// drain prematurely).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_waits_blocked_until_import_finished() {
+    use dynrunner_scheduler_api::pending_pool::PhaseState;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            // First recheck wave: placement routes the build onto a secondary,
+            // its pop gates `StrandedHere` (import NotDone there), dispatches the
+            // IMPORT on-demand, and BLOCKS the build (does NOT enqueue/spin it).
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // Exactly the import dispatched in this wave — NOT the build (it is
+            // blocked, waiting on its per-secondary import cell).
+            let mut wave: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                wave.extend(assignments(rx));
+            }
+            assert!(
+                wave.iter().all(|(_, _, _, h)| *h != build_hash),
+                "the build must NOT dispatch before its import is Done; got {wave:?}"
+            );
+            let (import_sec, import_worker) = wave
+                .iter()
+                .find(|(_, _, _, h)| *h == import_hash)
+                .map(|(_, sec, w, _)| (sec.clone(), *w))
+                .expect("the import dispatched on-demand for the blocked build");
+
+            // The build is BLOCKED on its import on that secondary (not queued).
+            assert!(
+                primary.affine_is_blocked_on_import_for_test(&import_sec, &build_hash),
+                "the build must WAIT in the per-secondary blocked map on {import_sec}"
+            );
+            // Owner requirement #3: phase "work" must NOT drain while the build
+            // waits blocked — it is still a live pool item holding the phase open.
+            assert_ne!(
+                primary.pool().phase_state(&PhaseId::from("work")),
+                Some(PhaseState::Done),
+                "phase 'work' must stay open while a build is blocked-on-import"
+            );
+
+            // Complete the import on its secondary → cell `Done` → on_cell_finished
+            // unblocks + re-enqueues the build → it dispatches there.
+            primary
+                .handle_task_complete(
+                    task_complete(&import_sec, import_worker, &import_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // The build is no longer blocked (it was unblocked on cell-Finished).
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&import_sec, &build_hash),
+                "the build must be unblocked once its import is Done"
+            );
+            // And it dispatched (on the secondary whose import is now Done).
+            let mut after: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                after.extend(assignments(rx));
+            }
+            let build_dispatch = after.iter().find(|(_, _, _, h)| *h == build_hash);
+            assert!(
+                build_dispatch.is_some(),
+                "the build must dispatch once its import is Done; got {after:?}"
+            );
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .unwrap();
+            let (_, build_sec, _, _) = build_dispatch.unwrap();
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(build_sec, affine_id),
+                SecondaryCell::Done,
+                "the build dispatched only on a secondary whose import cell is Done"
+            );
+        })
+        .await;
+}
+
+/// #652 B acceptance signature: an IDLE secondary actually attempts affine work
+/// and triggers its OWN on-demand import — it does not sit idle while all builds
+/// concentrate on one secondary (the asm-dataset-nix symptom). With one build
+/// per secondary, BOTH secondaries' imports run (each node imports locally),
+/// proving the idle secondary received a share, popped it, and kicked its own
+/// import via the per-secondary blocked → on-demand path.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_idle_secondary_triggers_own_import() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build_0 = work_dep("build_0", "import");
+            let build_1 = work_dep("build_1", "import");
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build_0, build_1]);
+            confirm_two(&mut primary).await;
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .unwrap();
+
+            // Drive to quiescence, completing every dispatched IMPORT (so each
+            // secondary's cell can reach Done and its build can run).
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_secs: std::collections::HashSet<String> = Default::default();
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == import_hash {
+                        import_secs.insert(sec.clone());
+                    }
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // THE ACCEPTANCE SIGNATURE: BOTH secondaries ran the import — the
+            // formerly-idle secondary triggered its OWN on-demand import rather
+            // than staying idle while sec-0 took every build.
+            assert_eq!(
+                import_secs.len(),
+                2,
+                "BOTH secondaries must trigger their own import (idle-secondary \
+                 under-utilization fix); import ran on: {import_secs:?}"
+            );
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::Done,
+                    "the idle secondary {sec} imported locally (cell Done)"
+                );
+            }
+        })
+        .await;
+}
+
+/// #652 B import-FAIL edge (owner requirement): when a blocked build's import
+/// FAILS on its secondary but is still SATISFIABLE on another, the failure event
+/// drains the build from the per-secondary blocked map IMMEDIATELY and re-routes
+/// it — it does not strand until the 5-min reconcile. The build ultimately runs
+/// on the surviving secondary and the run completes.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_import_failed_reroutes_blocked_build() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            // ONE build → it is blocked on exactly one secondary at a time.
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            // Find where the import dispatched (the build is blocked there).
+            let mut wave: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                wave.extend(assignments(rx));
+            }
+            let (fail_sec, fail_worker) = wave
+                .iter()
+                .find(|(_, _, _, h)| *h == import_hash)
+                .map(|(_, sec, w, _)| (sec.clone(), *w))
+                .expect("import dispatched for the blocked build");
+            assert!(
+                primary.affine_is_blocked_on_import_for_test(&fail_sec, &build_hash),
+                "the build is blocked on {fail_sec} before the import fails"
+            );
+
+            // FAIL the import on that secondary (genuine terminal). The cell
+            // flips Failed, the import is still satisfiable on the OTHER
+            // secondary, so the blocked build must be drained + re-routed NOW.
+            primary
+                .handle_task_failed(task_failed(&fail_sec, fail_worker, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            // The build is no longer blocked on the failed secondary.
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&fail_sec, &build_hash),
+                "the failed import must drain the blocked build from {fail_sec} immediately"
+            );
+
+            // Drive to quiescence, completing imports/builds. The build re-routes
+            // to the surviving secondary, its import runs there, and it completes.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "the re-routed build must complete on the surviving secondary"
+            );
+            assert!(
+                primary.run_complete_check(),
+                "the run completes after the import fails on one secondary + re-routes"
+            );
+        })
+        .await;
+}

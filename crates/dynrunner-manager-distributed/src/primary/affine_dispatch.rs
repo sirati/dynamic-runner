@@ -393,22 +393,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             match self.affine_readiness_gate(secondary, &placement) {
                 AffineGateOutcome::Ready => {}
                 AffineGateOutcome::InFlightHere => {
-                    // Import in flight here: leave W at the front, let the
-                    // import's terminal re-nudge. No re-place, no emit.
-                    self.affine_scheduler.requeue_front(secondary, unit);
+                    // Import in flight here (#652 concern B): the work's import
+                    // is `Queued` on this secondary (running, perhaps for a
+                    // sibling). Do NOT requeue W onto the queue — that is the
+                    // spin the redesign removes (every `TasksAdded` re-pops +
+                    // re-requeues W until the import lands). Instead BLOCK W in
+                    // the per-secondary blocked map on its not-yet-`Done` import
+                    // cells; the import's terminal flips the cell `Done` and
+                    // `on_cell_finished` (in the affine-complete handler)
+                    // re-enqueues W onto this secondary's queue. The popped
+                    // orphan copy is discarded (W left the queue). No re-dispatch
+                    // of the import (it is already in flight).
+                    let pending = self.not_done_cells_on(secondary, &placement);
+                    self.affine_scheduler
+                        .block_until_import(secondary, &hash, pending);
                     return false;
                 }
                 AffineGateOutcome::StrandedHere => {
-                    // Lazy-import model (c): the work has committed to THIS
-                    // secondary (it was popped for a worker here) but an affine
-                    // dep is NotDone here — dispatch the import ON-DEMAND now,
-                    // claiming the cell `Queued`, and requeue the work to the
-                    // front so it dispatches after the import's terminal nudge
-                    // (the `InFlightHere` gate holds it until the cell is Done).
-                    // The import runs ONLY because this dependent committed here —
-                    // never speculatively ahead of one — so it can never be
-                    // stranded by a steal.
-                    self.dispatch_affine_import_on_demand(worker_idx, secondary, &placement, unit)
+                    // Lazy-import model (c) under #652 concern B: the work was
+                    // popped for a worker on THIS secondary but an affine dep is
+                    // `NotDone` here — dispatch the import ON-DEMAND now (worker
+                    // in scope), claiming the cell `Queued`. Then BLOCK W in the
+                    // per-secondary blocked map on its not-yet-`Done` import
+                    // cells INSTEAD of requeuing it onto the queue (the spin the
+                    // redesign removes); `on_cell_finished` re-enqueues W once
+                    // its imports complete. The import runs ONLY because this
+                    // dependent committed here — never speculatively ahead of one
+                    // — so it can never be stranded by a steal. The popped orphan
+                    // is discarded (W left the queue).
+                    let pending = self.not_done_cells_on(secondary, &placement);
+                    self.affine_scheduler
+                        .block_until_import(secondary, &hash, pending);
+                    self.dispatch_affine_import_on_demand(worker_idx, secondary, &placement)
                         .await;
                     return false;
                 }
@@ -694,40 +710,145 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
     }
 
-    /// Lazy-import ON-DEMAND dispatch (model c): a WORK unit committed on
-    /// `secondary` (popped for `worker_idx`) found an affine dep `NotDone` here
-    /// (the `StrandedHere` gate). Dispatch that import on `secondary` NOW —
-    /// claiming the cell `Queued` and sending the import to this worker — and
-    /// requeue the work to the FRONT so it re-pops once the import terminals (the
-    /// `InFlightHere` gate holds it `Queued`, the import's terminal nudges the
-    /// re-pop). The import runs ONLY because this dependent committed here, so it
-    /// is never speculatively dispatched ahead of a work and never strandable by
-    /// a steal.
+    /// Cell-`Finished` unblock (#652 concern B): an affine import's cell just
+    /// flipped `Done` on `secondary`. Re-enqueue every work that was blocked on
+    /// that import here onto `secondary`'s queue so it re-pops + re-gates (the
+    /// gate then dispatches it `Ready`, kicks its next list-order import
+    /// `StrandedHere`, or re-blocks `InFlightHere`). Called from the
+    /// affine-complete handler right after the cell flips `Done`. A no-op when
+    /// nothing was blocked on this `(secondary, affine_id)`.
+    ///
+    /// Re-enqueue is via `place` (re-appends the Work unit to the queue — the
+    /// work was previously popped OUT of the queue into the blocked map, so it is
+    /// absent from the queue and `place` does not double-queue it; `placed_work`
+    /// stays set, which is correct: the work IS placed, just on the blocked
+    /// overlay until now). Emits `TasksAdded` so an idle worker pops it.
+    pub(crate) async fn reenqueue_affine_unblocked_on_cell(
+        &mut self,
+        secondary: &str,
+        affine_id: SecondaryCellId,
+    ) {
+        let freed = self.affine_scheduler.on_cell_finished(secondary, affine_id);
+        if freed.is_empty() {
+            return;
+        }
+        for work_hash in &freed {
+            let Some(task) = self.cluster_state.task_info_for_hash(work_hash) else {
+                // Settled / gone (the work terminalized while blocked): drop it,
+                // nothing to re-enqueue.
+                continue;
+            };
+            let placement = self.affine_placement_for(&task);
+            let mutations = self.affine_scheduler.place::<I, _>(
+                secondary,
+                &placement,
+                |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
+            );
+            if !mutations.is_empty() {
+                self.apply_and_broadcast_cluster_mutations(mutations).await;
+            }
+        }
+        self.cluster_state
+            .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+    }
+
+    /// Cell-`Failed` / dead-secondary re-route (#652 concern B's import-FAIL +
+    /// dead-secondary edges): drain every work blocked on `secondary` (filtered
+    /// to `affine_id` when `Some`, the whole secondary when `None`) and make a
+    /// FRESH route/terminalize decision for each RIGHT NOW — never leaving it
+    /// stranded until the 5-min reconcile. For each drained work:
+    ///   * SATISFIABLE elsewhere → clear its placement-dedup so the next
+    ///     placement pass re-derives it onto a still-eligible secondary (the
+    ///     same `unrecord_placed_work` seam `requeue_affine_aware` uses); the
+    ///     emitted `TasksAdded` re-runs placement.
+    ///   * UNSATISFIABLE (import failed on every eligible secondary) → collect
+    ///     for the shared #648/#650 terminalize batch.
+    ///
+    /// The work STAYS a pool item throughout (its phase-drain token); this only
+    /// re-decides the per-secondary scheduling overlay.
+    pub(crate) async fn reroute_affine_blocked_on(
+        &mut self,
+        secondary: &str,
+        affine_id: Option<SecondaryCellId>,
+        command_rx: &mut Option<tokio::sync::mpsc::Receiver<super::command_channel::PrimaryCommand<I>>>,
+    ) {
+        let drained = self.affine_scheduler.drain_blocked_on(secondary, affine_id);
+        if drained.is_empty() {
+            return;
+        }
+        let mut doomed: Vec<(String, dynrunner_core::PhaseId)> = Vec::new();
+        for work_hash in &drained {
+            let Some(task) = self.cluster_state.task_info_for_hash(work_hash) else {
+                continue;
+            };
+            let placement = self.affine_placement_for(&task);
+            if self.affine_unit_satisfiable_secondaries(&placement).is_empty() {
+                // Doomed everywhere — terminalize via the shared dead-upstream
+                // batch path (claim out of bucket + one broadcast + one cascade).
+                doomed.push((work_hash.clone(), task.phase_id.clone()));
+            } else {
+                // Re-routable: clear the placement guard so placement re-derives
+                // the work onto a still-eligible secondary on the next pass.
+                self.affine_scheduler.unrecord_placed_work(work_hash);
+            }
+        }
+        if !doomed.is_empty() {
+            self.terminalize_doomed_affine_work(doomed, command_rx).await;
+        }
+        // Re-run placement (re-route the cleared works) + dispatch.
+        self.cluster_state
+            .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+    }
+
+    /// The affine import cells of `placement` that are NOT yet `Done` on
+    /// `secondary` (#652 concern B) — exactly the imports a work blocked on this
+    /// secondary is WAITING for. `block_until_import` records this set; each cell
+    /// flipping `Done` ([`AffineScheduler::on_cell_finished`]) drops one, and the
+    /// work unblocks when the set empties. A `Failed` cell is included (it is not
+    /// `Done`); the import-FAIL edge drains such a block via
+    /// [`AffineScheduler::drain_blocked_on`] before the cell could matter here.
+    fn not_done_cells_on(&self, secondary: &str, placement: &WorkPlacement) -> Vec<SecondaryCellId> {
+        placement
+            .affine_deps
+            .iter()
+            .filter(|(aid, _)| {
+                self.cluster_state.affine_state(secondary, *aid) != SecondaryCell::Done
+            })
+            .map(|(aid, _)| *aid)
+            .collect()
+    }
+
+    /// Lazy-import ON-DEMAND dispatch (model c) under #652 concern B: a WORK
+    /// unit committed on `secondary` (popped for `worker_idx`) found an affine
+    /// dep `NotDone` here (the `StrandedHere` gate). The caller has ALREADY
+    /// blocked the work in the per-secondary blocked map; this helper only
+    /// dispatches the missing import on `secondary` NOW — claiming the cell
+    /// `Queued` and sending the import to this worker. When the import terminals
+    /// its cell flips `Done` and the affine-complete handler's
+    /// [`AffineScheduler::on_cell_finished`] re-enqueues the work onto this
+    /// secondary's queue (NO requeue/spin here — the work LEFT the queue into the
+    /// blocked map). The import runs ONLY because this dependent committed here,
+    /// so it is never speculatively dispatched ahead of a work and never
+    /// strandable by a steal.
     ///
     /// Dispatches the FIRST `NotDone` dep. This is consistent with the
     /// list-order dependency-not-met gate: `StrandedHere` fires ONLY when the
     /// first not-`Done` dep is itself `NotDone` (an earlier `Queued`/unmet dep
     /// would have gated `InFlightHere` and never reached here), so the first
     /// `NotDone` dep IS the first not-`Done` dep — the right import to run.
-    /// Multi-dep units resolve one import per re-pop in list order (each earlier
-    /// dep, once in flight, is unmet so the unit `InFlightHere`-waits on it), so
-    /// a delta import is never dispatched ahead of its still-not-met base. The
-    /// run-once + concurrent dispatch-once guards in
-    /// [`Self::dispatch_affine_unit`] still apply (a `Done`/in-flight import here
-    /// is skipped), so a re-pop racing the import's terminal cannot double-run
-    /// it. The work is always requeued so it is never lost.
+    /// Multi-dep units resolve one import per unblock in list order (each earlier
+    /// dep, once in flight, is unmet so the work stays blocked on it via the
+    /// `InFlightHere` re-block on the next pop), so a delta import is never
+    /// dispatched ahead of its still-not-met base. The run-once + concurrent
+    /// dispatch-once guards in [`Self::dispatch_affine_unit`] still apply (a
+    /// `Done`/in-flight import here is skipped), so a re-pop racing the import's
+    /// terminal cannot double-run it.
     async fn dispatch_affine_import_on_demand(
         &mut self,
         worker_idx: usize,
         secondary: &str,
         placement: &WorkPlacement,
-        work_unit: QueuedUnit,
     ) {
-        // The work re-pops after the import terminals; keep it at the front so it
-        // is the next unit this secondary serves. Requeue FIRST so an early
-        // return (no dispatchable import) never loses it.
-        self.affine_scheduler.requeue_front(secondary, work_unit);
-
         // First NotDone affine dep — the import to run on-demand here. (Queued =
         // already in flight here; Done = already ran here; Failed = the gate took
         // a different arm — none reach `StrandedHere`.)

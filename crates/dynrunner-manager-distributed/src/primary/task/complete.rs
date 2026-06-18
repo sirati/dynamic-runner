@@ -389,6 +389,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.apply_and_broadcast_cluster_mutations(vec![m]).await;
         }
 
+        // (1b) PER-SECONDARY UNBLOCK (#652 concern B): the import's cell just
+        // flipped `Done` on this secondary, so every work BLOCKED on this import
+        // here is now one import closer to ready. Re-enqueue each onto this
+        // secondary's queue so it re-pops + re-gates (dispatches `Ready`, or
+        // kicks its next list-order import). This is the unblock half of the
+        // affine-as-blocked model — the work LEFT the queue into the blocked map
+        // at `StrandedHere`/`InFlightHere`, and re-enters it HERE on the
+        // import's `Finished` event (never a per-`TasksAdded` requeue spin).
+        if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+            self.reenqueue_affine_unblocked_on_cell(&secondary_id, affine_id)
+                .await;
+        }
+
         // A healthy completion proves the secondary live — clear its backoff.
         self.backpressured_secondaries.remove(&secondary_id);
         self.drop_supplanted_holder(&task_hash);
