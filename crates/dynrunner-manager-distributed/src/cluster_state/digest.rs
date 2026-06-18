@@ -223,6 +223,10 @@ impl<I: Identifier> ClusterState<I> {
             // own result), so they carry no convergence signal.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // node-local: the change cadence is a pure derivation of the
+            // mutation seam (NOT a folded field), carrying no convergence
+            // signal. Bound for the exhaustive guard.
+            state_generation: _state_generation,
             // node-local: the range-fold memo is the per-bucket REFINEMENT of
             // the very `tasks_hash` this fold computes — a pure derivation of
             // the same `tasks` + `settled`, carrying no convergence signal of

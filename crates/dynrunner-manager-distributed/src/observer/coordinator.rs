@@ -139,6 +139,30 @@ const AE_FAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// two-consecutive-empty safety is unchanged; only the spacing shortens.
 const CLUSTER_GONE_CONSULT_INTERVAL: Duration = Duration::from_secs(90);
 
+/// Maximum staleness of the reporter's stats projection cell (#653). The
+/// observer's run loop used to rebuild the FULL O(ledger) stats projection
+/// (`StatsSnapshot::from_cluster_state` — two ledger passes + a per-pending
+/// dependency walk) AND re-run the run-narrator's phase diff at the TOP of
+/// EVERY loop iteration. Because the `select!` processes ONE event per
+/// iteration, ingesting N inbound frames cost N full rebuilds — at 120k
+/// tasks that pegged a core and throttled snapshot-package ingest to a
+/// trickle, so a relocated observer never caught up (#653).
+///
+/// The projection is now gated: it rebuilds when the replicated ledger
+/// actually CHANGED since the last projection (the O(1)
+/// [`ClusterState::state_generation`] change cadence) AND, as a backstop, at
+/// most once per this interval even with no change — so a settled mirror's
+/// derived view (the late-arriving wall-clock fields the projection folds)
+/// never strands stale, yet ingesting a burst of mutations costs at most ONE
+/// rebuild per drained burst plus one per cadence tick, NOT one per frame.
+///
+/// 1s mirrors the reporter's own idle-detector cadence granularity (the
+/// operator never reads the cell faster than its 1-minute / 10-minute
+/// emit cadences, so 1s freshness is already far tighter than any consumer
+/// needs) while keeping the worst-case idle rebuild rate to ~1/s — O(ledger)
+/// at most once a second, versus once per ingested frame.
+const STATS_PROJECTION_MAX_STALENESS: Duration = Duration::from_secs(1);
+
 /// Configuration for a standalone observer. Carries only the values the
 /// observer's own concerns read: the node identity, the lost-visibility
 /// report thresholds, and the panik trigger inputs. It carries NO scheduler
@@ -520,6 +544,13 @@ where
     /// a forwarder spawned in `run_inner`. See
     /// [`crate::force_print_trigger`].
     force_print_trigger: Option<ForcePrintTrigger>,
+    /// Test-only injected stats source: when set, `run` uses THIS source as
+    /// the reporter's live-feed cell instead of minting its own, so a test
+    /// can read its `publish_count` to assert the #653 dirty-gate /
+    /// rate-limit (ingesting N mutations must not drive N rebuilds).
+    /// Compiled out of production.
+    #[cfg(test)]
+    injected_snapshot_source: Option<SharedSnapshotSource>,
 }
 
 /// Per-replacement-id state of the observer-side respawn execution arm.
@@ -771,6 +802,8 @@ where
             // route repurposes SIGUSR1 to force-print, and that route
             // injects via `set_force_print_trigger` post-construction.
             force_print_trigger: None,
+            #[cfg(test)]
+            injected_snapshot_source: None,
         }
     }
 
@@ -899,6 +932,8 @@ where
             // unset construction = the trigger lives parked in the run
             // loop's forwarder until then.
             force_print_trigger: None,
+            #[cfg(test)]
+            injected_snapshot_source: None,
         }
     }
 
@@ -970,6 +1005,13 @@ where
     /// [`crate::force_print_trigger`].
     pub fn set_force_print_trigger(&mut self, trigger: ForcePrintTrigger) {
         self.force_print_trigger = Some(trigger);
+    }
+
+    /// Test-only: inject the stats source `run` will feed, so a test can read
+    /// its `publish_count` to assert the #653 dirty-gate / rate-limit.
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_source(&mut self, source: SharedSnapshotSource) {
+        self.injected_snapshot_source = Some(source);
     }
 
     /// Read-only access to the replicated ledger (tests / result getters).
@@ -1273,8 +1315,16 @@ where
         // The reporter task owns its own cadences with Skip + immediate-
         // tick-consume (see `run_reporter`); the loop publishes a fresh
         // CRDT projection each iteration into the shared cell.
-        let snapshot_source =
-            SharedSnapshotSource::new(StatsSnapshot::from_cluster_state(&self.cluster_state));
+        let snapshot_source = {
+            #[cfg(test)]
+            if let Some(injected) = self.injected_snapshot_source.clone() {
+                injected
+            } else {
+                SharedSnapshotSource::new(StatsSnapshot::from_cluster_state(&self.cluster_state))
+            }
+            #[cfg(not(test))]
+            SharedSnapshotSource::new(StatsSnapshot::from_cluster_state(&self.cluster_state))
+        };
         let snapshot_publisher = snapshot_source.clone();
         let (reporter_cancel_tx, reporter_cancel_rx) = oneshot::channel::<()>();
         // The wake-stream outage seam: the run loop forwards the loss
@@ -1318,12 +1368,36 @@ where
             },
         ));
 
-        // Bootstrap recovery REQUEST half (§6): fire one snapshot-stream
-        // request to `Destination::Primary` at entry, gated on a known
-        // primary, best-effort. The REPLY half (the packages) is folded
-        // into the loop's recv arm. The stream is tracked per the
-        // primary's id so an interrupted bootstrap stream RESUMES from
-        // its cursor on the recovery cadence.
+        // Bootstrap recovery REQUEST half (§6 / #653). The observer obtains
+        // the FULL ledger from a peer at entry AND, for the relocated /
+        // primary-unknown case, through the standing any-peer pull machinery.
+        //
+        // (1) When a primary IS already known, fire ONE direct
+        //     `RequestSnapshotStream` to it. This `request_params` call SEEDS
+        //     the inbound-stream tracker (`by_responder`) so the
+        //     mid-transfer EXIT HOLD ([`Self::evaluate_exit`]) recognises the
+        //     stream's packages and does not exit on the HEAD package's
+        //     `run_complete` latch with a half-merged (zero-count) mirror.
+        //
+        // (2) For a RELOCATED observer the primary is frequently UNKNOWN at
+        //     this instant (the membership view has not converged yet), so the
+        //     direct request cannot fire. The pre-#653 code stopped there and
+        //     — compounded by the per-iteration stats rebuild that pegged the
+        //     loop and STARVED snapshot-package ingest (the concern-1/2 fix
+        //     above) — fell back to a slow anti-entropy mutation trickle and
+        //     never caught up. With the loop no longer starved, the observer's
+        //     standing anti-entropy + recovery machinery IS the any-peer pull
+        //     the owner asked for, robust to an unknown primary and retried:
+        //     every peer broadcasts its `StateDigest`; the `on_state_digest`
+        //     arm fires `pull_coordinator.note_behind` the instant the FIRST
+        //     peer digest shows the observer behind (it is behind ANY peer's
+        //     digest), which broadcasts a `PullProbe` to `Destination::All`
+        //     (no primary id needed) and commits the SMALLEST-INBOX ahead
+        //     responder — so the busy primary (deepest inbox) is naturally
+        //     deprioritized in favour of a SECONDARY. That `pull_request` also
+        //     seeds `by_responder` for its target, so the mid-transfer hold
+        //     covers the reactive path too. The recovery tick re-arms the
+        //     pull until the mirror converges, then quiesces.
         if let Some(primary_id) = self.cluster_state.current_primary().map(str::to_owned) {
             let (stream_id, resume_after) = self.inbound_snapshots.request_params(&primary_id);
             let req = DistributedMessage::RequestSnapshotStream {
@@ -1487,17 +1561,82 @@ where
                 .take()
                 .unwrap_or_else(GracefulAbortTrigger::arm);
 
+            // #653 projection-cadence state: the O(ledger) stats rebuild +
+            // narrator phase-diff are NO LONGER run per loop iteration (which
+            // cost one full rebuild per ingested inbound frame and pegged a
+            // core at scale, starving snapshot-package ingest). The rebuild is
+            // both DIRTY-gated and RATE-limited:
+            //
+            //   - DIRTY: skip entirely when the replicated ledger has NOT
+            //     changed since the last projection (the O(1)
+            //     `state_generation` compare) — a quiescent mirror does zero
+            //     work and the loop idles (so tokio's virtual-time
+            //     auto-advance is preserved — a staleness arm that fired every
+            //     interval regardless would defeat it and force step-by-step
+            //     advance).
+            //   - RATE-LIMIT (the coalescing that fixes the throughput bug):
+            //     when the ledger HAS changed, rebuild AT MOST once per
+            //     `STATS_PROJECTION_MAX_STALENESS`. A burst of N mutations
+            //     arriving inside one interval is COALESCED into a single
+            //     rebuild — so ingesting N inbound frames costs O(1) rebuilds,
+            //     not O(N). When a change is rate-limited (deferred), the
+            //     `defer_deadline` below arms a persistent-deadline select arm
+            //     that re-drives the loop exactly at the interval end, so the
+            //     coalesced batch is projected PROMPTLY when the interval
+            //     elapses (the reporter cell never strands stale past one
+            //     interval). When caught up the deadline is `None` → the arm
+            //     parks → the loop idles.
+            //
+            // `last_projection_at` is seeded a full interval in the past so the
+            // FIRST changed iteration (the entry-state mirror) projects
+            // immediately rather than being deferred.
+            let mut last_projected_generation: Option<u64> = None;
+            let mut last_projection_at =
+                tokio::time::Instant::now() - STATS_PROJECTION_MAX_STALENESS;
+
             loop {
-                // 1. Narrate (item 9/14): emit pending phase / summary
-                //    BEFORE the terminal early-returns so the completing
-                //    iteration emits the summary first. A narrated
-                //    iteration is a wake-stream HOST: the pending
-                //    reconnection note (if any) rides it.
-                if narrator.observe(&self.cluster_state) {
-                    self.wake_note.flush_after_host();
-                }
-                // Keep the reporter's cell fresh with the live projection.
-                snapshot_publisher.publish(StatsSnapshot::from_cluster_state(&self.cluster_state));
+                // 1. Stats projection + phase narration — DIRTY-gated +
+                //    RATE-limited (#653). The narration runs BEFORE the
+                //    terminal early-returns so the completing iteration emits
+                //    the summary first; a narrated iteration is a wake-stream
+                //    HOST (the pending reconnection note rides it). Both
+                //    projection consumers (`narrator.observe` +
+                //    `snapshot_publisher.publish`) share the ONE gate — neither
+                //    is special-cased; a `narrator.observe` on an unchanged
+                //    ledger would find no transition anyway.
+                //
+                // `defer_deadline` is the per-iteration deadline the deferred-
+                // rebuild select arm parks on: `Some` ⇒ a rate-limited change
+                // is awaiting its coalesced projection at the interval end;
+                // `None` ⇒ caught up (or never changed) ⇒ the arm parks via
+                // `pending()` so the loop can idle (preserving virtual-time
+                // auto-advance). It is computed fresh each iteration (the arm
+                // reads it in the SAME iteration), never loop-carried.
+                let generation = self.cluster_state.state_generation();
+                let defer_deadline: Option<tokio::time::Instant> =
+                    if last_projected_generation != Some(generation) {
+                        // The ledger changed since the last projection. Project
+                        // now iff at least one interval has elapsed; otherwise
+                        // DEFER (coalesce) and arm the deadline so the batch is
+                        // projected at the interval end.
+                        if last_projection_at.elapsed() >= STATS_PROJECTION_MAX_STALENESS {
+                            last_projected_generation = Some(generation);
+                            last_projection_at = tokio::time::Instant::now();
+                            if narrator.observe(&self.cluster_state) {
+                                self.wake_note.flush_after_host();
+                            }
+                            // Keep the reporter's cell fresh with the live projection.
+                            snapshot_publisher
+                                .publish(StatsSnapshot::from_cluster_state(&self.cluster_state));
+                            None
+                        } else {
+                            Some(last_projection_at + STATS_PROJECTION_MAX_STALENESS)
+                        }
+                    } else {
+                        // Caught up — nothing pending; the arm parks and the
+                        // loop can idle.
+                        None
+                    };
 
                 // 2. Observed-terminal block (top-of-loop). The observer
                 //    terminates ONLY on an OBSERVED run-terminal (the
@@ -1649,6 +1788,28 @@ where
                     // re-evaluates + the lost-visibility recurrence report
                     // fires even with zero inbound traffic.
                     _ = visibility_recheck_tick.tick() => {}
+                    // #653 stats-projection deferred-rebuild arm: when a
+                    // change was RATE-limited (coalesced) at the top of the
+                    // loop, `defer_deadline` holds the interval-end instant;
+                    // this arm re-drives the loop exactly then so the coalesced
+                    // batch is projected promptly (the reporter cell never
+                    // strands past one interval). `None` (caught up / no
+                    // pending change) parks the arm via `pending()` so the loop
+                    // can idle — this is what preserves virtual-time
+                    // auto-advance (an always-on cadence would force the loop
+                    // awake every interval and step time forward one interval
+                    // at a time). A PERSISTENT deadline (the watchdog law):
+                    // `sleep_until` targets the absolute stored instant, so
+                    // sibling-arm activity never resets it. No work in the arm
+                    // body; the top-of-loop owns the rebuild + republish.
+                    // Cancel-safe: `sleep_until`/`pending` hold no state beyond
+                    // the target instant.
+                    _ = async {
+                        match defer_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
                     // Wake-stream loss cadence (the 5-minute mark, then one
                     // repeat per 10 minutes while still down). A PERSISTENT
                     // deadline: `wake_deadline()` derives from STORED

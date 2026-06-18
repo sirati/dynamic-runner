@@ -1896,6 +1896,98 @@ async fn recovery_cadence_quiesces_when_converged() {
     .expect("the converged-quiesce observer must terminate");
 }
 
+/// #653 dirty-gate + rate-limit: ingesting a BURST of N inbound mutation
+/// frames must NOT drive N full stats rebuilds. Pre-#653 the run loop
+/// rebuilt the O(ledger) `StatsSnapshot::from_cluster_state` projection at
+/// the TOP of EVERY iteration, so each of the N frames (one event per
+/// `select!` iteration) paid a full rebuild — at 120k tasks this pegged a
+/// core and starved snapshot ingest so a relocated observer never caught up.
+///
+/// The fix gates the rebuild on the `state_generation` change cadence AND
+/// rate-limits it to at most once per `STATS_PROJECTION_MAX_STALENESS`, so a
+/// burst arriving inside one interval is COALESCED into a single rebuild.
+/// This test feeds N=40 `TaskAdded` frames (each a distinct inbox event /
+/// loop iteration) plus a terminal `RunComplete`, all pre-queued under a
+/// paused clock so they ingest as one burst, and asserts the live-feed
+/// publish (= rebuild) count is FAR below N — while the FINAL published
+/// projection still reflects every task (the cell is fresh, not stranded).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stats_rebuild_is_coalesced_not_per_mutation() {
+    use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                const N: usize = 40;
+
+                let (transport, inbound, _peers) = transport_with_peers("obs", 1);
+                let cs = ClusterState::<TestId>::new();
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+
+                let mut observer =
+                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+                // Inject the source so we can read its rebuild (publish) count.
+                let source = SharedSnapshotSource::new(StatsSnapshot::default());
+                observer.set_snapshot_source(source.clone());
+
+                // Pre-queue the whole burst: N distinct TaskAdded frames (each
+                // its own inbox event ⇒ its own loop iteration ⇒ its own
+                // `state_generation` bump) then the terminal RunComplete.
+                for i in 0..N {
+                    let t = task("p", &format!("t{i}"), &[]);
+                    inbound
+                        .send(DistributedMessage::ClusterMutation {
+                            target: None,
+                            sender_id: "peer-0".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::TaskAdded {
+                                hash: t.task_id.clone(),
+                                task: t,
+                                def_id: None,
+                            }],
+                        })
+                        .expect("inbound open");
+                }
+                inbound
+                    .send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "peer-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![ClusterMutation::RunComplete {
+                            counts: Default::default(),
+                        }],
+                    })
+                    .expect("inbound open");
+
+                let terminal = observer.run().await.expect("Ok on RunComplete");
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+
+                let rebuilds = source.publish_count();
+                // The coalescing is the whole point: a handful of rebuilds for
+                // the entry-state + at most one per staleness interval the
+                // burst spanned — NEVER one per mutation. A generous bound
+                // (N/4) still proves O(1)-per-burst against O(N)-per-frame.
+                assert!(
+                    rebuilds < N / 4,
+                    "the stats rebuild must be COALESCED, not per-mutation: \
+                     {rebuilds} rebuilds for {N} ingested mutations"
+                );
+                // Freshness: the final projection reflects EVERY task — the
+                // gate never strands a stale cell.
+                let final_counts = observer.cluster_state().counts();
+                assert_eq!(
+                    final_counts.pending, N,
+                    "every ingested task must be in the converged mirror"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the coalescing observer must terminate");
+}
+
 /// L2a: a departed peer's AE-3 recovery digest is PRUNED from
 /// `peer_digests` when its `PeerRemoved` mutation is applied, so the store
 /// stays bounded by the live roster over the run's lifetime. A still-live
@@ -2419,6 +2511,85 @@ async fn observer_digest_cadence_emits_on_the_wire() {
                          tick never put a StateDigest on the wire within 120s \
                          (≥4 jittered periods) — the relocation-handoff heal \
                          has no emitter"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
+/// #653 any-peer pull, primary UNKNOWN: a relocated observer whose
+/// membership view has not yet named a primary (`current_primary() == None`)
+/// must STILL initiate a bulk catch-up pull from any available peer. The
+/// pre-#653 at-entry bootstrap was gated on a known primary, so this case
+/// fell to the slow mutation trickle. The fix routes catch-up through the
+/// standing reactive pull: a secondary's `StateDigest` showing the observer
+/// behind fires `pull_coordinator.note_behind`, which broadcasts a
+/// `PullProbe` to `Destination::All` — NO primary id required. This test
+/// asserts that probe reaches the wire even with no primary in the ledger.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn behind_observer_with_unknown_primary_broadcasts_pull_probe() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, inbound, mut peers) = transport_with_peers("obs", 1);
+            let mut peer_rx = peers.pop().expect("one registered peer");
+
+            // A non-empty donor digest the observer (empty ledger, NO primary)
+            // is provably behind — taken from a SECONDARY peer.
+            let ahead_digest = {
+                let mut donor = ClusterState::<TestId>::new();
+                let t = task("p", "t1", &[]);
+                add(&mut donor, &t);
+                complete(&mut donor, "t1");
+                donor.digest()
+            };
+
+            // Observer ledger: EMPTY — in particular `current_primary()` is
+            // None, the relocated-observer pre-convergence condition.
+            let cs = ClusterState::<TestId>::new();
+            assert!(
+                cs.current_primary().is_none(),
+                "the test's precondition is an unknown primary"
+            );
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+
+            // Feed the secondary's ahead digest so `on_state_digest` notes the
+            // divergence and the pull driver arms a probe.
+            inbound
+                .send(DistributedMessage::StateDigest {
+                    target: None,
+                    sender_id: "peer-0".into(),
+                    timestamp: 0.0,
+                    digest: ahead_digest,
+                    sender_is_observer: false,
+                })
+                .expect("inbound open");
+
+            let assertion = async {
+                loop {
+                    let frame = peer_rx.recv().await.expect("peer wire open");
+                    if matches!(
+                        frame,
+                        DistributedMessage::PullProbe { ref sender_id, .. } if sender_id == "obs"
+                    ) {
+                        break;
+                    }
+                }
+            };
+
+            tokio::select! {
+                run = observer.run() => {
+                    panic!("the observer must keep observing + pull, got {run:?}");
+                }
+                () = assertion => { /* the any-peer pull probe reached the wire */ }
+                _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                    panic!(
+                        "NO PULL with an unknown primary: a behind observer whose \
+                         ledger names no primary never broadcast a PullProbe — the \
+                         relocated-observer catch-up regression (#653)"
                     );
                 }
             }

@@ -547,6 +547,25 @@ pub struct ClusterState<I> {
     /// does NOT recompute". Carries no convergence signal — classified
     /// node-local in every destructure guard.
     pub(super) digest_fold_count: std::cell::Cell<u64>,
+    /// Node-local monotonic counter of replicated-state CHANGES — bumped
+    /// once at every folded-field mutation seam (the same single
+    /// [`invalidate_digest_cache`] entry every folded-field mutator routes
+    /// through). A pure CHANGE signal for projection consumers: a reader
+    /// that stashes [`state_generation`](Self::state_generation) and finds
+    /// it unchanged on its next read KNOWS no replicated mutation landed
+    /// between the two — so an O(ledger) re-projection (the observer's
+    /// `StatsSnapshot::from_cluster_state` rebuild + the run-narrator diff)
+    /// can be SKIPPED for an unchanged ledger instead of paying the full
+    /// fold per ingested inbound frame. Strictly cheaper than comparing the
+    /// digest (an O(1) counter bump versus a possible O(ledger) memo
+    /// recompute), and it covers EXACTLY the digest-folded mutation set by
+    /// construction (it shares the seam). Classification: node-local — a
+    /// pure derivation cadence, NOT replicated, NOT folded into the digest,
+    /// NOT cloned (a clone starts its own counter from 0 — a fresh replica's
+    /// consumers re-project once against their own cold counter), NOT
+    /// snapshotted. Bound in every exhaustive-destructure guard like
+    /// `digest_cache`/`digest_fold_count`.
+    pub(super) state_generation: std::cell::Cell<u64>,
     /// Node-local incremental memo of the per-bucket range fold (#492 P2),
     /// the O(1)-read twin of the O(ledger) [`Self::tasks_range_digest`]
     /// one-pass fold. Maintained INCREMENTALLY (not invalidate-and-recompute
@@ -814,6 +833,10 @@ where
             // counter). Bound for the exhaustive-destructure guard.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // Node-local change cadence — not cloned (the clone starts its
+            // own counter from a cold 0; its consumers re-project once
+            // against their own counter). Bound for the exhaustive guard.
+            state_generation: _state_generation,
             // Node-local range-fold memo — a pure derivation of the (cloned)
             // logical ledger, so it is copied through verbatim below: the
             // clone's `tasks` + `settled` are byte-identical to the source's,
@@ -931,6 +954,9 @@ where
             // digest on first use, so it never inherits the source's memo).
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
+            // Node-local change cadence — cold on the clone (a fresh replica
+            // re-projects once against its own counter from 0).
+            state_generation: std::cell::Cell::new(0),
             // Node-local range-fold memo — copied verbatim: the clone's
             // logical ledger is byte-identical to the source's, so the
             // source's maintained fold already satisfies the invariant for
@@ -1019,6 +1045,7 @@ where
             dead_rejoin_warn,
             digest_cache,
             digest_fold_count,
+            state_generation,
             range_fold_memo: _range_fold_memo,
             blocked_by,
             outcome_tally: _outcome_tally,
@@ -1074,6 +1101,7 @@ where
             .field("dead_rejoin_warn", &dead_rejoin_warn.len())
             .field("digest_cache", &digest_cache.get().is_some())
             .field("digest_fold_count", &digest_fold_count.get())
+            .field("state_generation", &state_generation.get())
             .field("blocked_by", &blocked_by.len())
             .field("settled", settled)
             .field("output_store", output_store)
@@ -1127,6 +1155,7 @@ impl<I> Default for ClusterState<I> {
             dead_rejoin_warn: HashMap::new(),
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
+            state_generation: std::cell::Cell::new(0),
             range_fold_memo: super::range_fold_memo::RangeFoldMemo::default(),
             blocked_by: HashMap::new(),
             outcome_tally: super::outcome_tally::OutcomeTally::default(),
@@ -1206,5 +1235,27 @@ impl<I: Identifier> ClusterState<I> {
     /// the per-inbound-frame digest reads the memo exists to spare).
     pub(super) fn invalidate_digest_cache(&mut self) {
         self.digest_cache.set(None);
+        // Bump the change cadence at the SAME single seam: every
+        // folded-field mutation that clears the digest memo also advances
+        // the generation, so a projection consumer keyed on
+        // [`state_generation`](Self::state_generation) re-projects exactly
+        // when (and only when) a replicated field could have changed.
+        // `wrapping_add` so a process that somehow ran 2^64 mutations
+        // continues monotonically-modulo (a same-value collision after a
+        // full wrap is astronomically unreachable and would at worst skip
+        // one re-projection, which the bounded staleness cadence backstops).
+        self.state_generation
+            .set(self.state_generation.get().wrapping_add(1));
+    }
+
+    /// Node-local monotonic CHANGE cadence (see the
+    /// [`state_generation`](Self::state_generation) field doc): advances by
+    /// at least one at every folded-field mutation seam. Two reads returning
+    /// the SAME value prove no replicated mutation landed between them, so a
+    /// consumer can skip an O(ledger) re-projection for an unchanged ledger.
+    /// Read through `&self` (a `Copy` counter); carries no convergence
+    /// signal and never crosses the wire.
+    pub fn state_generation(&self) -> u64 {
+        self.state_generation.get()
     }
 }
