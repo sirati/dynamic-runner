@@ -484,6 +484,27 @@ where
         // Active for this binary's phase, putting the item back into
         // the bucket head so the next dispatch tick picks it up.
         self.failed_tasks.remove(&hash);
+        // Affine-dep work clears the placement-dedup guard before the pool
+        // reinject — the affine twin of `requeue_affine_aware`'s
+        // `unrecord_placed_work` (affine_scheduler.rs). `place_dependency_satisfied_affine_tasks`
+        // re-`record_placed_work`s an out-of-pool Unfulfillable affine-dep work,
+        // and the popped unit's `SkippedNoRecovery` leaves `placed_work` SET; a
+        // later reinject that did NOT clear it finds `placed_work[W]` still set,
+        // so the next placement's `record_placed_work(W)` returns `false`, W is
+        // skipped, and the revived work is never re-placed onto a per-secondary
+        // queue. The seam is reused (not re-implemented): the pool owns the
+        // "affine-dep work" predicate (`has_affine_dep`), the affine scheduler
+        // owns the dedup guard (`unrecord_placed_work`). This is the ONLY
+        // pool-clearing difference vs `requeue_affine_aware`; the pool primitive
+        // stays `reinject` (not `requeue`) because the reinjected item is an
+        // already-finalised Unfulfillable task (no in-flight count to undo, must
+        // re-arm `Drained/Done → Active` + clear soft_failed/dormant), which
+        // `requeue`'s in-flight-decrement contract would corrupt. Local,
+        // non-replicated guard only — failover-safe (a promoted primary rebuilds
+        // `placed_work` with the queues).
+        if self.pool().has_affine_dep(&binary) {
+            self.affine_scheduler.unrecord_placed_work(&hash);
+        }
         self.pool_mut().reinject(std::sync::Arc::new(binary));
 
         // Originate the bumped used count (P3) ONLY when a cap is set —
