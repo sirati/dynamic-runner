@@ -739,20 +739,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Consumed by the dispatch leaf's placement trigger + the failover rebuild
     /// (`primary::affine_dispatch`).
     pub(crate) fn affine_placement_for(&self, task: &TaskInfo<I>) -> WorkPlacement {
+        self.affine_placement_from_parts(compute_task_hash(task), &task.task_depends_on)
+    }
+
+    /// Build the [`WorkPlacement`] for a ledger entry DIRECTLY from its
+    /// `(content-hash key, &TaskState)` — the clone-free placement seam the
+    /// `TasksAdded` recheck (`place_dependency_satisfied_affine_tasks`) uses.
+    /// Identical output to [`Self::affine_placement_for`] for the same logical
+    /// task: the iteration's `hash` key IS the task's content hash (so the
+    /// re-derive via `compute_task_hash` is skipped), and the def's compact
+    /// dep refs resolve to the SAME string deps a full `task_to_info` rebuild
+    /// would produce — fed through the SAME `affine_placement_from_parts`
+    /// resolution. The win is purely cost: it never materializes the full
+    /// [`TaskInfo`] clone the placement never reads (the placement needs only
+    /// the hash + the affine subset of the deps), so a recheck over the live
+    /// ledger pays O(live-ledger) pointer reads + per-task dep-ref resolution
+    /// instead of O(live-ledger) whole-`TaskInfo` clones.
+    pub(crate) fn affine_placement_for_state(
+        &self,
+        hash: &str,
+        state: &crate::cluster_state::TaskState<I>,
+    ) -> WorkPlacement {
+        let deps = self.cluster_state.resolve_dep_refs(&state.def().task_depends_on);
+        self.affine_placement_from_parts(hash.to_string(), &deps)
+    }
+
+    /// Shared placement-construction core: resolve the affine subset of `deps`
+    /// to `(affine_id, prereq-hash)` pairs and pair with `hash`. The SINGLE
+    /// resolution recipe both the `TaskInfo`-based and the state-based seams
+    /// delegate to, so the two never drift.
+    fn affine_placement_from_parts(
+        &self,
+        hash: String,
+        deps: &[dynrunner_core::TaskDep],
+    ) -> WorkPlacement {
         let mut affine_deps = Vec::new();
-        for dep in &task.task_depends_on {
-            if let Some(hash) = self.cluster_state.task_hash_for_dep(&dep.phase_id, &dep.task_id)
+        for dep in deps {
+            if let Some(prereq_hash) =
+                self.cluster_state.task_hash_for_dep(&dep.phase_id, &dep.task_id)
             {
-                let hash = hash.to_string();
-                if let Some(aid) = self.cluster_state.affine_id_for_hash(&hash) {
-                    affine_deps.push((aid, hash));
+                let prereq_hash = prereq_hash.to_string();
+                if let Some(aid) = self.cluster_state.affine_id_for_hash(&prereq_hash) {
+                    affine_deps.push((aid, prereq_hash));
                 }
             }
         }
-        WorkPlacement {
-            hash: compute_task_hash(task),
-            affine_deps,
-        }
+        WorkPlacement { hash, affine_deps }
     }
 
     /// Map a worker terminal for `task_hash` on `secondary` onto the affine
