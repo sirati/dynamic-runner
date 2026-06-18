@@ -395,6 +395,106 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .await
     }
 
+    /// LOAD-BALANCE PULL of a parked waiting-on-dependents work onto the idle
+    /// worker at `worker_idx` (#661) — the LAST non-eager dispatch source, placed
+    /// AFTER the global pool, this secondary's own per-secondary queue, and the
+    /// idle-steal-of-queues, BEFORE the eager-prep filler. The owner-spec'd fix
+    /// for the idle-secondary strand: post-#652 a work waiting on its per-secondary
+    /// import is parked in the per-secondary BLOCKED map (`block_until_import`),
+    /// NOT in any queue, so the queue-stealing idle-steal can never pull it — an
+    /// idle secondary's freed workers cannot drain a busy secondary's
+    /// toolchain-bound backlog.
+    ///
+    /// Scan the waiting list for a work parked on ANOTHER secondary that is
+    /// `StrandedHere` on THIS one — i.e. its first not-`Done` affine dep (in LIST
+    /// ORDER, base before delta) is `NotDone` here, so there is a concrete import
+    /// to run on this idle worker. RE-KEY its block from the busy secondary onto
+    /// THIS secondary (the [`AffineScheduler::rekey_block`] primitive — the
+    /// dependent now runs here once its imports land here), then dispatch that
+    /// first-not-`Done` import on-demand on this worker via the SAME
+    /// [`Self::dispatch_affine_import_on_demand`] seam the `StrandedHere` arm uses
+    /// (so the not-`Done`-here guard, base-before-delta order, and the per-secondary
+    /// run-once/concurrent dispatch guards all hold unchanged). The work's
+    /// remaining imports flow onto this secondary as its workers free, via the
+    /// existing `on_cell_finished` re-enqueue + `StrandedHere` progression — one
+    /// import per real cell-`Finished`, never a spin. Pulls AT MOST ONE work per
+    /// idle worker (the per-worker call is the "until no idle workers left" bound),
+    /// so it never re-keys the whole backlog onto this secondary.
+    ///
+    /// Candidates that are NOT `StrandedHere` here are SKIPPED, never re-keyed:
+    ///   * `Ready` — every dep already `Done` here, so there is no import to run on
+    ///     this idle worker; leaving it parked where it is wastes nothing (it has
+    ///     no toolchain to pull). A genuinely-pullable candidate must have a
+    ///     not-`Done` import here.
+    ///   * `InFlightHere` — an import is already running here for this work; the
+    ///     idle worker would get no dispatch, so we look past it.
+    ///   * `Reroute` / `Unsatisfiable` — failure shapes owned by the gate's own
+    ///     handlers; the pull never re-decides a failed import.
+    ///
+    /// PULL-ELIGIBILITY (the steal-aware guard, the (b)+(c) twin of
+    /// [`AffineScheduler::steal_for`]'s `can_steal_work`): a parked work whose
+    /// import is GENUINELY IN FLIGHT on its busy secondary (a live slot there holds
+    /// the import) is NOT pullable — under lazy import (c) that import runs ONLY
+    /// because this work committed there, so the work BELONGS there and is making
+    /// progress; pulling it would strand the running import (`importing_nodes !=
+    /// building_nodes`) and double-run it on the idle node. Only a work whose busy
+    /// secondary is grinding OTHER work (the import is not on any of its slots — the
+    /// asm-dataset strand: the busy node won't get to this toolchain) is pullable.
+    /// This mirrors the idle-steal's "in flight on the donor ⇒ ineligible" exactly,
+    /// applied to the BLOCKED map instead of the queues.
+    /// Returns `true` iff a work was pulled (re-keyed + its import dispatched on
+    /// this worker); `false` leaves the worker for the eager-prep filler.
+    pub(crate) async fn try_affine_pull_waiting_for_worker(&mut self, worker_idx: usize) -> bool {
+        let secondary = self.workers[worker_idx].secondary_id.clone();
+        // The parked works keyed to ANOTHER secondary, deterministic order. A
+        // work already keyed HERE needs no pull (its re-enqueue is already coming).
+        for (busy_secondary, work_hash) in
+            self.affine_scheduler.blocked_work_keyed_elsewhere(&secondary)
+        {
+            let Some(task) = self.cluster_state.task_info_for_hash(&work_hash) else {
+                // Settled / gone while parked — nothing to pull; try the next.
+                continue;
+            };
+            let placement = self.affine_placement_for(&task);
+            // PULL-ELIGIBILITY: skip a work whose import is genuinely in flight on
+            // its busy secondary (a live slot there holds it) — it is progressing
+            // where it is and belongs there (the lazy-import (c) invariant). Only a
+            // work stranded behind UNRELATED work on the busy node is pullable.
+            let import_in_flight_on_busy = placement.affine_deps.iter().any(|(_, import_hash)| {
+                self.secondary_has_slot_holding_hash(&busy_secondary, import_hash)
+            });
+            if import_in_flight_on_busy {
+                continue;
+            }
+            // Only a `StrandedHere` candidate has a not-`Done` import to run on
+            // THIS idle worker (the others have nothing to dispatch here / are
+            // failure shapes the gate's own handlers own). The gate walks the deps
+            // in LIST ORDER, so the import it would kick is the first not-`Done`
+            // base before any delta.
+            if !matches!(
+                self.affine_readiness_gate(&secondary, &placement),
+                AffineGateOutcome::StrandedHere
+            ) {
+                continue;
+            }
+            // RE-KEY the block onto THIS secondary with a FRESH pending set (the
+            // imports still not `Done` HERE — the pending set is per-secondary),
+            // so the dependent runs here once its imports land here. The old
+            // (busy-secondary) block is dropped; if it raced away the re-block
+            // still applies (idempotent). Then dispatch the first not-`Done`
+            // import on-demand on this worker through the shared seam — which
+            // re-applies the run-once + concurrent dispatch-once guards (no
+            // over-import) and dispatches in list order (base before delta).
+            let pending = self.not_done_cells_on(&secondary, &placement);
+            self.affine_scheduler
+                .rekey_block(&busy_secondary, &secondary, &work_hash, pending);
+            self.dispatch_affine_import_on_demand(worker_idx, &secondary, &placement)
+                .await;
+            return true;
+        }
+        false
+    }
+
     /// Reconstruct a popped [`QueuedUnit`]'s worker-dispatchable `TaskInfo` by
     /// hash and dispatch it through the shared
     /// [`PrimaryCoordinator::dispatch_one_assignment`] seam. REPORTS the outcome

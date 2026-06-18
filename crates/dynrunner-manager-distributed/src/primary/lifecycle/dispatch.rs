@@ -306,6 +306,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     all_infos[worker_idx] = self.workers[worker_idx].budget_info();
                     continue;
                 }
+                // LOAD-BALANCE PULL of a parked waiting work (#661): the
+                // idle-steal only steals from per-secondary QUEUES, but a work
+                // WAITING on its import is parked in the per-secondary BLOCKED
+                // map (not any queue), so an idle secondary can't drain a busy
+                // secondary's toolchain-bound backlog through the steal. As the
+                // LAST non-eager source (after own-queue + idle-steal-of-queues),
+                // pull ONE parked work onto this idle worker: re-key its block
+                // here and run its first not-done import on this worker (the rest
+                // flow here via on_cell_finished). A no-op when no parked work is
+                // strandable here.
+                if self.try_affine_pull_waiting_for_worker(worker_idx).await {
+                    all_infos[worker_idx] = self.workers[worker_idx].budget_info();
+                    continue;
+                }
                 // LAST-resort eager-prep idle filler (#638): the worker has
                 // NOTHING else — empty pool view, empty affine queue, and no
                 // steal donor — so speculatively run one eager-prep task on its

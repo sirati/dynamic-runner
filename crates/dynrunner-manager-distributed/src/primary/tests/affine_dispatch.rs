@@ -3842,3 +3842,305 @@ async fn backpressure_bounce_redispatches_to_other_idle_secondary() {
         })
         .await;
 }
+
+/// #661 LOAD-BALANCE PULL: an idle secondary's worker pulls a parked
+/// waiting-on-dependents work off a BUSY secondary, instead of sitting idle while
+/// the busy secondary grinds its toolchain-bound backlog.
+///
+/// THE BUG SHAPE (asm-dataset 2-node): post-#652 a work WAITING on its
+/// per-secondary import is parked in the per-secondary BLOCKED map (keyed to the
+/// busy secondary), NOT in any queue. The queue-stealing idle-steal only looks at
+/// queues, so it can NEVER pull a parked work — the idle node's freed workers
+/// can't drain the busy node's backlog. Here: `build` is parked blocked on sec-0
+/// (busy, its worker occupied), sec-1 is idle (empty queue, empty pool view). The
+/// pull must re-key `build`'s block onto sec-1, dispatch its NotDone import on
+/// sec-1's idle worker, and (once the import completes) run `build` on sec-1 —
+/// the idle worker is NOT left idle while sec-0 has parked backlog.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_idle_worker_pulls_parked_waiting_work_off_busy_secondary() {
+    use dynrunner_core::ResourceMap;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build.clone()]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // STAGE the strand on sec-0 (the BUSY secondary): record `build` placed
+            // and PARK it in sec-0's per-secondary blocked map waiting on the import
+            // cell (the exact post-#652 state — work withheld from the global view,
+            // absent from every queue, blocked-on-import on the busy secondary).
+            // OCCUPY sec-0's worker so the idle-steal sees no donor queue and sec-0
+            // is genuinely busy.
+            assert!(primary.affine_record_placed_work_for_test(&build_hash));
+            primary
+                .affine_scheduler
+                .block_until_import("sec-0", &build_hash, vec![affine_id]);
+            let busy_idx = primary
+                .worker_idx_for("sec-0", 0)
+                .expect("sec-0 has a worker");
+            let occupier = make_binary("occupier", 10);
+            assert!(primary.commit_assignment(
+                busy_idx,
+                std::sync::Arc::new(occupier.clone()),
+                compute_task_hash(&occupier),
+                ResourceMap::new(),
+            ));
+
+            // Pre-state: build is parked on sec-0, NOT sec-1; both cells NotDone.
+            assert!(primary.affine_is_blocked_on_import_for_test("sec-0", &build_hash));
+            assert!(!primary.affine_is_blocked_on_import_for_test("sec-1", &build_hash));
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::NotDone,
+                );
+            }
+
+            // THE PULL: sec-1's idle worker has nothing else (empty pool view, empty
+            // own queue, no steal donor — sec-0's worker is occupied and sec-0's
+            // QUEUE is empty since `build` is parked in the BLOCKED map). The new
+            // load-balance source must pull `build` onto sec-1.
+            let idle_idx = primary
+                .worker_idx_for("sec-1", 0)
+                .expect("sec-1 has a worker");
+            let pulled = primary.try_affine_pull_waiting_for_worker(idle_idx).await;
+            settle_pump().await;
+            assert!(
+                pulled,
+                "the idle sec-1 worker must PULL the parked build off busy sec-0 \
+                 (RED pre-fix: idle-steal only steals from QUEUES, so a parked \
+                 blocked work is never pulled and the worker sits idle)"
+            );
+
+            // RE-KEYED: the block moved from sec-0 to sec-1 (the dependent now runs
+            // on sec-1), and the import is now in flight on sec-1 (cell Queued + a
+            // holding slot), NEVER on sec-0 (its worker is busy with the occupier).
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test("sec-0", &build_hash),
+                "the parked block must be RE-KEYED off the busy secondary"
+            );
+            assert!(
+                primary.affine_is_blocked_on_import_for_test("sec-1", &build_hash),
+                "the block must be re-keyed ONTO the idle secondary (build runs here \
+                 once its import lands here)"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-1", affine_id),
+                SecondaryCell::Queued,
+                "the pull dispatched the import on the idle secondary (cell Queued)"
+            );
+            assert!(
+                primary.secondary_has_slot_holding_hash("sec-1", &import_hash),
+                "the import landed a holding slot on the idle worker"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
+                SecondaryCell::NotDone,
+                "the import was NOT dispatched on the busy secondary"
+            );
+
+            // The import dispatched on sec-1's worker (the wire confirms it).
+            let mut import_on_sec1 = false;
+            for (id, rx, _tx) in ends.iter_mut() {
+                for (_, sec, _, h) in assignments(rx) {
+                    if h == import_hash && sec == "sec-1" {
+                        import_on_sec1 = true;
+                    }
+                    assert_ne!(
+                        (id.as_str(), h.as_str()),
+                        ("sec-0", import_hash.as_str()),
+                        "the import must not dispatch on the busy secondary"
+                    );
+                }
+            }
+            assert!(import_on_sec1, "the import dispatched on the idle sec-1 worker");
+
+            // LOAD-BALANCED END-TO-END: complete the import on sec-1 → its cell goes
+            // Done → `build` unblocks + re-enqueues onto sec-1 → it dispatches +
+            // runs THERE (on the formerly-idle secondary), proving the pull actually
+            // moved the dependent's execution off the busy node.
+            primary
+                .handle_task_complete(task_complete("sec-1", 0, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            let mut build_ran_on_sec1 = false;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, sec, _, h) in assignments(rx) {
+                    if h == build_hash {
+                        assert_eq!(
+                            sec, "sec-1",
+                            "the build must run on the secondary it was pulled onto"
+                        );
+                        build_ran_on_sec1 = true;
+                    }
+                }
+            }
+            assert!(
+                build_ran_on_sec1,
+                "the pulled build must eventually RUN on the idle secondary \
+                 (load-balanced off the busy one)"
+            );
+        })
+        .await;
+}
+
+/// #661 GUARD (not-Done-on-S2): the pull never re-imports a toolchain already
+/// present on the idle secondary. A work parked on busy sec-0 whose import is
+/// ALREADY `Done` on idle sec-1 gates `Ready` there (no NotDone import to run),
+/// so the pull SKIPS it — no duplicate import dispatch, the cell stays `Done`, and
+/// the (queue-empty) idle worker is left for the eager-prep filler.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_pull_skips_work_whose_import_already_done_on_idle_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build.clone()]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // Park `build` on busy sec-0, but mark the import ALREADY `Done` on idle
+            // sec-1 (the toolchain is already present there).
+            assert!(primary.affine_record_placed_work_for_test(&build_hash));
+            primary
+                .affine_scheduler
+                .block_until_import("sec-0", &build_hash, vec![affine_id]);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::SecondaryCellFinished {
+                    secondary: "sec-1".into(),
+                    cell_id: affine_id.0,
+                    generation: 1,
+                });
+            // drop any wire traffic from setup
+            for (_id, rx, _tx) in ends.iter_mut() {
+                let _ = assignments(rx);
+            }
+
+            let idle_idx = primary
+                .worker_idx_for("sec-1", 0)
+                .expect("sec-1 has a worker");
+            let pulled = primary.try_affine_pull_waiting_for_worker(idle_idx).await;
+            settle_pump().await;
+
+            assert!(
+                !pulled,
+                "the pull must SKIP a work whose import is already Done on the idle \
+                 secondary (it gates Ready, not StrandedHere — no toolchain to pull)"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-1", affine_id),
+                SecondaryCell::Done,
+                "the not-Done guard prevents re-importing a toolchain already \
+                 present on the idle secondary (cell stays Done, not re-Queued)"
+            );
+            assert!(
+                !primary.secondary_has_slot_holding_hash("sec-1", &import_hash),
+                "no duplicate import dispatch on the idle secondary"
+            );
+            // The original block is untouched (the pull declined it).
+            assert!(
+                primary.affine_is_blocked_on_import_for_test("sec-0", &build_hash),
+                "a skipped candidate's block is NOT re-keyed"
+            );
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, _, _, h) in assignments(rx) {
+                    assert_ne!(h, import_hash, "no import dispatched by a skipped pull");
+                }
+            }
+        })
+        .await;
+}
+
+/// #661 GUARD (base-before-delta): pulling a multi-dep work onto the idle
+/// secondary dispatches its imports in LIST ORDER — the BASE before the delta —
+/// the same ordering the on-demand `StrandedHere` path enforces. The pull routes
+/// through `dispatch_affine_import_on_demand`, which kicks the FIRST not-`Done`
+/// dep, so a delta is never imported ahead of its base on the pulled-onto node.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_pull_multidep_dispatches_base_before_delta_on_idle_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = affine_import("base");
+            let delta = affine_import("delta");
+            let base_hash = compute_task_hash(&base);
+            let delta_hash = compute_task_hash(&delta);
+            let build = work_two_deps("build", "base", "delta");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![base, delta, build.clone()]);
+            confirm_two(&mut primary).await;
+
+            let base_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&base_hash)
+                .expect("registered base affine-id");
+
+            // Park the multi-dep build on busy sec-0; both imports NotDone on idle
+            // sec-1. The pull must kick the BASE first (list order), never the delta.
+            assert!(primary.affine_record_placed_work_for_test(&build_hash));
+            primary.affine_scheduler.block_until_import(
+                "sec-0",
+                &build_hash,
+                vec![base_aid],
+            );
+            for (_id, rx, _tx) in ends.iter_mut() {
+                let _ = assignments(rx);
+            }
+
+            let idle_idx = primary
+                .worker_idx_for("sec-1", 0)
+                .expect("sec-1 has a worker");
+            assert!(primary.try_affine_pull_waiting_for_worker(idle_idx).await);
+            settle_pump().await;
+
+            // ONLY the base imported on sec-1; the delta did NOT (its base is not yet
+            // Done, so the list-order gate withholds it).
+            assert!(
+                primary.secondary_has_slot_holding_hash("sec-1", &base_hash),
+                "the BASE import dispatched first on the idle secondary"
+            );
+            assert!(
+                !primary.secondary_has_slot_holding_hash("sec-1", &delta_hash),
+                "the DELTA must NOT dispatch before its base is Done on the \
+                 pulled-onto secondary (base-before-delta order preserved)"
+            );
+            let mut dispatched: Vec<String> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, sec, _, h) in assignments(rx) {
+                    assert_eq!(sec, "sec-1", "the pull dispatches on the idle secondary");
+                    dispatched.push(h);
+                }
+            }
+            assert!(dispatched.contains(&base_hash), "base dispatched");
+            assert!(
+                !dispatched.contains(&delta_hash),
+                "delta NOT dispatched ahead of base"
+            );
+        })
+        .await;
+}
