@@ -26,6 +26,7 @@ use dynrunner_core::IMPORTANT_TARGET;
 use super::format::{ResourceBaseline, render_report, render_report_full};
 use super::idle::IdleDetector;
 use super::stats::StatsSnapshot;
+use super::status::StatusCell;
 use crate::observer::lost_visibility::{EndedOutage, WakeNoteSlot};
 
 /// The 10-minute periodic-stats cadence.
@@ -207,6 +208,35 @@ impl Reporter {
     /// emission is silent when there is literally nothing wake-worthy
     /// to say; the operator can use SIGUSR1 for a heartbeat read).
     ///
+    /// Process one STATS tick with the #662 sustained-degradation status
+    /// gate folded in. `status_line` is the periodic-report status the
+    /// observer's [`StatusCell`] produced for this report instant (`Some`
+    /// only when a degraded condition — connection lost / not caught up —
+    /// has been SUSTAINED ≥5 min; `None` otherwise).
+    ///
+    /// When `status_line` is `Some`, the report is FORCE-emitted (the
+    /// idle-skip gate AND the safety-net counter are overridden): the
+    /// operator must see a sustained problem at the 10-min cadence even if
+    /// no metric moved, and the one status line is folded into the body. The
+    /// `Some` line carries through `on_stats_tick` so the body it appends to
+    /// is the same delta-rendered body, and the baseline advances exactly as
+    /// any emission. When `None`, this is identical to
+    /// [`Self::on_stats_tick_skippable`] — the routine idle-aware behaviour
+    /// is completely unchanged.
+    pub fn on_stats_tick_gated(
+        &mut self,
+        snapshot: &StatsSnapshot,
+        status_line: Option<String>,
+    ) -> bool {
+        match status_line {
+            // A sustained-degradation status forces the report (override the
+            // idle-skip gate): the operator sees the problem at this cadence
+            // no matter what the metrics did, with the status folded in.
+            Some(line) => self.emit_report(snapshot, Some(line)),
+            None => self.on_stats_tick_skippable(snapshot),
+        }
+    }
+
     /// Returns whether a report was emitted — same contract as the
     /// unskipping `on_stats_tick`.
     pub fn on_stats_tick_skippable(&mut self, snapshot: &StatsSnapshot) -> bool {
@@ -240,23 +270,46 @@ impl Reporter {
     /// report was emitted (the caller flushes the wake-note slot after a
     /// genuine emission — the emitted report is a wake-stream host).
     pub fn on_stats_tick(&mut self, snapshot: &StatsSnapshot) -> bool {
+        self.emit_report(snapshot, None)
+    }
+
+    /// Render the delta body and, when there is anything to say, emit it +
+    /// advance the baselines. `forced_status` is the #662 folded
+    /// sustained-degradation line: when `Some`, the report ALWAYS emits
+    /// (even when the delta body is empty — the status alone is wake-worthy)
+    /// and the line is appended; when `None`, the report emits only when the
+    /// delta body is non-empty (the routine idle-aware rule). The single
+    /// owner of the emit-and-advance step so the routine path and the forced
+    /// path share one baseline-advance, never two.
+    fn emit_report(&mut self, snapshot: &StatsSnapshot, forced_status: Option<String>) -> bool {
         let outcome = render_report(snapshot, &self.last_announced, &self.last_printed_resource);
-        if let Some(report) = outcome.body {
-            // The whole report is one importance-channel event so the
-            // dual-sink routes it to stdio atomically under
-            // `--important-stdio-only` (C1's filter keys on the target).
-            tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
-            // Advance the operational baseline atomically + the
-            // per-field resource baseline per-line (the renderer wrote
-            // each included field into `next_resource_baseline`; an
-            // omitted line preserves its slot).
-            self.last_announced = snapshot.clone();
-            self.last_printed_resource = outcome.next_resource_baseline;
-            self.ticks_since_print = 0;
-            true
-        } else {
-            false
-        }
+        // Either a real delta body, or a forced status with no delta — in the
+        // latter case the report is the status line alone.
+        let body = match (outcome.body, &forced_status) {
+            (Some(b), _) => b,
+            (None, Some(_)) => String::new(),
+            (None, None) => return false,
+        };
+        // Fold the sustained-degradation status line in (it leads the body so
+        // the operator reads the problem first; an empty delta body collapses
+        // to just the status).
+        let report = match forced_status {
+            Some(status) if body.is_empty() => status,
+            Some(status) => format!("{status}\n{body}"),
+            None => body,
+        };
+        // The whole report is one importance-channel event so the
+        // dual-sink routes it to stdio atomically under
+        // `--important-stdio-only` (C1's filter keys on the target).
+        tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
+        // Advance the operational baseline atomically + the
+        // per-field resource baseline per-line (the renderer wrote
+        // each included field into `next_resource_baseline`; an
+        // omitted line preserves its slot).
+        self.last_announced = snapshot.clone();
+        self.last_printed_resource = outcome.next_resource_baseline;
+        self.ticks_since_print = 0;
+        true
     }
 
     /// Process an operator-driven FORCE-PRINT (SIGUSR1 against the
@@ -425,12 +478,26 @@ impl StatsGridGate {
 /// [`LATE_STATS_MIN_SPACING`] of the late emission. Grid ticks while the
 /// connection is down keep their pre-existing behaviour (they run the
 /// normal delta rule — see [`StatsGridGate`]).
+/// # The #662 sustained-degradation status seam
+///
+/// `status` is the shared [`StatusCell`] the observer coordinator publishes
+/// its two since-stamps into each loop iteration (connection-loss-since from
+/// the lost-visibility reporter, not-caught-up-since from its catch-up
+/// tracker). At each ON-GRID periodic occurrence the driver reads
+/// [`StatusCell::status_line`]; when a degraded condition has been sustained
+/// ≥5 min it returns ONE folded line that BOTH forces this report to emit
+/// (overriding the idle-skip gate) and rides in the body. A transient or
+/// absent problem returns `None` and the periodic report behaves exactly as
+/// before. The status is read only on the routine on-grid arm — a late
+/// (outage-regain) run already emits unconditionally, and a SIGUSR1
+/// force-print is the operator's own explicit read.
 pub async fn run_reporter<S, C, F>(
     source: S,
     clock: C,
     outage_rx: tokio::sync::mpsc::UnboundedReceiver<EndedOutage>,
     force_print_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     note: WakeNoteSlot,
+    status: StatusCell,
     cancel: F,
 ) where
     S: CrdtSnapshotSource,
@@ -464,9 +531,12 @@ pub async fn run_reporter<S, C, F>(
                 if grid_gate.grid_tick(clock.now()) {
                     // Routine periodic arm: the skippable path applies
                     // the 10-min skip-eligible predicate AND the 1-hour
-                    // safety net (see `Reporter::on_stats_tick_skippable`).
+                    // safety net (see `Reporter::on_stats_tick_skippable`),
+                    // UNLESS a #662 sustained-degradation status forces the
+                    // emit (the status both overrides the skip and folds in).
                     let snapshot = source.snapshot();
-                    if reporter.on_stats_tick_skippable(&snapshot) {
+                    let status_line = status.status_line(clock.now());
+                    if reporter.on_stats_tick_gated(&snapshot, status_line) {
                         note.flush_after_host();
                     }
                 }

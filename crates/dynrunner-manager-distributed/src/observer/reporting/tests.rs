@@ -892,6 +892,7 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
                 outage_rx,
                 force_print_rx,
                 crate::observer::lost_visibility::WakeNoteSlot::default(),
+                super::status::StatusCell::default(),
                 async move {
                     let _ = cancel_rx.await;
                 },
@@ -1211,6 +1212,7 @@ async fn driver_runs_late_stats_on_ended_outage_signal() {
                 outage_rx,
                 force_print_rx,
                 note,
+                super::status::StatusCell::default(),
                 async move {
                     let _ = cancel_rx.await;
                 },
@@ -1270,6 +1272,7 @@ async fn driver_skips_late_stats_when_no_periodic_elapsed_while_down() {
                 outage_rx,
                 force_print_rx,
                 note,
+                super::status::StatusCell::default(),
                 async move {
                     let _ = cancel_rx.await;
                 },
@@ -2070,5 +2073,192 @@ fn loop_health_plus_in_flight_change_is_not_skip_eligible() {
         !cur.diff_subset_of_skip_eligible(&prev),
         "an in_flight change must defeat skip-eligibility regardless of \
          loop-health movement"
+    );
+}
+
+// ── #662 sustained-degradation folded status line ──
+//
+// The owner spec: the per-snapshot-package "observer caught up: N
+// transitions" IMPORTANT line is suppressed (covered in the narrator
+// tests); instead ONE status line is folded into the 10-min periodic
+// report, force-emitting it even when the idle-skip gate would otherwise
+// elide, but ONLY when a degraded condition (connection lost / not caught
+// up) has been SUSTAINED ≥5 min. These drive the production seam exactly as
+// `run_reporter`'s on-grid arm does: `status.status_line(now)` →
+// `reporter.on_stats_tick_gated(snapshot, status_line)`, capturing the
+// importance-channel emissions synchronously.
+
+use super::status::{StatusCell, StatusStamps};
+
+/// Drive ONE on-grid periodic occurrence exactly as the reporter task's
+/// stats arm does: read the status line for `now`, gate the tick on it.
+fn gated_tick(
+    reporter: &mut Reporter,
+    status: &StatusCell,
+    snapshot: &StatsSnapshot,
+    now: Instant,
+) -> bool {
+    reporter.on_stats_tick_gated(snapshot, status.status_line(now))
+}
+
+/// (a) A not-caught-up state SUSTAINED >5 min force-emits the next 10-min
+/// report even though the snapshot is UNCHANGED (the idle-skip gate would
+/// normally elide), and the report carries the folded status line.
+#[test]
+fn sustained_not_caught_up_force_emits_unchanged_report_with_status() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let status = StatusCell::new();
+        // Establish a baseline so the snapshot below is UNCHANGED (a
+        // routine tick would skip it).
+        assert!(reporter.on_stats_tick(&snap_with(5, 0)), "baseline emit");
+        // The observer went behind at t0; publish that stamp.
+        status.publish(StatusStamps {
+            not_caught_up_since: Some(t0),
+            ..Default::default()
+        });
+        // 10 min later, SAME snapshot (no delta) → normally skipped, but the
+        // sustained (>5 min) catch-up forces the emit + folds the status.
+        assert!(
+            gated_tick(&mut reporter, &status, &snap_with(5, 0), t0 + secs(600)),
+            "sustained not-caught-up must FORCE the otherwise-skipped report"
+        );
+    });
+    let stats: Vec<_> = events
+        .iter()
+        .filter(|e| e.message.contains("periodic cluster stats"))
+        .collect();
+    assert_eq!(stats.len(), 2, "baseline + the forced report: {events:?}");
+    assert!(
+        stats[1].message.contains("not caught up"),
+        "the forced report folds in the not-caught-up status: {:?}",
+        stats[1].message
+    );
+}
+
+/// (b) A caught-up observer (no stamps) does NOT force a report — an
+/// unchanged snapshot stays silent exactly as before. (The per-event "caught
+/// up: N" spam suppression is pinned in the narrator unit tests.)
+#[test]
+fn caught_up_observer_does_not_force_report() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let status = StatusCell::new(); // all-clear
+        assert!(reporter.on_stats_tick(&snap_with(5, 0)), "baseline emit");
+        // Unchanged snapshot, no degraded status → skipped (silent).
+        assert!(
+            !gated_tick(&mut reporter, &status, &snap_with(5, 0), t0 + secs(600)),
+            "a caught-up observer must NOT force an unchanged report"
+        );
+    });
+    let stats: Vec<_> = events
+        .iter()
+        .filter(|e| e.message.contains("periodic cluster stats"))
+        .collect();
+    assert_eq!(stats.len(), 1, "only the baseline, no forced report: {events:?}");
+    assert!(
+        !stats[0].message.contains("not caught up")
+            && !stats[0].message.contains("degraded"),
+        "no status line on a healthy report: {:?}",
+        stats[0].message
+    );
+}
+
+/// (c) A TRANSIENT (<5 min) not-caught-up / loss at report time produces NO
+/// status line and does NOT force the emit — the report behaves exactly as
+/// today (an unchanged snapshot is skipped).
+#[test]
+fn transient_degradation_under_threshold_no_status_no_force() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let status = StatusCell::new();
+        assert!(reporter.on_stats_tick(&snap_with(5, 0)), "baseline emit");
+        // Behind for only 2 minutes when the 10-min report lands.
+        status.publish(StatusStamps {
+            not_caught_up_since: Some(t0 + secs(480)),
+            connection_lost_since: Some(t0 + secs(540)),
+        });
+        assert!(
+            !gated_tick(&mut reporter, &status, &snap_with(5, 0), t0 + secs(600)),
+            "a transient (<5 min) problem must NOT force the report"
+        );
+    });
+    let stats: Vec<_> = events
+        .iter()
+        .filter(|e| e.message.contains("periodic cluster stats"))
+        .collect();
+    assert_eq!(stats.len(), 1, "only the baseline — transient elides: {events:?}");
+}
+
+/// (d) Connection lost ≥5 min force-emits the report with the loss status
+/// line, even on an unchanged (frozen-CRDT) snapshot.
+#[test]
+fn sustained_connection_loss_force_emits_with_status() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let status = StatusCell::new();
+        assert!(reporter.on_stats_tick(&snap_with(5, 0)), "baseline emit");
+        // Connection lost at t0; the CRDT is frozen so the snapshot is
+        // unchanged at the 10-min mark.
+        status.publish(StatusStamps {
+            connection_lost_since: Some(t0),
+            ..Default::default()
+        });
+        assert!(
+            gated_tick(&mut reporter, &status, &snap_with(5, 0), t0 + secs(600)),
+            "a ≥5-min connection loss must FORCE the report"
+        );
+    });
+    let stats: Vec<_> = events
+        .iter()
+        .filter(|e| e.message.contains("periodic cluster stats"))
+        .collect();
+    assert_eq!(stats.len(), 2, "baseline + the forced loss report: {events:?}");
+    assert!(
+        stats[1].message.contains("connection to the run lost"),
+        "the forced report folds in the connection-loss status: {:?}",
+        stats[1].message
+    );
+}
+
+/// The forced status report still carries any genuine delta (the status
+/// leads, the delta follows) — the fold does not REPLACE the periodic body.
+#[test]
+fn forced_status_report_still_carries_the_delta_body() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let status = StatusCell::new();
+        assert!(reporter.on_stats_tick(&snap_with(5, 0)), "baseline emit");
+        status.publish(StatusStamps {
+            not_caught_up_since: Some(t0),
+            ..Default::default()
+        });
+        // A real delta (succeeded 5→9) AND the sustained status.
+        assert!(gated_tick(
+            &mut reporter,
+            &status,
+            &snap_with(9, 0),
+            t0 + secs(600)
+        ));
+    });
+    let forced = events
+        .iter()
+        .rev()
+        .find(|e| e.message.contains("periodic cluster stats"))
+        .expect("forced report emitted");
+    assert!(
+        forced.message.contains("not caught up"),
+        "status folded in: {:?}",
+        forced.message
+    );
+    assert!(
+        forced.message.contains("succeeded: 9(+4)"),
+        "the delta body is preserved alongside the status: {:?}",
+        forced.message
     );
 }

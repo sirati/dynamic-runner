@@ -484,13 +484,17 @@ fn catch_up(task_id: &str, change: TaskStateChange, holder: Option<(&str, u32)>)
     TaskStateChangeEvent { source: NarrationSource::CatchUp, ..evt(task_id, change, holder) }
 }
 
-/// CATCH-UP ROUTING (#636-followup): `observe` folds N CatchUp
-/// transitions into ONE summary on `flush_catch_up` (naming the distinct
-/// task + transition counts), narrates NOTHING per-task for them, and the
-/// counter RESETS per batch — while a LiveBroadcast event in the SAME
-/// stream still narrates individually.
+/// CATCH-UP ROUTING (#636-followup + #662): `observe` folds N CatchUp
+/// transitions into the batch accumulator (narrating NOTHING per-task for
+/// them), and the counter RESETS on `flush_catch_up` — while a LiveBroadcast
+/// event in the SAME stream still narrates individually. #662: the per-flush
+/// catch-up line is NO LONGER emitted to `IMPORTANT_TARGET` (it spammed the
+/// wake stream once per incremental snapshot-package flush); `flush_catch_up`
+/// returns `false` (not a wake host) and produces NO importance-channel line.
+/// The sustained-catch-up signal now lives in the periodic report's folded
+/// status line (`reporting::status`), gated on ≥5 min behind.
 #[test]
-fn observe_folds_catch_up_into_one_summary_and_narrates_live_individually() {
+fn catch_up_folds_silently_and_does_not_spam_important() {
     let events = capture(|| {
         let mut n = armed();
         // Three restored InFlight transitions over THREE distinct tasks +
@@ -507,30 +511,25 @@ fn observe_folds_catch_up_into_one_summary_and_narrates_live_individually() {
             n.observe(&evt("live", TaskStateChange::Assigned, Some(("sec-0", 2)))),
             "a live-broadcast transition narrates individually"
         );
-        // Terminal package: flush the batch → ONE summary line.
-        assert!(n.flush_catch_up(), "a non-empty batch flushes one summary");
-        // Counter reset: a second flush over an empty batch emits nothing.
+        // Terminal package: flush the batch → NO importance summary (the
+        // per-flush spam is suppressed), and NOT a wake host.
+        assert!(
+            !n.flush_catch_up(),
+            "a catch-up flush is no longer a wake host (no IMPORTANT emit)"
+        );
+        // Counter reset: a second flush over an empty batch is also silent.
         assert!(!n.flush_catch_up(), "an empty batch (post-reset) emits nothing");
     });
-    let summaries: Vec<_> = events
-        .iter()
-        .filter(|e| e.leveled.event.message.contains("observer caught up"))
-        .collect();
-    assert_eq!(summaries.len(), 1, "exactly one catch-up summary: {events:?}");
-    assert_eq!(summaries[0].target, IMPORTANT_TARGET, "summary is wake-worthy");
-    assert_eq!(
-        summaries[0].leveled.event.fields.get("catch_up_tasks").map(String::as_str),
-        Some("3"),
-        "3 distinct catch-up tasks (a re-touched): {:?}",
-        summaries[0]
+    // The per-flush "observer caught up: N" line must NOT reach the
+    // importance channel (the #662 spam fix).
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.leveled.event.message.contains("caught up")),
+        "no per-flush catch-up line on the wake stream: {events:?}"
     );
-    assert_eq!(
-        summaries[0].leveled.event.fields.get("catch_up_transitions").map(String::as_str),
-        Some("4"),
-        "4 catch-up transitions: {:?}",
-        summaries[0]
-    );
-    // The ONLY individual per-task line is the LIVE one (none of a/b/c).
+    // The ONLY individual per-task line is the LIVE one (none of a/b/c) —
+    // the catch-up fold is intact.
     let per_task: Vec<_> = events
         .iter()
         .filter(|e| e.target == OBSERVER_TASK_TARGET)
@@ -540,7 +539,10 @@ fn observe_folds_catch_up_into_one_summary_and_narrates_live_individually() {
 }
 
 /// An empty catch-up batch (a `done` over a converged re-stream that won
-/// no transitions) flushes NOTHING — the quiescent-observer no-op.
+/// no transitions) flushes NOTHING — the quiescent-observer no-op. Post-#662
+/// a NON-empty batch is ALSO silent on the importance channel; this pins the
+/// empty case stays a no-op (no full-log line either, distinct from the
+/// non-empty DEBUG diagnostic).
 #[test]
 fn empty_catch_up_batch_flushes_nothing() {
     let events = capture(|| {

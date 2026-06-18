@@ -198,7 +198,23 @@ impl ObserverTaskNarrator {
     /// An EMPTY batch (a `done` over a restore that won no transitions — a
     /// converged re-stream) emits NOTHING and resets, so a quiescent
     /// observer stays silent. Mirrors `narrate_baseline`'s empty-baseline
-    /// no-op. Returns whether a line was emitted (the wake-stream host seam).
+    /// no-op.
+    ///
+    /// #662: this NO LONGER emits to [`IMPORTANT_TARGET`]. Under the #653
+    /// INCREMENTAL catch-up, a single late-join / recovery catch-up drains as
+    /// a STREAM of snapshot-stream packages, each firing one `flush_catch_up`
+    /// — so the per-flush "observer caught up: N transitions" line produced a
+    /// stream of importance-channel lines ("1 transitions", "2 transitions",
+    /// …) interleaved with the 10-min periodic stats: spam under
+    /// `--important-stdio-only`. The operator-facing signal is now ONE gated
+    /// line folded into the periodic report, emitted ONLY when the observer
+    /// has been NOT-CAUGHT-UP for ≥5 min (see
+    /// [`crate::observer::reporting::status`]); the per-flush progress is
+    /// kept on the FULL log at DEBUG for post-hoc diagnostics. The catch-up
+    /// accumulator is still TRACKED + RESET here — its progress feeds the
+    /// full-log line and the reset keeps the per-batch count honest. Returns
+    /// `false` always: a catch-up flush is no longer a wake-stream host (it
+    /// emits nothing on [`IMPORTANT_TARGET`]).
     pub(crate) fn flush_catch_up(&mut self) -> bool {
         let transitions = self.catch_up_transitions;
         let tasks = self.catch_up_tasks.len();
@@ -207,18 +223,16 @@ impl ObserverTaskNarrator {
         if transitions == 0 {
             return false;
         }
-        // Per-RUN-scale (one line per catch-up batch, not per task), so it
-        // rides IMPORTANT_TARGET like the baseline summary — the operator
-        // sees the late-join / recovery catch-up as one wake line, never
-        // the N-task InFlight-partition flood the path-independent merge
-        // seam would otherwise narrate as live.
-        tracing::info!(
-            target: IMPORTANT_TARGET,
+        // FULL-LOG ONLY (no `IMPORTANT_TARGET`): a per-flush diagnostic the
+        // operator never sees on the wake stream. The sustained-catch-up
+        // status (≥5 min behind) surfaces as the periodic report's folded
+        // line instead.
+        tracing::debug!(
             catch_up_transitions = transitions,
             catch_up_tasks = tasks,
-            "observer caught up: {transitions} transitions over {tasks} tasks (from snapshot)",
+            "observer catch-up batch applied: {transitions} transitions over {tasks} tasks (from snapshot)",
         );
-        true
+        false
     }
 
     /// Narrate ONE live task transition. Emits a single line at the
