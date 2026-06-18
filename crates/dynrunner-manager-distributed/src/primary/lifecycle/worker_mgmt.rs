@@ -103,7 +103,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // the placement signal. Self-contained in `primary::affine_dispatch`;
             // the worker recheck never learns the affine concern (it selects the
             // affine-dep subset over the SAME pool).
-            self.place_dependency_satisfied_affine_tasks().await;
+            // Dead-upstream-aware placement (#650): placement declines to
+            // re-admit any ready candidate whose affine import is already
+            // globally-failed and RETURNS that doomed set; terminalize it here
+            // (this arm holds `command_rx`) through the SAME claim+batch path the
+            // #648 event-driven bridge uses. The placement source stays free of
+            // `command_rx` — it reports the doomed set, the `command_rx`-holding
+            // caller drives the cascade (the dispatch-decoupling boundary).
+            let doomed_affine_work = self.place_dependency_satisfied_affine_tasks().await;
+            self.terminalize_doomed_affine_work(doomed_affine_work, command_rx)
+                .await;
             // Send failures are logged + rolled back inside the recheck;
             // `.ok()` swallows the transient so the reaction can't abort
             // the loop.

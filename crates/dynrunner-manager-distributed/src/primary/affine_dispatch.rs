@@ -124,12 +124,37 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// secondary is not re-appended (the `place` policy skips it) and is the
     /// only `SecondaryAffine` pool item this pass takes; re-running with
     /// nothing newly ready is a cheap no-op.
-    pub(crate) async fn place_dependency_satisfied_affine_tasks(&mut self) {
+    ///
+    /// ## Dead-upstream-aware placement (#650)
+    /// A work unit can become ready-in-bucket AFTER its affine import has already
+    /// reached a GLOBAL terminal-failure (recorded in `failed_tasks` by a
+    /// pool-cascade — e.g. the import's own non-affine upstream failed
+    /// non-recoverably). The #648 fast-fail bridge fires ONCE at the import's
+    /// terminal seam, so a dependent that was not-yet-ready-in-bucket at that
+    /// instant is MISSED by the bridge; when it later becomes ready, this
+    /// placement source would re-admit it as if the import were live. To close
+    /// that residual, each ready candidate is PARTITIONED via the EXACT #648
+    /// predicate ([`Self::affine_unit_satisfiable_secondaries`], which keys on
+    /// `failed_tasks`): a SATISFIABLE candidate is placed unchanged; a DOOMED one
+    /// (no roster secondary can satisfy its deps) is NEVER recorded placed and is
+    /// instead collected into the returned `(hash, phase)` doomed set. The caller
+    /// (which holds `command_rx`) routes that set through the SAME claim+batch
+    /// terminalization the bridge uses ([`Self::terminalize_doomed_affine_work`]).
+    /// This is the CONTINUOUS complement on the placement source to #648's
+    /// one-shot event-driven bridge — two triggers, ONE predicate, ONE batch — so
+    /// a doomed dependent is terminalized whether its import failed before or
+    /// after the dependent became ready.
+    ///
+    /// Returns the doomed `(work_hash, phase)` set for the caller to terminalize;
+    /// empty when every ready candidate was satisfiable (the common path).
+    pub(crate) async fn place_dependency_satisfied_affine_tasks(
+        &mut self,
+    ) -> Vec<(String, dynrunner_core::PhaseId)> {
         // The candidate secondaries for rank selection: the live roster. An
         // empty roster (no secondary yet) means nothing can be placed.
         let secondaries: Vec<String> = self.affine_placement_secondaries();
         if secondaries.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // The set of affine-prereq hashes the pool has marked READY (a
@@ -142,15 +167,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .filter(|t| t.kind.is_secondary_affine())
             .map(compute_task_hash)
             .collect();
-        if ready_affine.is_empty() {
-            return;
-        }
 
-        // Find every WORK task whose affine prereqs are ALL in `ready_affine`
-        // (the whole schedulable unit is runnable). A work task with no affine
-        // dep is never a candidate (it dispatches from the global pool as
-        // today). Resolve the candidate's `WorkPlacement` while iterating, so
-        // the placement input is built once per candidate.
+        // Find every WORK candidate, partitioning each into PLACEABLE vs DOOMED.
+        // A candidate qualifies on EITHER of two independent conditions:
+        //
+        //   * PLACEABLE: every affine prereq is ready-in-bucket (`ready_affine`)
+        //     — the whole schedulable unit is runnable; place it as today. A unit
+        //     not yet wholly ready (a prereq still blocked) is deferred (a later
+        //     `TasksAdded` re-evaluates it).
+        //   * DOOMED (#650): the unit is `Unsatisfiable` — its affine import is
+        //     globally-failed (the EXACT #648 predicate, which reads
+        //     `failed_tasks`). This is checked INDEPENDENTLY of `ready_affine`,
+        //     because a globally-failed import will NEVER be a ready-in-bucket
+        //     prereq, so the `all_ready` placeable gate alone can never see it —
+        //     the doomed unit must be terminalized at its own work-readiness, not
+        //     gated behind a prereq that can never become ready.
+        //
+        // A SATISFIABLE-but-not-yet-ready candidate (a live/in-flight import not
+        // yet in a bucket) is neither: it is simply deferred. Only the
+        // `failed_tasks`-globally-failed case diverts to terminalization — a live
+        // import still places normally once ready.
+        //
+        // `affine_unit_satisfiable_secondaries` is computed once per candidate and
+        // reused for both the doomed decision and (for a placeable one) is not
+        // needed again — so the predicate runs at most once per candidate.
+        let mut doomed: Vec<(String, dynrunner_core::PhaseId)> = Vec::new();
         let placements: Vec<(String, super::affine_scheduler::WorkPlacement)> = self
             .cluster_state
             .tasks_iter()
@@ -164,10 +205,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if placement.affine_deps.is_empty() {
                     return None;
                 }
-                // Every affine prereq must be ready-in-bucket: otherwise the
-                // unit is not yet wholly runnable, so defer (a later
-                // `TasksAdded`, fired when the lagging prereq's deps complete,
-                // re-evaluates it).
+                // DOOMED takes precedence: a unit whose import is globally-failed
+                // is collected for terminalization regardless of prereq-readiness
+                // (its prereq can never become ready-in-bucket).
+                if self
+                    .affine_unit_satisfiable_secondaries(&placement)
+                    .is_empty()
+                {
+                    doomed.push((placement.hash.clone(), task.phase_id.clone()));
+                    return None;
+                }
+                // PLACEABLE: every affine prereq is ready-in-bucket.
                 let all_ready = placement
                     .affine_deps
                     .iter()
@@ -217,6 +265,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.apply_and_broadcast_cluster_mutations(mutations).await;
             }
         }
+        doomed
     }
 
     /// Per-secondary-FIRST pop for the idle worker at `worker_idx`: pop the
@@ -785,6 +834,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if !self.claim_affine_work_for_fail(hash, phase) {
             return;
         }
+        // Clear the placement-dedup record (#650): a gate-failed work task must
+        // not stay `placed_work`-marked, else it sits placed-but-unqueued forever
+        // (the strand diagnostic grows monotonically — the 3570-churn's secondary
+        // contributor when a doomed work is requeued + re-popped + gate-failed
+        // repeatedly without ever clearing its placed record). It is now terminal,
+        // so the placement scan will not re-derive it.
+        self.affine_scheduler.unrecord_placed_work(hash);
         let (reply, _rx) = tokio::sync::oneshot::channel();
         let cmd = super::command_channel::PrimaryCommand::FailPermanent {
             hash: hash.to_string(),
@@ -904,11 +960,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             })
             .collect();
 
-        // CLAIM each doomed dependent out of its bucket (+ mark in-flight) so the
-        // batch's `on_item_failed_permanent` decrement balances. A stale claim
-        // (already taken / phase not Active) is skipped — nothing to fail there.
-        // Only the successfully-claimed items go to the batch, keeping the
-        // claim ↔ decrement accounting exactly paired.
+        // Claim + batch-terminalize the doomed set — the SAME tail the placement
+        // source (`place_dependency_satisfied_affine_tasks`) routes its declined
+        // doomed candidates through (#650), so the claim ↔ decrement accounting
+        // and the one-broadcast batch live in ONE owner.
+        self.terminalize_doomed_affine_work(doomed, command_rx).await;
+    }
+
+    /// Claim a set of doomed affine-dep WORK units out of their buckets and
+    /// terminal-fail the whole set in ONE batch — the shared claim+batch tail of
+    /// every dead-upstream-aware affine terminalization path. Two triggers feed
+    /// it ONE predicate-already-applied `(hash, phase)` set:
+    ///
+    ///   * the EVENT-DRIVEN bridge ([`Self::fast_fail_affine_dependents_if_unsatisfiable`],
+    ///     #648) — an affine import just reached its global terminal-failure;
+    ///   * the PLACEMENT SOURCE ([`Self::place_dependency_satisfied_affine_tasks`],
+    ///     #650) — a work unit became ready-in-bucket AFTER its import was already
+    ///     globally-failed, so placement declines it instead of re-admitting it.
+    ///
+    /// Both callers have ALREADY applied the `Unsatisfiable` predicate
+    /// ([`Self::affine_unit_satisfiable_secondaries`] empty); this owner only does
+    /// the claim + batch, so the two sources share one accounting + one broadcast.
+    ///
+    /// CLAIM each doomed dependent out of its bucket (+ mark in-flight) so the
+    /// batch's `on_item_failed_permanent` decrement balances. A stale claim
+    /// (already taken / phase not Active) is skipped — nothing to fail there.
+    /// Only the successfully-claimed items go to the batch, keeping the
+    /// claim ↔ decrement accounting exactly paired.
+    pub(crate) async fn terminalize_doomed_affine_work(
+        &mut self,
+        doomed: Vec<(String, dynrunner_core::PhaseId)>,
+        command_rx: &mut Option<tokio::sync::mpsc::Receiver<super::command_channel::PrimaryCommand<I>>>,
+    ) {
         let claimed: Vec<(String, dynrunner_core::ErrorType, String)> = doomed
             .into_iter()
             .filter_map(|(hash, phase)| {
