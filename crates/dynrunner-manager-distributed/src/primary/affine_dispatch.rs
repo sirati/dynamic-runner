@@ -497,6 +497,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         secondary: &str,
         placement: &WorkPlacement,
     ) -> AffineGateOutcome {
+        // A GLOBALLY-failed affine import (in the pool's `failed_tasks` terminal
+        // ledger — its non-affine upstream pool-cascade-failed it #648) is
+        // order-independent UNsatisfiable: unlike a per-secondary `Failed` cell
+        // (recoverable by a re-route to a still-eligible secondary), a globally-
+        // failed import cannot run ANYWHERE, so there is nothing to re-route to.
+        // Checked FIRST so the verdict is `Unsatisfiable` even when every cell is
+        // still `NotDone` (a pool-cascade import never ran, so it flips no cell).
+        // The `select_secondary` over `affine_unit_satisfiable_secondaries`
+        // (empty for a globally-failed dep) would also yield `Unsatisfiable`, but
+        // the direct check makes the dead-import case explicit + skips the rank
+        // walk.
+        if placement
+            .affine_deps
+            .iter()
+            .any(|(_, import_hash)| self.failed_tasks.contains_key(import_hash))
+        {
+            return AffineGateOutcome::Unsatisfiable;
+        }
+
         // A `Failed` dep anywhere is order-independent terminal: this secondary
         // cannot satisfy the unit regardless of any other dep's position. Re-route
         // to an eligible secondary that can still satisfy EVERY dep (none `Failed`
@@ -546,7 +565,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// the dependent is doomed. Reads the roster (not just the bitvector's
     /// written secondaries) so a fresh all-`NotDone` secondary counts as
     /// placeable.
+    ///
+    /// ## GLOBAL import-failure is order-independent unsatisfiable (#648)
+    /// A per-secondary `Failed` cell is the LOCAL signal a single secondary
+    /// could not run the import (recoverable elsewhere). But an affine import
+    /// can also reach a GLOBAL terminal-failure that no secondary can recover
+    /// from: when its OWN non-affine upstream fails non-recoverably, the
+    /// permanent-fail cascade (`fail_permanent_cascade_mutations` →
+    /// `on_item_failed_permanent`) records the import in `failed_tasks` WITHOUT
+    /// flipping any bitvector cell (the import never ran anywhere — its cells
+    /// stay `NotDone`). A unit with such a dep is doomed on EVERY secondary
+    /// regardless of cell state, so a globally-failed dep collapses the
+    /// satisfiable set to empty — the missing edge the per-secondary `Failed`
+    /// gate alone never sees (its cells are all `NotDone`). This is the single
+    /// predicate that bridges a pool-cascade import failure into the affine
+    /// `Unsatisfiable` verdict; `fast_fail_affine_dependents_if_unsatisfiable`
+    /// then terminalizes the doomed dependents.
     fn affine_unit_satisfiable_secondaries(&self, placement: &WorkPlacement) -> Vec<String> {
+        // A GLOBALLY-failed affine import (recorded in the pool's `failed_tasks`
+        // terminal ledger) cannot run on ANY secondary — the unit is doomed
+        // everywhere, so the satisfiable set is empty.
+        if placement
+            .affine_deps
+            .iter()
+            .any(|(_, import_hash)| self.failed_tasks.contains_key(import_hash))
+        {
+            return Vec::new();
+        }
         self.affine_placement_secondaries()
             .into_iter()
             .filter(|sec| {

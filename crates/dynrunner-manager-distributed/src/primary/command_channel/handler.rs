@@ -173,7 +173,7 @@ where
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
         // In-memory cascade + mutation build (the shared core).
-        let Some((phase_id, _task_id, mutations)) =
+        let Some((phase_id, _task_id, mutations, affine_imports)) =
             self.fail_permanent_cascade_mutations(hash.clone(), error, reason)
         else {
             return Err(format!("fail_permanent: unknown task hash {hash}"));
@@ -191,6 +191,13 @@ where
         // cascade helper, so the routing takes the legacy in-flight-only
         // decrement.
         self.note_item_failed(&phase_id, None, None, command_rx).await;
+
+        // AFFINE FAST-FAIL BRIDGE (#648). Any cascaded affine import is now in
+        // `failed_tasks`; its affine-DEP work tasks escaped the cascade BFS
+        // (the Model-B edge filter), so bridge each import into the affine
+        // subsystem's own fast-fail to terminalize the doomed dependents.
+        self.bridge_affine_imports_to_fast_fail(affine_imports, command_rx)
+            .await;
         Ok(())
     }
 
@@ -233,12 +240,16 @@ where
         // The phases each failed item belongs to — the in-flight decrement
         // targets, applied after the single broadcast.
         let mut decrements: Vec<dynrunner_core::PhaseId> = Vec::with_capacity(items.len());
+        // The cascaded affine imports across the whole burst — bridged into the
+        // affine fast-fail after the single broadcast + lifecycle pass (#648).
+        let mut affine_imports: Vec<String> = Vec::new();
         for (hash, error, reason) in items {
-            if let Some((phase_id, _task_id, mutations)) =
+            if let Some((phase_id, _task_id, mutations, imports)) =
                 self.fail_permanent_cascade_mutations(hash, error, reason)
             {
                 all_mutations.extend(mutations);
                 decrements.push(phase_id);
+                affine_imports.extend(imports);
             }
             // Unknown hash: skipped — no mutation, no decrement (the in-memory
             // cascade was never applied for it, so accounting stays balanced).
@@ -259,13 +270,60 @@ where
             self.pool_mut().on_item_finished(phase_id, None);
         }
         self.process_phase_lifecycle(command_rx).await;
+
+        // AFFINE FAST-FAIL BRIDGE (#648). Same seam as the single-item path:
+        // any cascaded affine import is now in `failed_tasks`; bridge each into
+        // the affine fast-fail to terminalize its escaped affine-dep work tasks.
+        // `Box::pin`: the bridge → `fast_fail` → `apply_fail_permanent_batch`
+        // cycle (a terminalized affine-dep work task can itself have downstream
+        // affine imports) is a recursive async call the state machine must box;
+        // the runtime depth is bounded by the dependency DAG.
+        Box::pin(self.bridge_affine_imports_to_fast_fail(affine_imports, command_rx))
+            .await;
+    }
+
+    /// Bridge each cascaded affine IMPORT (now recorded in `failed_tasks` by
+    /// [`Self::fail_permanent_cascade_mutations`]) into the affine subsystem's
+    /// own fast-fail, terminalizing the affine-DEP work tasks that escaped the
+    /// permanent-fail cascade BFS (#648).
+    ///
+    /// The escape: an affine import's affine-dep dependents are EXCLUDED from
+    /// the pool's `dependents_of` by the Model-B affine edge filter
+    /// (`commit_item` / `has_affine_dep`), so the cascade BFS dead-ends at the
+    /// import — the dependents are never failed by it and sit placed-but-never-
+    /// terminal forever (the build phase never drains). This is the SINGLE
+    /// pool-terminal → affine-fast-fail seam: it reuses the affine subsystem's
+    /// EXISTING enumeration + batched terminalization
+    /// ([`Self::fast_fail_affine_dependents_if_unsatisfiable`]), which — via the
+    /// generalized `affine_unit_satisfiable_secondaries` predicate that now
+    /// reads a `failed_tasks` import as globally-unsatisfiable — finds the
+    /// dependents `Unsatisfiable` even though no bitvector cell is `Failed` (a
+    /// pool-cascade import never ran, so its cells stay `NotDone`). The caller
+    /// reads no affine internals; this is the only place the pool-terminal seam
+    /// knows the affine subsystem exists.
+    ///
+    /// Idempotent + scale-safe: the fast-fail dedups against already-terminal
+    /// dependents (`claim_affine_work_for_fail` → `take_first_match` returns
+    /// `None`) and batches the whole dependent set through one broadcast + one
+    /// lifecycle pass. Must run AFTER the import's own `TaskFailed` is applied
+    /// (the satisfiability read consults `failed_tasks`, populated synchronously
+    /// during the cascade build).
+    async fn bridge_affine_imports_to_fast_fail(
+        &mut self,
+        affine_imports: Vec<String>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
+        for import_hash in affine_imports {
+            self.fast_fail_affine_dependents_if_unsatisfiable(&import_hash, command_rx)
+                .await;
+        }
     }
 
     /// The shared in-memory core of permanent-failure: record `hash` in the
     /// per-pass `failed_tasks` ledger, cascade-to-dependents via the pool
     /// primitive, and BUILD (but do not broadcast) the resulting terminal
-    /// mutations. Returns `(phase_id, task_id, mutations)` or `None` for an
-    /// unknown hash. Consumed by both [`Self::apply_fail_permanent`] (single,
+    /// mutations. Returns `(phase_id, task_id, mutations, affine_imports)` or
+    /// `None` for an unknown hash. Consumed by both [`Self::apply_fail_permanent`] (single,
     /// channel-driven) and [`Self::apply_fail_permanent_batch`] (burst,
     /// one-broadcast) so the cascade + mutation shape can never drift.
     ///
@@ -277,12 +335,33 @@ where
     /// cascade (#358: the apply's `merge_task_state` join owns the per-phase
     /// Failed EVENT tally bump, so a phase draining inside the cascade must fire
     /// `on_phase_end` with the tally already including this failure).
+    ///
+    /// The returned `affine_imports` are the cascaded hashes that are themselves
+    /// affine IMPORTS (`affine_id_for_hash` resolves) — the seam for the
+    /// pool-cascade → affine fast-fail bridge (#648). A non-affine upstream's
+    /// permanent failure cascades THROUGH an affine import (which has a
+    /// non-affine edge on that upstream), terminalizing the import in
+    /// `failed_tasks`; but the affine-DEP work tasks downstream of the import
+    /// ESCAPE this BFS (an import's affine-dep dependents are EXCLUDED from the
+    /// pool's `dependents_of` by the Model-B affine edge filter), so the cascade
+    /// dead-ends at the import. The caller bridges each such import into
+    /// `fast_fail_affine_dependents_if_unsatisfiable` to terminalize the doomed
+    /// dependents. They are RETURNED (not bridged here) because the fast-fail
+    /// needs the async broadcast + `command_rx` the caller holds, and must run
+    /// AFTER the import's own `TaskFailed` is applied (so the generalized
+    /// satisfiability read sees the import in `failed_tasks`).
+    #[allow(clippy::type_complexity)]
     fn fail_permanent_cascade_mutations(
         &mut self,
         hash: String,
         error: ErrorType,
         reason: String,
-    ) -> Option<(dynrunner_core::PhaseId, String, Vec<ClusterMutation<I>>)> {
+    ) -> Option<(
+        dynrunner_core::PhaseId,
+        String,
+        Vec<ClusterMutation<I>>,
+        Vec<String>,
+    )> {
         let (phase_id, task_id) = self.task_meta_for_hash(&hash)?;
         // Record the failure in the local per-pass ledger so the operational
         // loop's accounting + the per-phase counters match the wire-side state
@@ -292,6 +371,12 @@ where
         // Cascade-to-dependents via the pool primitive. How the caller observes
         // them depends on the error class (cascade-pause for Unfulfillable,
         // cascade-fail otherwise).
+        // The cascaded hashes that are themselves affine IMPORTS — the
+        // bridge seam to the affine fast-fail (#648). An `Unfulfillable`
+        // cascade is a PAUSE (`TaskBlocked`), not a terminal failure, so it
+        // never globally-fails an import and never bridges; only the
+        // terminal-failure cascade does.
+        let mut affine_imports: Vec<String> = Vec::new();
         let cascaded_blocks: Vec<(String, String)> = {
             let cascaded = self
                 .pool_mut()
@@ -303,6 +388,13 @@ where
                 if is_unfulfillable {
                     blocks.push((cascaded_hash, hash.clone()));
                 } else {
+                    if self
+                        .cluster_state
+                        .affine_id_for_hash(&cascaded_hash)
+                        .is_some()
+                    {
+                        affine_imports.push(cascaded_hash.clone());
+                    }
                     self.failed_tasks.insert(cascaded_hash, error.clone());
                 }
             }
@@ -326,7 +418,7 @@ where
                 on: on_hash,
             });
         }
-        Some((phase_id, task_id, mutations))
+        Some((phase_id, task_id, mutations, affine_imports))
     }
 
     /// Handler for `PrimaryCommand::ReinjectTask`. Accepts only entries

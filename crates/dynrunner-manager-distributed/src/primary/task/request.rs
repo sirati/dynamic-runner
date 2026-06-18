@@ -16,6 +16,11 @@ use crate::primary::lifecycle::dispatch::DispatchOutcome;
 pub(in crate::primary) const UNASSIGNABLE_PARK_WARN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
+/// The cap on the per-hash strand list emitted on the unassignable-park line —
+/// bounded so a large strand set never floods the rollup; the
+/// `affine_dep_strand_candidates` count carries the full magnitude.
+const AFFINE_STRAND_HASH_LOG_LIMIT: usize = 16;
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the terminal-veto settle cascade (its
@@ -298,16 +303,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // counts), so it is diagnostic only.
                             let affine_dep_strand_candidates =
                                 self.affine_scheduler.placed_but_unqueued_count();
+                            // The actual stranded work hashes (bounded), so the
+                            // signal is greppable to the OFFENDING units in one
+                            // line — not just a count. The count above carries
+                            // the full magnitude when it exceeds the cap.
+                            let affine_dep_strand_hashes = self
+                                .affine_scheduler
+                                .placed_but_unqueued_hashes(AFFINE_STRAND_HASH_LOG_LIMIT);
                             tracing::debug!(
                                 parked_workers = parked,
                                 suppressed_re_requests = suppressed,
                                 affine_dep_strand_candidates,
+                                affine_dep_strand_hashes = ?affine_dep_strand_hashes,
                                 "idle workers parked awaiting work; \
                                  unassignable re-requests suppressed in the \
                                  last {:?} — each worker is assigned by the \
                                  dispatch push as soon as work fits \
-                                 (affine_dep_strand_candidates names work hashes \
-                                 placed but absent from every affine queue)",
+                                 (affine_dep_strand_hashes names the work hashes \
+                                 placed but absent from every affine queue; \
+                                 affine_dep_strand_candidates is the full count)",
                                 UNASSIGNABLE_PARK_WARN_INTERVAL
                             );
                         }

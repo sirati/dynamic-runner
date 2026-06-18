@@ -2438,3 +2438,229 @@ async fn affine_multiworker_same_node_delta_never_assigned_before_base_done() {
         })
         .await;
 }
+
+/// An ordinary `Work` upstream (no deps), phase "work" — the non-affine prereq
+/// an affine import is built ON TOP of (the consumer's `build_common_dep`).
+fn work_upstream(name: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 10);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t
+}
+
+/// A `SecondaryAffine` import depending on the ordinary `Work` `upstream` via a
+/// NON-affine edge (the consumer's `import_common_dep`: an affine import whose
+/// own prereq is an ordinary build). The edge is non-affine because `upstream`
+/// is an ordinary work def — so the import is BLOCKED in the global pool on
+/// `upstream` (and is in `dependents_of[upstream]`), unlike an affine prereq
+/// (which is excluded from a dependent's blocking set).
+fn affine_import_dep(name: &str, upstream: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 10);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t.kind = TaskKind::SecondaryAffine;
+    t.task_depends_on = vec![TaskDep {
+        task_id: upstream.into(),
+        phase_id: PhaseId::from("work"),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+    t
+}
+
+/// DEAD-UPSTREAM AFFINE-DEP TERMINALIZATION (#648): an affine import's OWN
+/// non-affine upstream fails non-recoverably → the permanent-fail cascade
+/// pool-fails the import (it has a non-affine edge on the upstream, so it is in
+/// `dependents_of[upstream]`) — BUT the import flips NO bitvector cell (it never
+/// ran anywhere; its cells stay `NotDone`). The affine-DEP work tasks downstream
+/// of the import ESCAPE the cascade via two stacked gaps: (1) the Model-B edge
+/// filter keeps them OUT of `dependents_of[import]` so the cascade BFS dead-ends
+/// at the import, and (2) the per-secondary fast-fail
+/// (`fast_fail_affine_dependents_if_unsatisfiable`) only fires from a per-secondary
+/// worker terminal that flips a cell `→ Failed`, which a pool-cascade import
+/// never does. Pre-fix the dependent sits placed-but-never-terminal forever and
+/// the build phase never drains.
+///
+/// RED at fc1b0ee9: the dependent W is placed (the global view never grabs it,
+/// `has_affine_dep`), absent from every affine queue, and NON-terminal after the
+/// upstream fails — and `affine_unit_satisfiable_secondaries` reads the
+/// all-`NotDone` import as STILL satisfiable, so no fast-fail fires.
+///
+/// GREEN: the generalized satisfiability predicate reads the import (now in
+/// `failed_tasks`) as globally-UNsatisfiable, and the pool-terminal → affine
+/// fast-fail bridge (`bridge_affine_imports_to_fast_fail`, run from
+/// `apply_fail_permanent`) terminalizes W in one batch — W is terminal, out of
+/// its bucket, and no longer placed-but-unqueued, so the phase can drain.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_terminalized_when_import_pool_cascade_failed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Topology: ordinary Work upstream U → affine import I (non-affine
+            // edge on U) → affine-dep Work W (affine edge on I).
+            let upstream = work_upstream("build_common_dep");
+            let upstream_hash = compute_task_hash(&upstream);
+            let import = affine_import_dep("import_common_dep", "build_common_dep");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("cross_arch_build", "import_common_dep");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![upstream, import, build]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id for the import");
+
+            // The import is BLOCKED on its non-affine upstream (it is NOT a ready
+            // bucket item) — so it is in `dependents_of[upstream]` and the
+            // cascade will reach it. The affine-dep work W, by contrast, IS a
+            // ready bucket item (its only dep is the affine import, excluded from
+            // its global blocking set by `has_affine_dep`).
+            let import_ready = primary
+                .pool()
+                .iter()
+                .any(|t| compute_task_hash(t) == import_hash);
+            assert!(
+                !import_ready,
+                "the affine import must be BLOCKED on its non-affine upstream \
+                 (in dependents_of[upstream], not a ready bucket item)"
+            );
+            let build_ready = primary
+                .pool()
+                .iter()
+                .any(|t| compute_task_hash(t) == build_hash);
+            assert!(
+                build_ready,
+                "the affine-dep work must be a READY bucket item (its affine \
+                 import dep is excluded from its global blocking set)"
+            );
+
+            // STAGE the strand: the placement trigger recorded W placed (the
+            // race-window state) — W dispatches ONLY through the per-secondary
+            // affine queue (withheld from the global view by has_affine_dep). It
+            // is NOT in any affine queue (the import never became ready to drag
+            // it in), so it is exactly placed-but-unqueued.
+            assert!(
+                primary.affine_record_placed_work_for_test(&build_hash),
+                "staging records the work placed for the first time"
+            );
+            assert_eq!(
+                primary.affine_scheduler_placed_but_unqueued_for_test(),
+                1,
+                "W must be placed-but-unqueued (the strand signature) before the \
+                 upstream fails"
+            );
+
+            // PRE-FIX (satisfiability): with all cells NotDone, the import looks
+            // SATISFIABLE on the roster — this is the gap the predicate
+            // generalization closes once the import is in `failed_tasks`.
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::NotDone,
+                    "the pool-cascade import flips NO bitvector cell on {sec}"
+                );
+            }
+
+            // ── THE TRIGGER: the non-affine upstream fails non-recoverably. ──
+            // Drive it through the real permanent-fail seam (the same path a
+            // worker `TaskFailed` / setup-failure routes through), holding the
+            // command_rx so the bridge's fast-fail runs DIRECTLY.
+            let mut command_rx = primary.command_rx.take();
+            primary
+                .apply_fail_permanent(
+                    upstream_hash.clone(),
+                    dynrunner_core::ErrorType::NonRecoverable,
+                    "build_common_dep failed non-recoverably".into(),
+                    &mut command_rx,
+                )
+                .await
+                .expect("the upstream hash is known");
+            primary.command_rx = command_rx;
+            settle_pump().await;
+
+            // The cascade reached the import: it is recorded in the pool's
+            // `failed_tasks` terminal ledger (the global-failure signal the
+            // generalized satisfiability predicate reads), WITHOUT flipping any
+            // bitvector cell. (The cascaded import gets the local `failed_tasks`
+            // terminal, not its own CRDT `TaskFailed` — the existing #358
+            // cascade shape; the predicate keys on `failed_tasks`, so this is the
+            // exact edge the bridge needs.)
+            assert!(
+                primary.failed_tasks.contains_key(&import_hash),
+                "the cascade must pool-fail the affine import into failed_tasks \
+                 (non-affine edge on the dead upstream)"
+            );
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::NotDone,
+                    "the pool-cascade import must NOT flip a bitvector cell on \
+                     {sec} (it never ran anywhere)"
+                );
+            }
+
+            // GENERALIZED PREDICATE: the gate now reads W as `Unsatisfiable`
+            // even though every cell is `NotDone` — purely because its import is
+            // in `failed_tasks`. This is the missing edge: pre-fix the all-
+            // `NotDone` import read as satisfiable and the gate never reached
+            // `Unsatisfiable`. (W's def is still in the CRDT, so the gate's pure
+            // placement read is valid post-terminalization.)
+            if let Some(build_state) = primary.cluster_state_for_test().task_state(&build_hash) {
+                let build_info = primary.cluster_state_for_test().task_to_info(build_state);
+                assert_eq!(
+                    primary.affine_gate_label_for_test("sec-0", &build_info),
+                    "Unsatisfiable",
+                    "the generalized satisfiability predicate must read the \
+                     globally-failed import (in failed_tasks, cells all NotDone) \
+                     as Unsatisfiable"
+                );
+            }
+
+            // GREEN (the bridge): the affine-dep work W is terminalized — it is
+            // terminal, removed from its bucket, and no longer placed-but-unqueued
+            // (claimed out of the bucket by the fast-fail). RED at fc1b0ee9: W was
+            // non-terminal, still placed-but-unqueued (count 1), and the phase
+            // could not drain.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "the affine-dep work must be TERMINALIZED once its import is \
+                 pool-cascade-failed (RED at fc1b0ee9: stranded non-terminal \
+                 forever)"
+            );
+            assert_eq!(
+                primary
+                    .pool()
+                    .iter()
+                    .filter(|t| compute_task_hash(t) == build_hash)
+                    .count(),
+                0,
+                "the terminalized work must be removed from its bucket"
+            );
+
+            // The phase can now drain past the affine-dep work: the placed
+            // affine-dep work W (the #642 drain-blocker — a live non-terminal
+            // task hidden from the global view) is terminal and out of every
+            // bucket, so no affine-dep work remains to hold the drain open. (Any
+            // other residual queued item, e.g. the upstream U which this test
+            // fails while still queued rather than dispatching it in-flight
+            // first, is orthogonal to the affine-dep strand the bridge fixes.)
+            assert_eq!(
+                primary
+                    .pool()
+                    .iter()
+                    .filter(|t| primary.pool().has_affine_dep(t))
+                    .count(),
+                0,
+                "no affine-dep work remains queued — the #642 drain-blocker is \
+                 cleared (RED at fc1b0ee9: W stayed queued+non-terminal forever)"
+            );
+        })
+        .await;
+}
