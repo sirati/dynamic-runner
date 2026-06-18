@@ -73,6 +73,70 @@
 //! WOULD BE localized to [`SecondaryCellBits::merge_cell`] / [`Self::set_cell`]
 //! — adding a clamp of a `Failed` cell against an incoming non-`Done` (NO such
 //! clamp exists now; this is purely WHERE it would go), NOT a wire change.
+//!
+//! ## Cell-bearing terminal/recovery obligations (the ONE invariant set)
+//! This cell substrate is the natural — and KIND-BLIND — owner of the contract
+//! every site that terminalizes or RECOVERS a cell-bearing hash
+//! (`TaskKind::has_secondary_cell()`: a `SecondaryAffine` import OR a
+//! `SecondaryEagerPrep` filler) owes the rest of the framework. The
+//! kind-discrimination half of this contract was independently re-documented at
+//! three failed-tasks guards (`coordinator::recover_inflight_for_dead_secondary`'s
+//! cell arm, `task::mutation`'s CRDT-settle guard, `hydrate`'s settled-projection
+//! guard); the DRAIN half was the omission that stranded the #556 silent-peer
+//! path (a cell-bearing import recovered there left its dependents blocked). The
+//! obligations, as ONE set so no site can satisfy a subset and look correct:
+//!
+//! 1. **Per-secondary cell** — a cell-bearing terminal/recovery is PER-SECONDARY,
+//!    never a global task terminal. The cell on THIS `(secondary, cell_id)` is
+//!    the unit of state; the hash is NOT globally done/failed because one
+//!    secondary's leg ended. A recovery that drops an in-flight import on a
+//!    secondary that STAYS rostered must consider its `Queued` cell still live
+//!    (it is not evicted with the peer); a recovery on a REMOVED secondary may
+//!    leave the cell — the peer (and its cells) are gone.
+//! 2. **`in_flight` ledger + type-slot** — drop the dropped leg's `in_flight`
+//!    entry and release its per-dispatch type slot together (consistent ledger ↔
+//!    budget), exactly as the reassignable-work requeue does. A cell-bearing
+//!    import is NEVER `pool.requeue`d (it is not a pool item — it re-derives
+//!    on-demand off its cell), so no `TaskRequeued` is emitted for it.
+//! 3. **`placed_work`** — a cell-bearing import has no `placed_work` dedup entry
+//!    of its own (it is not placed work); its DEPENDENTS do (obligation 4).
+//! 4. **`blocked_per_secondary` / dependents + the holderless cell (DRAIN)** —
+//!    when a cell-bearing import's leg is dropped, the dependents BLOCKED on that
+//!    secondary's cell MUST be re-decided NOW (re-routed to a still-eligible
+//!    secondary, or terminalized only if genuinely unsatisfiable), not stranded
+//!    until the 5-min reconcile. CRITICAL: the correct MECHANISM depends on
+//!    whether the secondary is leaving the candidate set:
+//!    * Secondary being EVICTED (dead-secondary path): `reroute_affine_blocked_on
+//!      (secondary, None|Some, ..)`. Eviction removes the secondary from
+//!      `affine_placement_secondaries` (derived from `self.workers`), so re-
+//!      derivation lands the dependents on a LIVE secondary — the dead cell is
+//!      never a candidate again. `recover_inflight_for_dead_secondary` does NOT
+//!      itself discharge this; its dead-secondary CALLER runs the reroute after.
+//!    * Secondary STAYS ROSTERED (#556 silent-peer path): a reroute is WRONG —
+//!      the secondary is still in `affine_placement_secondaries`, so its stale
+//!      `Queued`-with-no-holder cell remains a placement candidate and the next
+//!      placement pass re-derives the dependents straight BACK onto that phantom
+//!      cell (drain-then-re-block). The leg is a per-secondary BOUNCE (the holder
+//!      went silent → "never ran here"): drive `recover_bounced_affine_import`,
+//!      which RESETS the cell `Queued → NotDone` (the source-level cure) and re-
+//!      derives the dependents `StrandedHere`, so the import re-dispatches on-
+//!      demand on a live secondary. The dispatch-side FSM-suspect gate keeps the
+//!      re-dispatch off the still-silent holder until it re-proves itself.
+//!    * EAGER-PREP is dep-less — nothing declares a dep on its cell — so its
+//!      drain is a provable no-op, not an exemption.
+//! 5. **Global terminal — the prohibition** — NEVER emit a global
+//!    `ClusterMutation::TaskFailed` for a cell-bearing hash, and NEVER insert a
+//!    cell-bearing hash into `failed_tasks`. The affine readiness gate reads
+//!    `failed_tasks` to doom a dependent subtree `Unsatisfiable`; a cell-bearing
+//!    hash there is a spurious doom that lies dormant until a failover hydrate
+//!    loads the CRDT `Failed`. This is the kind-discrimination half guarded at
+//!    the three failed-tasks sites named above.
+//!
+//! A site that satisfies 1–3 and 5 but omits 4 — OR satisfies 4 with the WRONG
+//! mechanism (a reroute on a still-rostered secondary, leaving its phantom
+//! `Queued` cell to re-attract the dependents) — looks locally correct (no
+//! spurious doom, ledger consistent) yet still strands the dependents: the exact
+//! #556 silent-peer bug. Treat the set as indivisible.
 
 use std::collections::HashMap;
 

@@ -482,8 +482,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     phases_with_terminal.insert(entry.phase_id.clone());
                     soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
                     // #668 defense-in-depth (generalized, settled twin of the fat
-                    // `Failed` arm): a CELL-BEARING per-secondary task's terminal
-                    // is PER-SECONDARY, never the global `failed_tasks` doom-gate.
+                    // `Failed` arm): obligation 5 of the "cell-bearing
+                    // terminal/recovery obligations" set in
+                    // `cluster_state::secondary_cell_state`. A CELL-BEARING
+                    // per-secondary task's terminal is PER-SECONDARY, never the
+                    // global `failed_tasks` doom-gate.
                     // Neither a `SecondaryAffine` import NOR a `SecondaryEagerPrep`
                     // filler may enter it. This site keys on the carried
                     // `entry.category` (a `TaskCountCategory`, not a kind — the

@@ -1106,6 +1106,10 @@ where
         // spawn batch.
         let spawned_affine_prereq_ids: Vec<String> = valid_tasks
             .iter()
+            // affine-only intentional (D-3): eager-prep is dep-less — nothing
+            // declares a dep on its cell — so it can never be an affine-prereq id
+            // a dependent work task withholds on; `has_secondary_cell()` would be
+            // a wrong generalization on this affine-prereq-id enumeration.
             .filter(|t| t.kind.is_secondary_affine())
             .map(|t| t.task_id.clone())
             .collect();
