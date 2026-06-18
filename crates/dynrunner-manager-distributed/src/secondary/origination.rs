@@ -216,10 +216,13 @@ where
     ///      `ClusterMutation::PeerRemoved { id: <self>, cause:
     ///      SelfDeparture(reason) }` — applied locally and fanned out
     ///      to every peer via [`Self::apply_and_broadcast_mutations`].
-    ///      Peers LOG the departure and mark this node Dead. This is
-    ///      observability only: it does NOT cancel cluster work or
-    ///      terminate the run on peers, and the mesh stays free to
-    ///      continue / re-elect.
+    ///      Peers LOG the departure and project this node OUT of
+    ///      membership/roles via the convergent `Departed` tombstone —
+    ///      WITHOUT a node-local Dead flip (`apply_peer_removed` leaves a
+    ///      `SelfDeparture` peer `Alive` so its final mutations still
+    ///      converge). This is observability only: it does NOT cancel
+    ///      cluster work or terminate the run on peers, and the mesh stays
+    ///      free to continue / re-elect.
     ///   2. Take down every worker pgid this secondary owns via
     ///      [`dynrunner_manager_local::pool::WorkerPool::kill_all_workers_with_grace`].
     ///   3. Surface the matched path + reason to the caller, which records
@@ -289,9 +292,12 @@ where
                  tearing down workers"
             );
             // Self-authored departure announcement: peers LOG it and
-            // mark this node Dead (observability only). It does NOT
-            // cancel cluster work or terminate the run on peers — the
-            // mesh stays free to continue / re-elect. The shared helper
+            // project this node out of membership/roles via the convergent
+            // `Departed` tombstone — NOT a node-local Dead flip (a
+            // `SelfDeparture` leaves the peer `Alive` in `apply_peer_removed`
+            // so its final mutations still converge); observability only. It
+            // does NOT cancel cluster work or terminate the run on peers —
+            // the mesh stays free to continue / re-elect. The shared helper
             // truncates the reason at the 1 KiB `SelfDeparture` cap, then
             // proceeds with the local worker teardown below even on a
             // broadcast failure.

@@ -455,6 +455,223 @@ async fn gracefully_departed_member_is_not_silence_removed() {
     );
 }
 
+/// A member that DEPARTED GRACEFULLY (its self-authored
+/// `PeerRemoved { SelfDeparture }` arriving over the wire) must be REAPED
+/// from the primary-local roster caches the instant the departure applies,
+/// so it drops out of the dial-driving `peer_roster()` (the SOLE `PeerInfo`
+/// candidate set) and the transport's `forget_departed` path ends its
+/// redial loop.
+///
+/// REPRO (#655 face): the leaving node broadcasts its own
+/// `PeerRemoved { SelfDeparture }`, which `apply_peer_removed` converges
+/// into the membership ledger (Departed tombstone, peer kept Alive) — but
+/// the primary's wire-receive `handle_cluster_mutation` had NO arm to drop
+/// the id from `self.secondaries` / `secondary_keepalives`, and the
+/// keepalive sweep deliberately skips a departed member, so the local-cache
+/// reaper (`requeue_dead_secondary`) never fired for it. `peer_roster()`
+/// therefore kept re-listing the departed peer in every `PeerInfo`, and the
+/// transport redialled the dead address forever.
+///
+/// SAFETY: the reap must NOT requeue the departed member's work. A graceful
+/// departure only fires once the leaving node has drained its in-flight work
+/// (both drain gates in `secondary::processing::process_tasks` require
+/// `no_active_tasks`), so reaping without requeue strands nothing — this
+/// test pins that no spurious death/requeue is charged.
+#[tokio::test(flavor = "current_thread")]
+async fn observed_self_departure_reaps_local_roster_caches_without_requeue() {
+    let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    // Register the member at the connection level (Operational), advertise
+    // its membership + capacity in the replicated ledger, and stage one
+    // in-flight task attributed to it — the steady-state shape before it
+    // departs.
+    let conn = SecondaryConnection::new("departed-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "departed-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("departed-sec");
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "departed-sec".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "departed-sec".into(),
+            worker_count: 1,
+            resources: vec![],
+        });
+    }
+    // A graceful drain departs only once its work has drained, so there is
+    // no in-flight task to strand at reap time — model that quiescent state
+    // (no `stage_in_flight_for_test`).
+
+    // Pre-condition: the member is in the dial-driving roster.
+    assert!(
+        primary
+            .peer_roster_for_test()
+            .iter()
+            .any(|p| p.secondary_id == "departed-sec"),
+        "the operational member must be in the dial roster before it departs",
+    );
+
+    // The leaving node's OWN self-authored departure arrives over the wire.
+    let departure = DistributedMessage::ClusterMutation {
+        target: None,
+        sender_id: "departed-sec".into(),
+        timestamp: 0.0,
+        mutations: vec![ClusterMutation::PeerRemoved {
+            id: "departed-sec".into(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(
+                "graceful abort: local work drained".to_string(),
+            )),
+            member_gen: 0,
+        }],
+    };
+    primary.handle_cluster_mutation(departure, &mut None).await;
+
+    // The departed member is reaped from EVERY local roster cache, so it is
+    // gone from the dial-driving roster — the next `PeerInfo` drops it and
+    // the transport's `forget_departed` path engages.
+    assert!(
+        !primary.secondaries.contains_key("departed-sec"),
+        "the departed member must be reaped from self.secondaries",
+    );
+    assert!(
+        primary
+            .peer_roster_for_test()
+            .iter()
+            .all(|p| p.secondary_id != "departed-sec"),
+        "a gracefully-departed member must be excluded from peer_roster()",
+    );
+    // The membership ledger still holds the convergent tombstone (the reap
+    // is local-cache only; it does not re-author or undo the departure).
+    assert!(
+        primary
+            .cluster_state_for_test()
+            .is_member_departed("departed-sec"),
+        "the reap must leave the convergent Departed tombstone intact",
+    );
+
+    // SAFETY: the reap charged NO spurious death and requeued NO work.
+    assert_eq!(
+        primary.pool().len(),
+        0,
+        "the clean-departure reap must NOT requeue any work",
+    );
+    assert_eq!(
+        primary.failed_count(),
+        0,
+        "no spurious keepalive-miss death is charged against a departed member",
+    );
+}
+
+/// A RE-ADMITTED peer (same id, HIGHER membership generation) must be
+/// re-included in the dial roster: the higher-gen `PeerJoined` supersedes
+/// the Departed tombstone, so the departure-reap (which re-checks
+/// `is_member_departed` at reap time) must NOT evict it.
+#[tokio::test(flavor = "current_thread")]
+async fn re_admitted_peer_at_higher_gen_is_not_reaped() {
+    let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    let conn = SecondaryConnection::new("departed-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "departed-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("departed-sec");
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "departed-sec".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "departed-sec".into(),
+            worker_count: 1,
+            resources: vec![],
+        });
+        // The peer was already re-admitted at a HIGHER generation (its
+        // respawn re-seated) BEFORE the stale gen-0 departure reaches us.
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "departed-sec".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 1,
+        });
+    }
+
+    // The stale gen-0 self-departure arrives AFTER the gen-1 re-admission.
+    // `apply_peer_removed`'s superseded-incarnation guard NoOps it, and the
+    // reap re-checks `is_member_departed` (false here), so the live
+    // re-admitted peer is preserved.
+    let stale_departure = DistributedMessage::ClusterMutation {
+        target: None,
+        sender_id: "departed-sec".into(),
+        timestamp: 0.0,
+        mutations: vec![ClusterMutation::PeerRemoved {
+            id: "departed-sec".into(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(
+                "graceful abort: local work drained".to_string(),
+            )),
+            member_gen: 0,
+        }],
+    };
+    primary
+        .handle_cluster_mutation(stale_departure, &mut None)
+        .await;
+
+    assert!(
+        !primary
+            .cluster_state_for_test()
+            .is_member_departed("departed-sec"),
+        "the gen-1 re-admission supersedes the stale gen-0 departure tombstone",
+    );
+    assert!(
+        primary.secondaries.contains_key("departed-sec"),
+        "a re-admitted peer (higher gen) must NOT be reaped by a stale departure",
+    );
+    assert!(
+        primary
+            .peer_roster_for_test()
+            .iter()
+            .any(|p| p.secondary_id == "departed-sec"),
+        "a re-admitted peer must stay in the dial roster",
+    );
+}
+
 /// Multi-secondary transport variant that pre-registers two
 /// secondaries on the outgoing map. Used by the mass-death tests
 /// because the singleton `empty_transport` only knows about
