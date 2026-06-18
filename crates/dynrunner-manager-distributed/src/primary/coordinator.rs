@@ -4480,6 +4480,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.affine_scheduler.placed_but_unqueued_count()
     }
 
+    /// Test-only seam: record `work_hash` in the affine scheduler's
+    /// `placed_work` guard, reproducing the state the placement trigger leaves
+    /// behind. Used by the dead-upstream terminalization test to stage an
+    /// affine-dep work task that was placed (the global view never grabs it,
+    /// `has_affine_dep`) while its affine import is then pool-cascade-failed by a
+    /// dead non-affine upstream — the strand the #648 bridge terminalizes.
+    #[cfg(test)]
+    pub fn affine_record_placed_work_for_test(&mut self, work_hash: &str) -> bool {
+        self.affine_scheduler.record_placed_work(work_hash)
+    }
+
     /// Test-only inspector: does the `(secondary_id, worker_id)` slot
     /// currently hold a task whose hash equals `task_hash`? Lets the
     /// reorder/reassignment tests assert the slot's held-task identity

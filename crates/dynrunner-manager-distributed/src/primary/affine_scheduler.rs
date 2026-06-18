@@ -174,14 +174,30 @@ impl AffineScheduler {
     /// unassignable-park line), never a control input. Owned here because both
     /// `placed_work` and `queues` are this module's private state.
     pub(crate) fn placed_but_unqueued_count(&self) -> usize {
-        self.placed_work
-            .iter()
-            .filter(|hash| {
-                !self.queues.values().flatten().any(|unit| {
-                    matches!(unit, QueuedUnit::Work { hash: h } if h == *hash)
-                })
-            })
-            .count()
+        self.placed_unqueued_iter().count()
+    }
+
+    /// DIAGNOSTIC: up to `limit` of the work hashes counted by
+    /// [`Self::placed_but_unqueued_count`] — the per-hash list the
+    /// unassignable-park strand line emits so a future strand names its stranded
+    /// work in ONE greppable line (not just a count). Bounded so a large strand
+    /// set never floods the log; the count line carries the full magnitude. Same
+    /// upper-bound caveat as the count (a momentarily popped unit may appear).
+    pub(crate) fn placed_but_unqueued_hashes(&self, limit: usize) -> Vec<String> {
+        self.placed_unqueued_iter().take(limit).cloned().collect()
+    }
+
+    /// The shared filter behind both diagnostics: each `placed_work` hash that
+    /// sits in NO secondary's queue as a `Work` unit. One owner so the count and
+    /// the per-hash list can never disagree about what "stranded" means.
+    fn placed_unqueued_iter(&self) -> impl Iterator<Item = &String> {
+        self.placed_work.iter().filter(|hash| {
+            !self
+                .queues
+                .values()
+                .flatten()
+                .any(|unit| matches!(unit, QueuedUnit::Work { hash: h } if h == *hash))
+        })
     }
 
     /// The whole current queue for a secondary (empty slice for an unseen one)
