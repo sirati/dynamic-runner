@@ -1852,6 +1852,190 @@ async fn affine_dep_work_dead_secondary_recovery_clears_placement_guard() {
         .await;
 }
 
+/// AFFINE-DEP-WORK OPERATOR/MATCHER REINJECT RECOVERY (#673): the FOURTH requeue
+/// site — `apply_reinject_task`, the single chokepoint for BOTH the operator's
+/// explicit `ReinjectTask` revive AND the fulfillability matcher's
+/// resource-appeared auto-reinject. When an `Unfulfillable` affine-dep WORK task
+/// whose `placed_work` guard was re-SET by a placement pass is reinjected, the
+/// reinject MUST clear the guard — exactly as the backpressure / dead-secondary
+/// / illegal-assignment siblings already do via `requeue_affine_aware` — or the
+/// revived work is hidden from the global view by `has_affine_dep` AND blocked
+/// from re-placement by the lingering guard: permanently unassignable, the
+/// operator revive a silent no-op.
+///
+/// THE STRAND PRECONDITION (re-created here, not staged): the build dispatches
+/// (guard SET); it then goes `Unfulfillable` (the terminal clears the guard);
+/// a placement pass re-iterates it — `affine_work_placeability` reads ONLY the
+/// affine deps' cells (import `Done`), never the work's own CRDT state, so the
+/// out-of-pool `Unfulfillable` work is `Placeable` again → `record_placed_work`
+/// re-SETs the guard → the popped unit's `take_first_match` finds it gone from
+/// the pool → `SkippedNoRecovery`, leaving `placed_work` SET with NO queue unit.
+/// That is the trap a bare `pool.reinject` (pre-#673) never undoes.
+///
+/// RED at ee5c9db6: `apply_reinject_task` did a raw `pool.reinject` and never
+/// `unrecord_placed_work`'d, so the guard stayed SET → the next placement's
+/// `record_placed_work` returned `false` → the work was skipped → never
+/// re-placed → the operator revive silently no-op'd. GREEN: the reinject clears
+/// the guard for an affine-dep work (the `has_affine_dep` seam), so the next
+/// placement pass re-derives + re-queues its per-secondary unit.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_operator_reinject_clears_guard_and_replaces() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            // Drive the import Done + let the dependent build commit. The guard is
+            // now SET (it was placed). We don't need the holder coordinates — the
+            // failure is operator-class (a FailPermanent by hash), not a wire
+            // bounce.
+            let _ = drive_until_work_dispatches(
+                &mut primary,
+                &mut ends,
+                &mut wm_rx,
+                &import_hash,
+                &build_hash,
+            )
+            .await;
+            assert!(
+                primary.affine_work_is_placed_for_test(&build_hash),
+                "the build's placement guard must be SET before it goes Unfulfillable"
+            );
+
+            // ── THE WORK GOES UNFULFILLABLE (the operator-resolvable failure
+            // class). This both terminalises the in-flight build and — via the
+            // #663 terminal clear — UNRECORDS the placement guard. ──
+            let (tx_fail, rx_fail) = tokio::sync::oneshot::channel();
+            crate::primary::command_channel::handle_primary_command(
+                &mut primary,
+                crate::primary::command_channel::PrimaryCommand::FailPermanent {
+                    hash: build_hash.clone(),
+                    error: dynrunner_core::ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                    reason: "operator-resolvable".into(),
+                    reply: tx_fail,
+                },
+                &mut None,
+            )
+            .await;
+            assert!(rx_fail.await.unwrap().is_ok());
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&build_hash),
+                    Some(crate::cluster_state::TaskState::Unfulfillable { .. })
+                ),
+                "the build must be CRDT-Unfulfillable so apply_reinject_task accepts it"
+            );
+
+            // ── RE-SET THE GUARD via a placement pass (the bug's enabler, NOT a
+            // hand-staged state): the placement re-iterates the out-of-pool
+            // Unfulfillable build (import cell still Done ⇒ Placeable, the work's
+            // own state is NOT consulted), re-records the guard, and the popped
+            // unit SkippedNoRecovery's (the build is gone from the pool). The
+            // guard ends SET with no queue unit — the strand precondition. ──
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            assert!(
+                primary.affine_work_is_placed_for_test(&build_hash),
+                "a placement pass must RE-SET the guard for the out-of-pool \
+                 Unfulfillable affine-dep work (the placement re-records, the \
+                 SkippedNoRecovery pop leaves it set) — the #673 strand precondition"
+            );
+            // The strand signature: placed, in no queue, not in flight, but the
+            // diagnostic excludes it because it is a terminal (failed) hash — so
+            // assert the queue directly: no secondary holds a build unit.
+            for s in ["sec-0", "sec-1"] {
+                assert!(
+                    !primary.affine_queue_hashes_for_test(s).contains(&build_hash),
+                    "no secondary queue should hold the Unfulfillable build's unit \
+                     (the SkippedNoRecovery pop discarded it) on {s}"
+                );
+            }
+
+            // ── THE OPERATOR REINJECT (apply_reinject_task — the unit under
+            // test). ──
+            let (tx_re, rx_re) = tokio::sync::oneshot::channel();
+            crate::primary::command_channel::handle_primary_command(
+                &mut primary,
+                crate::primary::command_channel::PrimaryCommand::ReinjectTask {
+                    hash: build_hash.clone(),
+                    reply: tx_re,
+                },
+                &mut None,
+            )
+            .await;
+            assert!(
+                rx_re.await.unwrap().is_ok(),
+                "the operator reinject must succeed (CRDT was Unfulfillable)"
+            );
+
+            // GREEN (#673): the reinject CLEARED the placement guard for the
+            // affine-dep work. RED at ee5c9db6: the raw pool.reinject left it SET.
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "apply_reinject_task must UNRECORD the affine-dep work's placement \
+                 guard (the has_affine_dep seam) so the next placement re-derives \
+                 it — RED at ee5c9db6: the raw pool.reinject left it SET → the \
+                 revive silently no-op'd → permanently unassignable"
+            );
+            // The build flipped Unfulfillable → Pending (the reinject's CRDT
+            // effect) — it is genuinely revivable now.
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&build_hash),
+                    Some(crate::cluster_state::TaskState::Pending { .. })
+                ),
+                "the reinject must flip the build CRDT state Unfulfillable → Pending"
+            );
+
+            // ── THE PAYOFF: the next placement pass RE-DERIVES the build's
+            // per-secondary unit (the revive actually works). The freshly-derived
+            // unit lands in ONE of three affine-channel shapes, all of which prove
+            // the placement pass ran `place` for the build (impossible in the RED
+            // case, where `record_placed_work` returns false → no `place` → no
+            // unit in ANY shape):
+            //   * QUEUED on some secondary (unit sitting in its affine queue), or
+            //   * BLOCKED-on-import on some secondary (placed + popped, then parked
+            //     on a not-yet-`Done` import cell — the lazy-import re-route a
+            //     secondary that never imported takes), or
+            //   * DISPATCHED to a worker on a wire (cell already Done somewhere).
+            // RED at ee5c9db6: the guard stayed set → record_placed_work returned
+            // false → the build was SKIPPED → none of the three ever happen →
+            // permanently unassignable.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let queued_or_blocked = ["sec-0", "sec-1"].iter().any(|s| {
+                primary.affine_queue_hashes_for_test(s).contains(&build_hash)
+                    || primary.affine_is_blocked_on_import_for_test(s, &build_hash)
+            });
+            let dispatched = {
+                let mut d = false;
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    for (_, _s, _w, h) in assignments(rx) {
+                        if h == build_hash {
+                            d = true;
+                        }
+                    }
+                }
+                d
+            };
+            assert!(
+                queued_or_blocked || dispatched,
+                "after the affine-aware reinject the build must be RE-DERIVED onto \
+                 a per-secondary affine channel (queued / blocked-on-import / \
+                 dispatched) — the revive works. RED at ee5c9db6: skipped by the \
+                 lingering guard, never re-placed → permanently unassignable"
+            );
+        })
+        .await;
+}
+
 /// AFFINE-DEP-WORK ILLEGAL-ASSIGNMENT-BOUNCE RECOVERY (#659): the THIRD
 /// requeue-of-recovered-work site — the illegal-assignment bounce handler. When
 /// a secondary bounces a committed affine-dep WORK task with an
