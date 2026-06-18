@@ -34,6 +34,7 @@ const ARM_PULL: usize = 13;
 const ARM_PERSISTENT_DIAL_FAILURE: usize = 14;
 const ARM_DISCOVERY: usize = 15;
 const ARM_PHASE_RESURFACE: usize = 16;
+const ARM_RECONCILE: usize = 17;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -55,6 +56,7 @@ pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
     "persistent_dial_failure",
     "discovery",
     "phase_resurface",
+    "reconcile",
 ];
 
 /// Follow-on batch-drain cap for the inbox arm (#491, mirrored from the
@@ -70,6 +72,16 @@ pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
 /// so a mirrored local const keeps each role's tuning self-contained rather
 /// than coupling them through a shared symbol.
 const INBOX_BATCH_DRAIN_CAP: usize = 256;
+
+/// FIXED cadence of the 5-min reconcile arm (#652 concern C) — the ONE
+/// level-net that replaces the deleted per-task DispatchBackoff. NOT a per-task
+/// timer (the forbidden antipattern): a single fleet-wide periodic sweep that
+/// recovers any blocked dependent whose unblock event was lost (the dropped-task
+/// net). Long + fixed because the KNOWN events (import-fail, dead-secondary,
+/// completion) drain their blocks directly + immediately; this only catches the
+/// truly-orphaned, so a coarse 5-min cadence is ample and near-free at steady
+/// state (one `Instant` compare per loop iteration).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
 /// `[TaskRequest=N, Keepalive=M, ...]`, only non-zero types, sorted by
@@ -519,6 +531,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // elapses on a live cluster — the 1e914505 lesson the fleet-dead /
         // reconciliation ticks above also follow).
         let mut mesh_formation_deadline: Option<Instant> = None;
+
+        // 5-min reconcile arm deadline (#652 concern C) — the ONE level-net for
+        // orphaned blocked work. PERSISTENT absolute `Instant` re-armed after
+        // each fire (the watchdog law: a `select!`-arm sleep rebuilt every
+        // iteration never elapses on a busy loop). Armed to the first fire one
+        // full `RECONCILE_INTERVAL` from loop entry; never disarms (the sweep is
+        // a cheap fleet-wide periodic, always wanted while the run is live).
+        let mut reconcile_deadline: Instant = Instant::now() + RECONCILE_INTERVAL;
 
         // Entry sweep — dispatch is a pure function of state, asserted
         // ONCE the moment the loop is entered. The pre-loop chain may have
@@ -1549,6 +1569,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     arm_stats.record(ARM_PHASE_RESURFACE);
                     self.pool_mut().resurface_drained_pending();
                     self.process_phase_lifecycle(&mut command_rx).await;
+                }
+                // 5-min reconcile arm (#652 concern C) — the ONE level-net that
+                // replaces the deleted per-task DispatchBackoff. Fires on a
+                // FIXED cadence off a PERSISTENT absolute `Instant` (the watchdog
+                // law — survives a sibling arm winning every iteration), re-arming
+                // after each fire. Recovers any blocked dependent (normal or
+                // affine) whose unblock EVENT was lost — its dep's holder died or
+                // a completion/`Finished` was dropped — by moving it to the
+                // general-queue head (normal: D.1 pop-time re-check re-routes it)
+                // or clearing its placement guard (affine: fresh placement
+                // re-routes it). The KNOWN events (import-fail, dead-secondary,
+                // completion) drain their blocks directly + immediately; this is
+                // the orphan-only backstop, NOT the primary handler.
+                _ = tokio::time::sleep_until(reconcile_deadline.into()) => {
+                    arm_stats.record(ARM_RECONCILE);
+                    self.reconcile_orphaned_blocked_work().await;
+                    // Re-arm for the next fixed-cadence fire (one full interval
+                    // from now, so a busy loop that fired this late still spaces
+                    // the next sweep a full interval out).
+                    reconcile_deadline = Instant::now() + RECONCILE_INTERVAL;
                 }
             }
         }

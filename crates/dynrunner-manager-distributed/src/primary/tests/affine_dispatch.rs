@@ -3268,3 +3268,75 @@ async fn affine_dep_work_import_failed_reroutes_blocked_build() {
         })
         .await;
 }
+
+/// #652 concern C: the 5-min reconcile arm is the ORPHAN net for affine-blocked
+/// work. A build BLOCKED on a per-secondary import whose unblock event was LOST
+/// (its cell is neither Done nor Queued — e.g. the import's holder died without a
+/// terminal) is drained from the blocked map by `reconcile_orphaned_blocked_work`
+/// and its placement-dedup guard cleared, so the next placement pass re-routes
+/// it (instead of stranding forever). A still-healthy block (cell Queued —
+/// import in flight) is left untouched by the same sweep.
+#[tokio::test(flavor = "current_thread")]
+async fn reconcile_reroutes_orphaned_affine_blocked_work() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            // Find the secondary the build is blocked on (where its import ran).
+            let mut wave: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                wave.extend(assignments(rx));
+            }
+            let blocked_sec = wave
+                .iter()
+                .find(|(_, _, _, h)| *h == import_hash)
+                .map(|(_, sec, _, _)| sec.clone())
+                .expect("import dispatched for the blocked build");
+            assert!(primary.affine_is_blocked_on_import_for_test(&blocked_sec, &build_hash));
+            assert!(primary.affine_work_is_placed_for_test(&build_hash));
+
+            // HEALTHY case: the import cell is Queued (in flight) on a reachable
+            // secondary → reconcile keeps the block untouched.
+            primary.reconcile_orphaned_blocked_work().await;
+            assert!(
+                primary.affine_is_blocked_on_import_for_test(&blocked_sec, &build_hash),
+                "a healthy block (cell Queued, reachable) survives reconcile"
+            );
+
+            // LOST-EVENT: reset the import cell Queued → NotDone (the import's
+            // holder died without a terminal — no Finished/bounce will arrive).
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .unwrap();
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::SecondaryCellUnqueued {
+                    secondary: blocked_sec.clone(),
+                    cell_id: affine_id.0,
+                    generation: 1,
+                });
+
+            // Reconcile now sees an orphan (cell NotDone, no terminal coming):
+            // drains the block + clears the placement guard so it re-routes.
+            primary.reconcile_orphaned_blocked_work().await;
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&blocked_sec, &build_hash),
+                "the orphaned block must be drained by reconcile"
+            );
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "reconcile clears the orphan's placement guard so it re-routes"
+            );
+        })
+        .await;
+}

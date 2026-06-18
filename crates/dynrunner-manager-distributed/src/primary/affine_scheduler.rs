@@ -243,6 +243,51 @@ impl AffineScheduler {
         drained
     }
 
+    /// 5-min reconcile sweep for the per-secondary blocked map (#652 concern C):
+    /// the ORPHAN net for affine-blocked work, the complement of the pool's
+    /// `reconcile_blocked`. For each `(secondary, work_hash, pending imports)`,
+    /// the entry is ORPHANED — its unblock event will never come — when EITHER:
+    ///   * its `secondary` is no longer `reachable` (the dead-secondary drain
+    ///     should already have caught this; reconcile is the backstop for a
+    ///     miss), OR
+    ///   * a pending import is neither `Done` (an already-fired `Finished` was
+    ///     lost) nor in-flight (`Queued`) on that secondary — i.e. no terminal is
+    ///     coming to flip its cell (the lost-`Finished` / lost-bounce window).
+    ///
+    /// An orphaned entry is REMOVED and its `work_hash` RETURNED so the caller
+    /// routes the work to the general-queue head (clearing its placement-dedup so
+    /// a fresh affine placement re-derives it). A blocked entry whose secondary
+    /// is reachable AND every pending import is `Done`/`Queued` there is healthy
+    /// (its unblock is still coming) and is left untouched.
+    ///
+    /// `reachable(secondary)` is the live-roster predicate; `cell_of(secondary,
+    /// affine_id)` is the bitvector read (both supplied by the caller — this
+    /// module owns no replicated state).
+    pub(crate) fn reconcile_per_secondary_blocked<R, F>(
+        &mut self,
+        reachable: R,
+        cell_of: F,
+    ) -> Vec<String>
+    where
+        R: Fn(&str) -> bool,
+        F: Fn(&str, SecondaryCellId) -> SecondaryCell,
+    {
+        let mut orphaned = Vec::new();
+        self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
+            let unreachable = !reachable(sec);
+            let no_terminal_coming = pending.iter().any(|aid| {
+                !matches!(cell_of(sec, *aid), SecondaryCell::Done | SecondaryCell::Queued)
+            });
+            if unreachable || no_terminal_coming {
+                orphaned.push(work_hash.clone());
+                false // remove the orphan
+            } else {
+                true // healthy — unblock still coming
+            }
+        });
+        orphaned
+    }
+
     /// Whether `(secondary, work_hash)` is currently blocked-on-import — the
     /// read seam the concern-B tests assert against.
     #[cfg(test)]
@@ -1071,5 +1116,81 @@ mod tests {
         sched.clear();
         assert!(sched.queue("s1").is_empty());
         assert_eq!(sched.queue_len("s1"), 0);
+    }
+
+    #[test]
+    fn block_until_import_records_and_on_cell_finished_unblocks() {
+        // #652 B: block a work on its not-Done import cells; on_cell_finished
+        // returns + unblocks every work waiting on that import on that secondary.
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![aid(0), aid(1)]);
+        assert!(sched.is_blocked_on_import("s1", "w1"));
+        // A cell-finish for an import this work does NOT wait on (different sec)
+        // returns nothing.
+        assert!(sched.on_cell_finished("s2", aid(0)).is_empty());
+        assert!(sched.is_blocked_on_import("s1", "w1"));
+        // The first import finishing unblocks the work (re-pop drives the next).
+        let freed = sched.on_cell_finished("s1", aid(0));
+        assert_eq!(freed, vec!["w1".to_string()]);
+        assert!(!sched.is_blocked_on_import("s1", "w1"), "unblocked on cell-finish");
+    }
+
+    #[test]
+    fn block_until_import_empty_pending_is_noop() {
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![]);
+        assert!(!sched.is_blocked_on_import("s1", "w1"), "empty pending → no block");
+    }
+
+    #[test]
+    fn drain_blocked_on_filters_by_affine_id_or_whole_secondary() {
+        // #652 B import-FAIL + dead-secondary edges.
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![aid(0)]);
+        sched.block_until_import("s1", "w2", vec![aid(1)]);
+        sched.block_until_import("s2", "w3", vec![aid(0)]);
+        // Filtered to aid(0) on s1 → only w1.
+        let drained = sched.drain_blocked_on("s1", Some(aid(0)));
+        assert_eq!(drained, vec!["w1".to_string()]);
+        assert!(!sched.is_blocked_on_import("s1", "w1"));
+        assert!(sched.is_blocked_on_import("s1", "w2"), "w2 (aid 1) untouched");
+        // Whole-secondary drain (dead s1) → w2.
+        let drained = sched.drain_blocked_on("s1", None);
+        assert_eq!(drained, vec!["w2".to_string()]);
+        assert!(sched.is_blocked_on_import("s2", "w3"), "other secondary untouched");
+    }
+
+    #[test]
+    fn clear_drops_blocked_map() {
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![aid(0)]);
+        sched.clear();
+        assert!(!sched.is_blocked_on_import("s1", "w1"), "clear drops the blocked map");
+    }
+
+    #[test]
+    fn reconcile_per_secondary_blocked_returns_orphans_keeps_healthy() {
+        // #652 C: a blocked entry on an UNREACHABLE secondary is an orphan; a
+        // blocked entry whose import cell is Queued/Done on a reachable secondary
+        // is healthy (its unblock is still coming); a blocked entry whose cell is
+        // NotDone (no terminal coming) is an orphan.
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        // healthy: cell Queued on reachable s1.
+        cells.set("s1", aid(0), SecondaryCell::Queued);
+        sched.block_until_import("s1", "healthy", vec![aid(0)]);
+        // orphan-A: dead (unreachable) secondary s_dead.
+        sched.block_until_import("s_dead", "orphan_dead", vec![aid(0)]);
+        // orphan-B: reachable s1 but cell NotDone (no terminal coming).
+        sched.block_until_import("s1", "orphan_lost", vec![aid(1)]);
+
+        let reachable = |s: &str| s == "s1";
+        let mut orphans = sched.reconcile_per_secondary_blocked(reachable, cells.of());
+        orphans.sort();
+        assert_eq!(orphans, vec!["orphan_dead".to_string(), "orphan_lost".to_string()]);
+        // The healthy one is kept; the orphans are removed.
+        assert!(sched.is_blocked_on_import("s1", "healthy"));
+        assert!(!sched.is_blocked_on_import("s_dead", "orphan_dead"));
+        assert!(!sched.is_blocked_on_import("s1", "orphan_lost"));
     }
 }

@@ -800,6 +800,74 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
     }
 
+    /// 5-min reconcile sweep (#652 concern C) — the ONE level-net that replaces
+    /// the deleted per-task DispatchBackoff, uniform across normal + affine
+    /// blocked work. Fired by the operational loop's `ARM_RECONCILE` arm on a
+    /// FIXED 5-min cadence. Recovers a blocked dependent whose unblock event will
+    /// never come (its dep's holder died, or a completion/`Finished` was lost) by
+    /// moving it to the GENERAL-QUEUE HEAD, where the idempotent pop-time
+    /// re-check (D.1) / fresh affine placement re-routes it. The PRIMARY handlers
+    /// for KNOWN events (import-fail, dead-secondary) already drain their blocks
+    /// directly; this is the orphan-only backstop for the truly-stranded.
+    ///
+    /// Two owners, ONE orchestrator: the pool owns the normal-blocked validity
+    /// predicate ([`PendingPool::reconcile_blocked`]); the affine scheduler owns
+    /// the per-secondary-blocked one
+    /// ([`AffineScheduler::reconcile_per_secondary_blocked`]). This method only
+    /// supplies the live-roster + in-flight + bitvector reads and routes the
+    /// returned orphans — it re-implements no dep logic.
+    pub(crate) async fn reconcile_orphaned_blocked_work(&mut self) {
+        // The live roster (reachable secondaries) + the set of dep task_ids
+        // currently in-flight on a LIVE worker (dead workers are reaped out of
+        // `self.workers`, so a held hash is in-flight on a reachable secondary by
+        // construction). Built once for both sweeps.
+        let reachable: std::collections::HashSet<String> =
+            self.affine_placement_secondaries().into_iter().collect();
+        let in_flight_dep_ids: HashSet<String> = self
+            .workers
+            .iter()
+            .filter_map(|w| w.held_task_hash())
+            .filter_map(|hash| self.cluster_state.task_info_for_hash(hash))
+            .map(|t| t.task_id.clone())
+            .collect();
+
+        // NORMAL-blocked orphans → general-queue head (D.1 re-routes on pop).
+        let normal_orphans = self
+            .pool_mut()
+            .reconcile_blocked(|dep_id| in_flight_dep_ids.contains(dep_id));
+        let normal_count = normal_orphans.len();
+        for item in normal_orphans {
+            self.pool_mut().push_to_queue_head(item);
+        }
+
+        // AFFINE-blocked orphans → clear the placement guard so the next
+        // placement pass re-derives each onto a live-route secondary (the
+        // requeue_affine_aware unrecord seam). The work stays a pool item, so
+        // no general-queue push is needed — affine-dep work dispatches only
+        // through the per-secondary path, never the general worker view.
+        let affine_orphans = self.affine_scheduler.reconcile_per_secondary_blocked(
+            |sec: &str| reachable.contains(sec),
+            |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
+        );
+        let affine_count = affine_orphans.len();
+        for work_hash in &affine_orphans {
+            self.affine_scheduler.unrecord_placed_work(work_hash);
+        }
+
+        if normal_count > 0 || affine_count > 0 {
+            tracing::info!(
+                normal_orphans = normal_count,
+                affine_orphans = affine_count,
+                "reconcile: re-routed orphaned blocked work (the 5-min level-net)"
+            );
+            // A pool-entry / placement edge: nudge the recheck so the re-routed
+            // work is re-evaluated (D.1 pop-time re-check for normal, fresh
+            // affine placement for affine).
+            self.cluster_state
+                .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+        }
+    }
+
     /// The affine import cells of `placement` that are NOT yet `Done` on
     /// `secondary` (#652 concern B) — exactly the imports a work blocked on this
     /// secondary is WAITING for. `block_until_import` records this set; each cell
