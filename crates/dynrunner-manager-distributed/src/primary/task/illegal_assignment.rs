@@ -170,14 +170,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 WorkerMgmtSignal::TasksAdded,
             )
             .await;
-        } else if let Some(entry) =
-            self.free_slot_on_terminal(&secondary_id, worker_id, &assigned.hash)
-        {
-            // NON-IMPORT BOUNCE. `free_slot_on_terminal` resolves the holder slot
-            // from the LEDGER entry (by hash) — independent of the wire
-            // `worker_id` — frees that slot, drops the ledger entry, and releases
-            // the type slot, returning the binary. A hash not in the ledger yields
-            // `None` (already requeued / terminal): safe no-op.
+        } else if let Some(entry) = self.recover_work_on_illegal_bounce(&assigned.hash) {
+            // NON-IMPORT BOUNCE. `recover_work_on_illegal_bounce` resolves the
+            // holder from the LEDGER entry (by hash) — independent of the wire
+            // `worker_id` — releases the type slot, vacates the holding slot when
+            // it still resolves, drops the ledger entry, and returns the binary.
+            // It is the WORK twin of the affine import's slot-direct recovery: a
+            // bounce is a DIVERGENCE report (the task never ran here), so the
+            // binary must be recovered EVEN WHEN the committed slot is gone — the
+            // roster shrank between `commit_assignment` and the bounce, so the
+            // stable `local_worker_id` no longer resolves to a live slot. The
+            // terminal-handler twin (`free_slot_on_terminal`) returns `None` in
+            // that slot-gone case (correctly a no-op for a genuine terminal),
+            // which would here SKIP the requeue AND leave a phantom in-flight
+            // entry — the strand. A hash not in the ledger yields `None` (already
+            // requeued / terminal): safe no-op.
             //
             // Affine-aware (the SAME recovery seam the dead-secondary and
             // backpressure-failed requeue-of-recovered-work sites use): an
