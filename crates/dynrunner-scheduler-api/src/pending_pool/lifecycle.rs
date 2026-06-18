@@ -108,6 +108,32 @@ impl<I: Identifier> PendingPool<I> {
         self.maybe_transition_drain(phase_id);
     }
 
+    /// Record an AFFINE prereq's GENUINE GLOBAL terminal FAILURE — the
+    /// permanent-failure twin of [`Self::note_affine_terminal`], fired by the
+    /// manager's `handle_affine_task_failed` when the import can no longer run
+    /// on any roster secondary (the gate is all-eligible-`Failed`).
+    ///
+    /// Like the success twin, this is phase-NEUTRAL and runs NO dependent
+    /// cascade (the manager already terminal-fails the now-`Unsatisfiable`
+    /// dependents through `fast_fail_affine_dependents_if_unsatisfiable`; the
+    /// per-secondary bitvector — not this global terminal — is what dependent
+    /// dispatch reads). The ONLY two effects:
+    ///   1. record the affine `task_id` in `failed_tasks` so
+    ///      [`Self::phase_has_live_affine_prereq`] flips `false` for its phase
+    ///      (a genuinely-failed import is no longer LIVE — its terminal is
+    ///      reached); and
+    ///   2. re-run [`Self::maybe_transition_drain`] for its phase so the
+    ///      now-drained affine-only phase is pushed onto `drained_pending`.
+    ///
+    /// Without this, a genuinely-failed affine would hold its phase's Gate B
+    /// (`phase_has_live_affine_prereq` reads `!failed_tasks.contains`) forever —
+    /// the failed-terminal twin the complete path already had. Idempotent: a
+    /// `HashSet` insert + an idempotent transition.
+    pub fn note_affine_failed(&mut self, phase_id: &PhaseId, task_id: &str) {
+        self.failed_tasks.insert(task_id.to_string());
+        self.maybe_transition_drain(phase_id);
+    }
+
     /// Forget a task's re-dispatch backoff streak + any expired-but-
     /// undispatched re-poll state, WITHOUT the rest of the terminal
     /// bookkeeping (`on_item_finished`'s in-flight decrement / dependent
@@ -237,6 +263,21 @@ impl<I: Identifier> PendingPool<I> {
     /// collections while iterating. Each re-route may empty its phase's
     /// queue, so a drain transition is re-evaluated per affected phase.
     fn reblock_dependents_on_uncompleted(&mut self, id: &str) {
+        // OPT-2 — an affine token's GLOBAL terminal is STICKY: a
+        // `SecondaryAffine` import has no regenerable global output (its
+        // dependents' readiness is the per-secondary bitvector, NOT this
+        // global terminal), so re-running it must NOT un-complete it and must
+        // NOT re-block its dependents. Leave its `completed_tasks` entry intact
+        // and return — keeping the affine terminal recorded so the pool's
+        // affine guard (`phase_has_live_affine_prereq`) stays `false`. This is
+        // the SAME established pattern the auto-resume reinject funnel already
+        // applies (`primary/lifecycle/mutations.rs:77` skips `is_secondary_affine`
+        // on reinject); restoring it here closes the lost-mirror window at the
+        // un-complete source. Non-affine ids fall through to the unchanged
+        // dependent-reblocking path below.
+        if self.affine_prereq_ids.contains(id) {
+            return;
+        }
         // Only a previously-completed id has dependents to re-block.
         if !self.completed_tasks.remove(id) {
             return;
@@ -1295,5 +1336,15 @@ impl<I: Identifier> PendingPool<I> {
                     && !self.completed_tasks.contains(item.task_id.as_str())
                     && !self.failed_tasks.contains(item.task_id.as_str())
             })
+    }
+
+    /// Test-only observability seam for the otherwise-private affine drain
+    /// guard [`Self::phase_has_live_affine_prereq`] — the regression tests for
+    /// the affine-terminal mirror (OPT-1/OPT-2 + the failed-path twin) assert
+    /// directly on Gate B for one phase. Production code reads the guard
+    /// in-module; this widens NOTHING outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn phase_has_live_affine_prereq_for_test(&self, phase_id: &PhaseId) -> bool {
+        self.phase_has_live_affine_prereq(phase_id)
     }
 }

@@ -565,6 +565,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.fast_fail_affine_dependents_if_unsatisfiable(&task_hash, command_rx)
                 .await;
             self.drop_supplanted_holder(&task_hash);
+            // POOL TERMINAL-FAILURE MIRROR (the failed twin of the complete
+            // path's `note_affine_terminal`). The per-secondary cell flip above
+            // is NOT a global terminal — the import may still run on another
+            // secondary. But once it is `Failed` on EVERY eligible roster
+            // secondary it can no longer run anywhere: its GLOBAL terminal is a
+            // permanent failure. Record THAT in the pool's `failed_tasks` so the
+            // import's own phase's affine guard (`phase_has_live_affine_prereq`,
+            // which reads `!failed_tasks.contains`) clears and the phase can
+            // drain past it — without this a genuinely-failed affine holds Gate B
+            // forever. Phase-neutral + no dependent cascade (the fast-fail above
+            // already terminal-failed the now-`Unsatisfiable` dependents); this
+            // re-trigger is solely for the import's OWN phase. The lifecycle pass
+            // observes the freshly-drained phase (the affine terminal path holds
+            // no `command_rx`, so `&mut None` — the same shape the non-callback
+            // cascade entries use).
+            if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash)
+                && self.affine_import_globally_failed(affine_id)
+                && let Some((phase, task_id)) = self
+                    .cluster_state
+                    .task_state(&task_hash)
+                    .map(|s| (s.def().phase_id.clone(), s.def().task_id.clone()))
+            {
+                self.pool_mut().note_affine_failed(&phase, &task_id);
+                self.process_phase_lifecycle(&mut None).await;
+            }
             tracing::warn!(
                 secondary = %secondary_id,
                 worker_id,

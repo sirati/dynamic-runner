@@ -798,6 +798,105 @@ async fn affine_import_failed_everywhere_terminal_fails_dependent() {
         .await;
 }
 
+/// AFFINE FAILED-PATH MIRROR (commit-1 fix): an affine-only IMPORT phase whose
+/// import FAILS on every eligible secondary must DRAIN its own phase to `Done` —
+/// the failed twin of the complete-path's `note_affine_terminal`. Pre-fix the
+/// failed path recorded NOTHING in the pool, so a globally-failed import held
+/// its phase's Gate B (`phase_has_live_affine_prereq`) forever and the import
+/// phase stranded `Active`. Post-fix `note_affine_failed` (fired once the import
+/// is `Failed` on every roster secondary) clears Gate B + re-runs the drain, and
+/// the phase reaches `Done`.
+///
+/// Separate-phase topology (import alone in "import", build in "build") so the
+/// assertion isolates the IMPORT phase's own drain — distinct from the
+/// dependent-cascade the same-phase `affine_import_failed_everywhere…` covers.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_only_phase_import_failed_everywhere_drains_import_phase() {
+    use dynrunner_scheduler_api::pending_pool::PhaseState;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+
+            let mut build = make_binary("build", 20);
+            build.phase_id = PhaseId::from("build");
+            build.type_id = TypeId::from("default");
+            build.task_depends_on = vec![TaskDep {
+                task_id: "import".into(),
+                phase_id: PhaseId::from("import"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with_phase_deps(
+                    vec![import, build],
+                    HashMap::from([
+                        (PhaseId::from("import"), vec![]),
+                        (PhaseId::from("build"), vec![PhaseId::from("import")]),
+                    ]),
+                );
+            confirm_two(&mut primary).await;
+
+            // While the import is live (not yet failed everywhere) the import
+            // phase stays Active — Gate B holds it (the #617 invariant).
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("import")),
+                Some(PhaseState::Active),
+                "the import phase holds Active while its import is still live"
+            );
+
+            // Drive the run, FAILING every dispatched import on every secondary.
+            // The gate re-routes off each failed secondary; once the import is
+            // Failed on BOTH, it is globally failed.
+            for _round in 0..12 {
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+                drain_commands(&mut primary).await;
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == import_hash {
+                        primary
+                            .handle_task_failed(task_failed(sec, *worker, h), &mut None)
+                            .await;
+                        settle_pump().await;
+                    }
+                }
+            }
+            drain_commands(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::Failed,
+                    "the import cell must be Failed on {sec}"
+                );
+            }
+
+            // THE FIX: the import phase drained to Done once its import reached a
+            // global terminal failure (Gate B cleared by `note_affine_failed`).
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("import")),
+                Some(PhaseState::Done),
+                "the import phase must drain to Done once its import is failed on \
+                 every secondary — not strand Active forever (the failed-path \
+                 lost-mirror fix)"
+            );
+        })
+        .await;
+}
+
 /// A BACKPRESSURE-shaped `TaskFailed` from `secondary`/`worker` for `task_hash`
 /// — the exact wire shape a type-shift worker respawn's first-bind reinject
 /// sends ("worker pipe broken; respawning"). NOT a terminal: the task never ran
