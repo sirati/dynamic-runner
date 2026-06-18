@@ -28,13 +28,12 @@ const ARM_LIVENESS_PING: usize = 7;
 const ARM_RESPAWN_JOIN: usize = 8;
 const ARM_PANIK: usize = 9;
 const ARM_GRACEFUL_ABORT: usize = 10;
-const ARM_TASK_BACKOFF: usize = 11;
-const ARM_SNAPSHOT_STREAM: usize = 12;
-const ARM_SETTLED_SPILL: usize = 13;
-const ARM_PULL: usize = 14;
-const ARM_PERSISTENT_DIAL_FAILURE: usize = 15;
-const ARM_DISCOVERY: usize = 16;
-const ARM_PHASE_RESURFACE: usize = 17;
+const ARM_SNAPSHOT_STREAM: usize = 11;
+const ARM_SETTLED_SPILL: usize = 12;
+const ARM_PULL: usize = 13;
+const ARM_PERSISTENT_DIAL_FAILURE: usize = 14;
+const ARM_DISCOVERY: usize = 15;
+const ARM_PHASE_RESURFACE: usize = 16;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -50,7 +49,6 @@ pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
     "respawn_join",
     "panik",
     "graceful_abort",
-    "task_backoff",
     "snapshot_stream",
     "settled_spill",
     "pull",
@@ -827,19 +825,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             )
             .await?;
 
-            // Per-task re-dispatch backoff wake deadline, recomputed
-            // each iteration from the pool's PERSISTENT stored
-            // eligible-at stamps (never derived relative to "now" at
-            // the arm — the persistent-deadline law). Computed OUTSIDE
-            // the `select!` so the backoff arm's future does not
-            // borrow `self`.
-            let task_backoff_due = self.next_task_dispatch_backoff_expiry();
-
             // Phase-drain re-surface wake deadline, recomputed each
-            // iteration from the pool's PERSISTENT drain state (the same
-            // persistent-deadline law as `task_backoff_due` — an absolute
-            // instant, never a relative sleep, so it survives a sibling arm
-            // winning every iteration). `Some(now + bounded interval)` while
+            // iteration from the pool's PERSISTENT drain state (the
+            // persistent-deadline law — an absolute instant, never a
+            // relative sleep, so it survives a sibling arm winning every
+            // iteration). `Some(now + bounded interval)` while
             // a phase is stranded short of its drain edge
             // (`phases_stuck_drainable` non-empty), `None` otherwise → the
             // arm parks on `pending()` and DISARMS (no hot-spin). Computed
@@ -1520,39 +1510,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     arm_stats.record(ARM_RESPAWN_JOIN);
                     self.handle_respawn_join(outcome);
                 }
-                // Per-task re-dispatch backoff wake. `task_backoff_due`
-                // (computed at the top of this iteration) is the pool's
-                // earliest STORED eligible-at instant across queued
-                // backed-off tasks — a persistent deadline, so parking
-                // on the absolute instant survives sibling arms winning
-                // every iteration (the watchdog law; a relative sleep
-                // would re-arm forever on a busy mesh). When it fires,
-                // a previously-hidden task just became dispatch-
-                // eligible while every worker may already be parked
-                // ("no work" was the answer the whole window) — EMIT a
-                // `TasksAdded` onto the decoupled worker-management bus
-                // (never a direct dispatch call) so the worker-
-                // management arm coalesces it into one batched recheck.
-                // The wake is LEVEL-triggered (see `pending_pool::backoff`):
-                // if that single recheck MISSES (the eligible task could
-                // not be placed — no idle worker, transport-gate skip,
-                // affine-dep), the next iteration's recompute returns a
-                // BOUNDED re-poll instant (`now + interval`), so this arm
-                // re-fires until the task is actually dispatched instead
-                // of parking on `pending()` forever after one fire (the
-                // #640 25-min dispatch deadlock). The interval is bounded,
-                // so an undispatchable task is re-checked once per
-                // interval — never a hot-spin.
-                _ = async {
-                    match task_backoff_due {
-                        Some(due) => tokio::time::sleep_until(due.into()).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    arm_stats.record(ARM_TASK_BACKOFF);
-                    self.cluster_state
-                        .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
-                }
                 // Phase-drain re-surface wake. `phase_resurface_due`
                 // (computed at the top of this iteration) is `Some` only
                 // while a phase is stranded short of its drain edge — a
@@ -1564,7 +1521,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // but un-surfaced (the never-flipped transient) or
                 // `Drained`-but-not-`Done` (a flipped-then-consumed race) by
                 // its last event would strand forever — this LEVEL-trigger
-                // recovers it. The drain-edge analogue of `ARM_TASK_BACKOFF`.
+                // recovers it.
                 // When `phase_resurface_due` is `None` the arm parks on
                 // `pending()` → DISARMED, no hot-spin; while a phase is
                 // legitimately undrainable (a live affine import, unfinished

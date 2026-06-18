@@ -3175,17 +3175,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .expect("PendingPool initialised at run() start")
     }
 
-    /// The pool's earliest queued-task re-dispatch backoff expiry (see
-    /// [`PendingPool::next_dispatch_backoff_expiry`]), or `None` when
-    /// nothing is parked OR the pool is not yet initialised (the
-    /// operational loop's backoff wake arm then parks forever, same as
-    /// every other disabled-arm shape).
-    pub(super) fn next_task_dispatch_backoff_expiry(&mut self) -> Option<std::time::Instant> {
-        self.pending
-            .as_mut()
-            .and_then(|p| p.next_dispatch_backoff_expiry())
-    }
-
     /// The operational loop's phase-drain re-surface wake deadline — a
     /// BOUNDED level-trigger that re-enters `process_phase_lifecycle` when the
     /// event stream that ordinarily drives it has gone silent.
@@ -3195,23 +3184,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// completion hooks). A phase whose LAST event left it all-clear but
     /// stranded short of its drain edge (a momentarily-unsettled counter at
     /// that instant, or a flipped-`Drained`-then-consumed race) has no further
-    /// event to re-surface it — the drain-edge analogue of the #640 dispatch
-    /// deadlock the `task_backoff` arm fixes. While the pool reports any such
-    /// phase ([`PendingPool::phases_stuck_drainable`]) this returns
+    /// event to re-surface it. While the pool reports any such phase
+    /// ([`PendingPool::phases_stuck_drainable`]) this returns
     /// `Some(now + repoll_interval)` so the level-trigger arm re-enters the
     /// cascade; when none remain (or the pool is not yet initialised) it
     /// returns `None` and the arm parks on `pending()` — DISARMED, no
-    /// hot-spin. The interval is the SAME bounded re-poll cadence the
-    /// per-task backoff level-trigger uses ([`PendingPool::dispatch_repoll_interval`]),
-    /// so a legitimately-undrainable phase is re-checked once per interval
-    /// rather than spun on. A PERSISTENT (absolute) deadline recomputed each
-    /// loop iteration, exactly like [`Self::next_task_dispatch_backoff_expiry`].
+    /// hot-spin. The interval is the bounded re-poll cadence
+    /// [`PendingPool::phase_resurface_repoll_interval`] exposes, so a
+    /// legitimately-undrainable phase is re-checked once per interval rather
+    /// than spun on. A PERSISTENT (absolute) deadline recomputed each loop
+    /// iteration so it survives a sibling arm winning every iteration.
     pub(super) fn next_phase_resurface_expiry(&self) -> Option<std::time::Instant> {
         let pool = self.pending.as_ref()?;
         if pool.phases_stuck_drainable().is_empty() {
             None
         } else {
-            Some(std::time::Instant::now() + pool.dispatch_repoll_interval())
+            Some(std::time::Instant::now() + pool.phase_resurface_repoll_interval())
         }
     }
 
@@ -7064,8 +7052,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// hooks) stops, nothing re-runs the drain check. A phase whose last event
     /// left it all-clear but un-surfaced (a momentarily-unsettled counter at
     /// that instant) or `Drained`-but-not-`Done` (a flipped-then-consumed
-    /// race) is then stranded forever — the drain-edge analogue of the #640
-    /// dispatch deadlock the `task_backoff` arm closes. This drive (called
+    /// race) is then stranded forever. This drive (called
     /// from the empty-poll site of `process_phase_lifecycle`, AFTER the
     /// soft-finalize breaker, AND from the bounded `ARM_PHASE_RESURFACE`
     /// level-trigger that re-enters `process_phase_lifecycle` when the event

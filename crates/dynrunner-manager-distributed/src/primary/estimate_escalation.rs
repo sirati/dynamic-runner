@@ -133,7 +133,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             let pool = self.pool();
             let estimator = &self.estimator;
             for task in pool.iter() {
-                if !pool.dispatch_eligible_now(task) {
+                if !pool.dispatch_eligible(task) {
                     continue;
                 }
                 let est_mem = estimator.estimate(task).get(&mem_kind);
@@ -248,7 +248,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let estimator = &self.estimator;
         let eligible_estimates: Vec<u64> = pool
             .iter()
-            .filter(|t| pool.dispatch_eligible_now(t))
+            .filter(|t| pool.dispatch_eligible(t))
             .map(|t| estimator.estimate(t).get(&mem_kind))
             .collect();
 
