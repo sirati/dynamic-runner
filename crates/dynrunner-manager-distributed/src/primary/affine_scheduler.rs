@@ -243,6 +243,64 @@ impl AffineScheduler {
         drained
     }
 
+    /// The waiting-on-dependents entries keyed to a secondary OTHER than
+    /// `secondary`, as `(holding_secondary, work_hash)` pairs in deterministic
+    /// order (sorted by `(secondary, hash)`) — the SCAN seam the idle-worker
+    /// load-balance pull (#661) consumes. An idle worker on `secondary` whose
+    /// every eager-and-non-eager option is exhausted (empty global pool, empty
+    /// own per-secondary queue, no idle-steal donor) reads this set to find a
+    /// PARKED affine-dep work it can pull onto itself: a work blocked on its
+    /// import elsewhere is absent from every queue (it left the queue into this
+    /// blocked map), so the queue-stealing idle-steal can never see it. Entries
+    /// already keyed to `secondary` are EXCLUDED — a work already waiting for
+    /// `secondary`'s own import needs no pull, its `on_cell_finished` re-enqueue
+    /// is already coming. The caller picks the first pullable entry, re-keys it
+    /// via [`Self::rekey_block`], and routes it through the on-demand import path.
+    pub(crate) fn blocked_work_keyed_elsewhere(&self, secondary: &str) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .blocked_per_secondary
+            .keys()
+            .filter(|(sec, _)| sec != secondary)
+            .cloned()
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Re-key a waiting-on-dependents block for `work_hash` from `old_secondary`
+    /// to `new_secondary` with a FRESH pending-import set (#661): the idle-worker
+    /// load-balance pull moves a parked affine-dep work off a busy secondary onto
+    /// an idle one, so the dependent now runs on `new_secondary` once its imports
+    /// land THERE. Removes the `(old_secondary, work_hash)` entry and re-blocks
+    /// `(new_secondary, work_hash)` on `new_pending` (the imports still not `Done`
+    /// on the NEW secondary — the caller computes it against `new_secondary`'s
+    /// bitvector, because the pending set is per-secondary). An empty
+    /// `new_pending` removes the old block without re-blocking (every import is
+    /// already `Done` on `new_secondary`, so the caller enqueues the work directly
+    /// via `place`). A no-op on the old entry's absence (it raced away) still
+    /// applies the re-block, keeping the re-key idempotent against a concurrent
+    /// drain. Returns whether an old entry was actually removed (the caller pulled
+    /// a genuinely-parked work, not a phantom).
+    pub(crate) fn rekey_block(
+        &mut self,
+        old_secondary: &str,
+        new_secondary: &str,
+        work_hash: &str,
+        new_pending: Vec<SecondaryCellId>,
+    ) -> bool {
+        let removed = self
+            .blocked_per_secondary
+            .remove(&(old_secondary.to_string(), work_hash.to_string()))
+            .is_some();
+        if !new_pending.is_empty() {
+            self.blocked_per_secondary.insert(
+                (new_secondary.to_string(), work_hash.to_string()),
+                new_pending.into_iter().collect(),
+            );
+        }
+        removed
+    }
+
     /// 5-min reconcile sweep for the per-secondary blocked map (#652 concern C):
     /// the ORPHAN net for affine-blocked work, the complement of the pool's
     /// `reconcile_blocked`. For each `(secondary, work_hash, pending imports)`,
