@@ -920,6 +920,29 @@ fn task_failed_backpressure(
     }
 }
 
+/// A CAPACITY-shaped backpressure `TaskFailed` ("No idle worker available") —
+/// the GENUINE-capacity bounce the secondary's dispatch sends when every worker
+/// is busy with OTHER work. The #656 M2 brake gates this shape (sets the
+/// secondary's backpressure flag); the pipe-broken shape above does NOT.
+fn task_failed_capacity_bounce(
+    secondary: &str,
+    worker: u32,
+    task_hash: &str,
+) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: secondary.into(),
+        timestamp: 0.0,
+        secondary_id: secondary.into(),
+        worker_id: worker,
+        task_hash: task_hash.into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "No idle worker available".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    }
+}
+
 /// REGRESSION (affine-import backpressure-bounce wedge): an on-demand affine
 /// IMPORT that its secondary BACKPRESSURE-bounces (a type-shift worker respawn
 /// → first-bind reinject `TaskFailed{error_message="worker pipe broken;
@@ -1075,6 +1098,101 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
                 primary.cluster_state_for_test().affine_state(&sec, affine_id),
                 SecondaryCell::Queued,
                 "the re-dispatch re-claims the cell Queued"
+            );
+        })
+        .await;
+}
+
+/// #656 M2 (affine import-bounce capacity brake): an on-demand affine import
+/// refused with the GENUINE CAPACITY shape ("No idle worker available") must set
+/// the secondary's backpressure flag so `should_skip_worker_for_dispatch`
+/// (already invoked before `try_affine_pop_for_worker`) skips it for affine pops
+/// too — braking the import-bounce micro-loop (W re-pops → StrandedHere → import
+/// refused → bounce → reset → re-enqueue → re-pop). The flag event-clears on the
+/// next real capacity event (the #652 TaskComplete clear). A NON-capacity bounce
+/// (pipe-broken/preempt/…) is NOT capacity-exhausted and must recover promptly,
+/// so it must NOT set the flag.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_capacity_bounce_sets_flag_noncapacity_does_not() {
+    // Stage an on-demand import dispatch (round-1 StrandedHere, the SAME staging
+    // the existing bounce test uses) and return the secondary it landed on + its
+    // worker + the import hash. Macro (not a fn) to keep the staging inline and
+    // sidestep returning the borrow-entangled (primary, ends, wm_rx) bundle.
+    macro_rules! stage_import_in_flight {
+        ($primary:ident) => {{
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_dispatch: Option<(String, u32)> = None;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, sec, worker, h) in assignments(rx) {
+                    assert_ne!(h, build_hash, "build must not dispatch before import Done");
+                    if h == import_hash {
+                        import_dispatch = Some((sec.clone(), worker));
+                    }
+                }
+            }
+            let (sec, worker) =
+                import_dispatch.expect("the on-demand import dispatched (StrandedHere)");
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                SecondaryCell::Queued,
+                "on-demand dispatch claims the cell Queued"
+            );
+            $primary = primary;
+            (sec, worker, import_hash)
+        }};
+    }
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // ── CAPACITY bounce → flag SET. ──
+            let mut primary;
+            let (sec, worker, import_hash) = stage_import_in_flight!(primary);
+            assert!(
+                !primary.is_backpressured(&sec),
+                "no backpressure flag before the bounce"
+            );
+            primary
+                .handle_task_failed(
+                    task_failed_capacity_bounce(&sec, worker, &import_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            assert!(
+                primary.is_backpressured(&sec),
+                "a CAPACITY bounce (No idle worker available) sets the secondary's \
+                 backpressure flag — the affine import-bounce micro-loop brake"
+            );
+
+            // ── NON-capacity bounce → flag NOT set. ──
+            let mut primary2;
+            let (sec2, worker2, import_hash2) = stage_import_in_flight!(primary2);
+            primary2
+                .handle_task_failed(
+                    task_failed_backpressure(&sec2, worker2, &import_hash2),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            assert!(
+                !primary2.is_backpressured(&sec2),
+                "a NON-capacity bounce (pipe-broken) must NOT set the backpressure \
+                 flag — it is not capacity-exhausted and must recover promptly"
             );
         })
         .await;

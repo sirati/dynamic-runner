@@ -298,7 +298,7 @@ impl<I: Identifier> PendingPool<I> {
     /// non-affine work task's blocking set is unchanged (baseline-preserved).
     ///
     /// `pub(super)` so BOTH the ingest router ([`Self::commit_item`]) AND the
-    /// pop-time idempotent re-check ([`Self::commit_item_if_ready_else_reblock`]
+    /// pop-time idempotent re-check ([`Self::take_at_if_ready`]
     /// in `dispatch.rs`) read readiness through ONE owner — never a
     /// re-implemented dep walk. The pop-time guard exists because the 5-min
     /// reconcile arm (#652 concern C) pushes a possibly-not-ready item to a

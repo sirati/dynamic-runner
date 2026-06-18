@@ -722,11 +722,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// work was previously popped OUT of the queue into the blocked map, so it is
     /// absent from the queue and `place` does not double-queue it; `placed_work`
     /// stays set, which is correct: the work IS placed, just on the blocked
-    /// overlay until now). Emits `TasksAdded` so an idle worker pops it.
+    /// overlay until now).
+    ///
+    /// `recheck_signal` is the worker-management recheck the caller wants for the
+    /// re-popped work (#656 M2). A genuine import COMPLETION (the affine-complete
+    /// caller) frees its worker — a real capacity-restoring event — so it passes
+    /// the bypass=TRUE `TasksAdded` (and the #652 `TaskComplete` clear has
+    /// already removed any backpressure flag for that secondary). A
+    /// CAPACITY-BOUNCE (the failed handler's "No idle worker available" arm)
+    /// instead passes the bypass=FALSE `TasksReadyBackpressureAware` so the
+    /// at-capacity secondary the caller just flagged is SKIPPED on the recheck —
+    /// braking the import-bounce micro-loop. The seam takes the signal rather
+    /// than deciding it so the bounce-shape policy stays wholly in the caller.
     pub(crate) async fn reenqueue_affine_unblocked_on_cell(
         &mut self,
         secondary: &str,
         affine_id: SecondaryCellId,
+        recheck_signal: crate::worker_signal::WorkerMgmtSignal,
     ) {
         let freed = self.affine_scheduler.on_cell_finished(secondary, affine_id);
         if freed.is_empty() {
@@ -748,8 +760,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.apply_and_broadcast_cluster_mutations(mutations).await;
             }
         }
-        self.cluster_state
-            .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+        self.cluster_state.emit_worker_mgmt(recheck_signal);
     }
 
     /// Cell-`Failed` / dead-secondary re-route (#652 concern B's import-FAIL +
@@ -845,9 +856,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // requeue_affine_aware unrecord seam). The work stays a pool item, so
         // no general-queue push is needed — affine-dep work dispatches only
         // through the per-secondary path, never the general worker view.
+        //
+        // M1 (#656): a `Queued` import cell counts as "unblock coming" ONLY
+        // when its import is GENUINELY running on a live worker slot of that
+        // secondary. A `Queued` cell with no holding slot is a silently-lost
+        // holder (no `TaskFailed` bounce emitted, so the backpressure-arm reset
+        // never fired) — the dependent would otherwise stay blocked forever.
+        // The `import_in_flight` predicate mirrors `secondary_has_slot_holding_hash`
+        // (the in-tree "is this import running on this secondary's slots?"
+        // precedent `reset_stale_eager_prep_cells` uses), composed here from
+        // disjoint field reads so the scheduler's `&mut` borrow stays clear of
+        // the `&self` reads (`hash_for_cell_id` + the live-slot scan). The
+        // affine scheduler owns no slot/replicated state, so it learns no hash.
+        let workers = &self.workers;
+        let cluster_state = &self.cluster_state;
         let affine_orphans = self.affine_scheduler.reconcile_per_secondary_blocked(
             |sec: &str| reachable.contains(sec),
-            |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
+            |s: &str, a: SecondaryCellId| cluster_state.affine_state(s, a),
+            |s: &str, a: SecondaryCellId| {
+                cluster_state.hash_for_cell_id(a).is_some_and(|hash| {
+                    workers.iter().any(|w| {
+                        w.secondary_id == s && w.held_task_hash() == Some(hash)
+                    })
+                })
+            },
         );
         let affine_count = affine_orphans.len();
         for work_hash in &affine_orphans {

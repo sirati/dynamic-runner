@@ -572,6 +572,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &task_hash) {
                 self.apply_and_broadcast_cluster_mutations(vec![m]).await;
             }
+            // CAPACITY-BOUNCE BRAKE (#656 M2, the affine sibling of the general
+            // arm's capacity gate at :248 + :362): an import refused with the
+            // GENUINE CAPACITY shape ("No idle worker available" — every worker
+            // on this secondary is busy with OTHER work) can micro-loop (W
+            // re-pops → `StrandedHere` → import refused → bounce → reset cell →
+            // re-enqueue → re-pop). Mark the secondary backpressured so
+            // `should_skip_worker_for_dispatch` (already invoked before
+            // `try_affine_pop_for_worker`) skips it for affine pops too. The
+            // flag event-clears on the next real capacity event (the #652
+            // `TaskComplete` + capacity-growth clears) — no new clear needed.
+            // BUT the flag alone is defeated by a bypass=TRUE `TasksAdded`
+            // recheck, so the re-enqueue below must emit the bypass=FALSE
+            // `TasksReadyBackpressureAware` for THIS shape — exactly mirroring
+            // the general arm. ONLY the capacity shape: the other backpressure
+            // shapes (pipe-broken / preempt / reconciliation / stale-gen) are
+            // NOT capacity-exhausted and must recover PROMPTLY (gating them hung
+            // phase_ordering in the general fix — same risk here), so they keep
+            // the bypass=TRUE `TasksAdded` and never set the flag.
+            let is_capacity_bounce = error_message == "No idle worker available";
+            let recheck_signal = if is_capacity_bounce {
+                let backoff_ms = 500;
+                self.backpressured_secondaries.insert(
+                    secondary_id.clone(),
+                    Instant::now() + std::time::Duration::from_millis(backoff_ms),
+                );
+                WorkerMgmtSignal::TasksReadyBackpressureAware
+            } else {
+                WorkerMgmtSignal::TasksAdded
+            };
             // PER-SECONDARY UNBLOCK on bounce (#652 concern B): a work blocked
             // on this import here is waiting on a cell that just went `Queued →
             // NotDone` (the import never ran). Re-enqueue it so it re-pops
@@ -579,9 +608,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // would wait forever on a cell no terminal will ever flip `Done`
             // (the bounce already consumed the only in-flight run). Reuses the
             // cell-finished re-enqueue seam (it re-appends + re-gates uniformly).
+            // The recheck signal is shape-aware (capacity → bp-aware/braked,
+            // else → prompt `TasksAdded`).
             if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
-                self.reenqueue_affine_unblocked_on_cell(&secondary_id, affine_id)
-                    .await;
+                self.reenqueue_affine_unblocked_on_cell(
+                    &secondary_id,
+                    affine_id,
+                    recheck_signal,
+                )
+                .await;
             }
             tracing::debug!(
                 secondary = %secondary_id,

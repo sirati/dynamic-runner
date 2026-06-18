@@ -250,33 +250,50 @@ impl AffineScheduler {
     ///   * its `secondary` is no longer `reachable` (the dead-secondary drain
     ///     should already have caught this; reconcile is the backstop for a
     ///     miss), OR
-    ///   * a pending import is neither `Done` (an already-fired `Finished` was
-    ///     lost) nor in-flight (`Queued`) on that secondary — i.e. no terminal is
-    ///     coming to flip its cell (the lost-`Finished` / lost-bounce window).
+    ///   * a pending import has no terminal coming to flip its cell — it is
+    ///     neither `Done` (an already-fired `Finished` was lost) nor GENUINELY
+    ///     in flight. A `Queued` cell counts as in-flight ONLY when its import is
+    ///     actually running on a live worker slot of that secondary
+    ///     (`import_in_flight`). A `Queued` cell with NO holding slot is a STALE
+    ///     claim — its holder died SILENTLY (no `TaskFailed` bounce emitted, so
+    ///     the normal backpressure-arm reset never fired), and no terminal will
+    ///     ever flip it `Done`: the M1 (#656) silent-loss orphan.
     ///
     /// An orphaned entry is REMOVED and its `work_hash` RETURNED so the caller
     /// routes the work to the general-queue head (clearing its placement-dedup so
     /// a fresh affine placement re-derives it). A blocked entry whose secondary
-    /// is reachable AND every pending import is `Done`/`Queued` there is healthy
-    /// (its unblock is still coming) and is left untouched.
+    /// is reachable AND every pending import is `Done` or `Queued`-with-a-live-
+    /// holding-slot there is healthy (its unblock is still coming) and is left
+    /// untouched.
     ///
     /// `reachable(secondary)` is the live-roster predicate; `cell_of(secondary,
-    /// affine_id)` is the bitvector read (both supplied by the caller — this
-    /// module owns no replicated state).
-    pub(crate) fn reconcile_per_secondary_blocked<R, F>(
+    /// affine_id)` is the bitvector read; `import_in_flight(secondary,
+    /// affine_id)` answers "is the import for this cell genuinely running on a
+    /// live worker slot of this secondary?" (the caller composes it from
+    /// `hash_for_cell_id` + `secondary_has_slot_holding_hash` — this module owns
+    /// no slot/replicated state, so it never learns the import hash).
+    pub(crate) fn reconcile_per_secondary_blocked<R, F, L>(
         &mut self,
         reachable: R,
         cell_of: F,
+        import_in_flight: L,
     ) -> Vec<String>
     where
         R: Fn(&str) -> bool,
         F: Fn(&str, SecondaryCellId) -> SecondaryCell,
+        L: Fn(&str, SecondaryCellId) -> bool,
     {
         let mut orphaned = Vec::new();
         self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
             let unreachable = !reachable(sec);
-            let no_terminal_coming = pending.iter().any(|aid| {
-                !matches!(cell_of(sec, *aid), SecondaryCell::Done | SecondaryCell::Queued)
+            let no_terminal_coming = pending.iter().any(|aid| match cell_of(sec, *aid) {
+                SecondaryCell::Done => false, // already finished — no terminal needed
+                // `Queued` is "unblock coming" ONLY if a live slot is actually
+                // running the import; a `Queued` cell with no holding slot is a
+                // silently-lost holder (M1) → no terminal will ever come.
+                SecondaryCell::Queued => !import_in_flight(sec, *aid),
+                // NotDone / Failed: no terminal coming to flip it `Done`.
+                _ => true,
             });
             if unreachable || no_terminal_coming {
                 orphaned.push(work_hash.clone());
@@ -1171,9 +1188,10 @@ mod tests {
     #[test]
     fn reconcile_per_secondary_blocked_returns_orphans_keeps_healthy() {
         // #652 C: a blocked entry on an UNREACHABLE secondary is an orphan; a
-        // blocked entry whose import cell is Queued/Done on a reachable secondary
-        // is healthy (its unblock is still coming); a blocked entry whose cell is
-        // NotDone (no terminal coming) is an orphan.
+        // blocked entry whose import cell is Queued (with a live holding slot) /
+        // Done on a reachable secondary is healthy (its unblock is still
+        // coming); a blocked entry whose cell is NotDone (no terminal coming) is
+        // an orphan.
         let mut sched = AffineScheduler::default();
         let mut cells = Cells::default();
         // healthy: cell Queued on reachable s1.
@@ -1185,12 +1203,57 @@ mod tests {
         sched.block_until_import("s1", "orphan_lost", vec![aid(1)]);
 
         let reachable = |s: &str| s == "s1";
-        let mut orphans = sched.reconcile_per_secondary_blocked(reachable, cells.of());
+        // The healthy entry's Queued import IS in flight on a live slot.
+        let import_in_flight = |s: &str, a: SecondaryCellId| s == "s1" && a == aid(0);
+        let mut orphans =
+            sched.reconcile_per_secondary_blocked(reachable, cells.of(), import_in_flight);
         orphans.sort();
         assert_eq!(orphans, vec!["orphan_dead".to_string(), "orphan_lost".to_string()]);
         // The healthy one is kept; the orphans are removed.
         assert!(sched.is_blocked_on_import("s1", "healthy"));
         assert!(!sched.is_blocked_on_import("s_dead", "orphan_dead"));
         assert!(!sched.is_blocked_on_import("s1", "orphan_lost"));
+    }
+
+    #[test]
+    fn reconcile_orphans_queued_cell_with_no_holding_slot() {
+        // #656 M1 (silent-loss): a `Queued` import cell on a REACHABLE secondary
+        // whose holder died SILENTLY (no `TaskFailed` bounce → the cell stays
+        // `Queued` with NO live slot running the import) is an ORPHAN — no
+        // terminal will ever flip it `Done`. The reconcile must drain its blocked
+        // dependent so the work re-routes, rather than treating the bare `Queued`
+        // claim as "unblock coming" forever.
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        cells.set("s1", aid(0), SecondaryCell::Queued);
+        sched.block_until_import("s1", "silent_loss", vec![aid(0)]);
+
+        let reachable = |_: &str| true;
+        // No live slot holds the import — the silent-loss case.
+        let import_in_flight = |_: &str, _: SecondaryCellId| false;
+        let orphans =
+            sched.reconcile_per_secondary_blocked(reachable, cells.of(), import_in_flight);
+        assert_eq!(orphans, vec!["silent_loss".to_string()]);
+        assert!(!sched.is_blocked_on_import("s1", "silent_loss"));
+    }
+
+    #[test]
+    fn reconcile_keeps_queued_cell_with_a_holding_slot() {
+        // #656 M1 (no false orphan): the SAME `Queued` cell, but its import IS
+        // genuinely in flight on a live slot — a legitimately in-progress import.
+        // The dependent's unblock is still coming, so the entry must be KEPT (not
+        // orphaned). This is the discriminator that distinguishes the silent-loss
+        // case above from a healthy in-flight import.
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        cells.set("s1", aid(0), SecondaryCell::Queued);
+        sched.block_until_import("s1", "in_flight", vec![aid(0)]);
+
+        let reachable = |_: &str| true;
+        let import_in_flight = |s: &str, a: SecondaryCellId| s == "s1" && a == aid(0);
+        let orphans =
+            sched.reconcile_per_secondary_blocked(reachable, cells.of(), import_in_flight);
+        assert!(orphans.is_empty(), "an in-flight Queued import is not orphaned");
+        assert!(sched.is_blocked_on_import("s1", "in_flight"));
     }
 }

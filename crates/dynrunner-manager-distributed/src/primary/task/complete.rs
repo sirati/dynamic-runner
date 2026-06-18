@@ -397,9 +397,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // affine-as-blocked model — the work LEFT the queue into the blocked map
         // at `StrandedHere`/`InFlightHere`, and re-enters it HERE on the
         // import's `Finished` event (never a per-`TasksAdded` requeue spin).
+        // A genuine import COMPLETION frees its worker — a real capacity
+        // event — so the re-popped work takes the bypass=TRUE `TasksAdded`
+        // recheck (the #656 M2 partition: only a capacity-BOUNCE re-enqueue is
+        // braked via the bypass=FALSE bp-aware signal). The backpressure flag
+        // for this secondary is cleared just below anyway.
         if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
-            self.reenqueue_affine_unblocked_on_cell(&secondary_id, affine_id)
-                .await;
+            self.reenqueue_affine_unblocked_on_cell(
+                &secondary_id,
+                affine_id,
+                crate::worker_signal::WorkerMgmtSignal::TasksAdded,
+            )
+            .await;
         }
 
         // A healthy completion proves the secondary live — clear its backoff.
