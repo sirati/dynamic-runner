@@ -935,14 +935,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `Unsatisfiable` verdict; `fast_fail_affine_dependents_if_unsatisfiable`
     /// then terminalizes the doomed dependents.
     fn affine_unit_satisfiable_secondaries(&self, placement: &WorkPlacement) -> Vec<String> {
-        // A GLOBALLY-failed affine import (recorded in the pool's `failed_tasks`
-        // terminal ledger) cannot run on ANY secondary — the unit is doomed
-        // everywhere, so the satisfiable set is empty.
-        if placement
-            .affine_deps
-            .iter()
-            .any(|(_, import_hash)| self.failed_tasks.contains_key(import_hash))
-        {
+        // A GLOBALLY-failed affine import cannot run on ANY secondary — the unit
+        // is doomed everywhere, so the satisfiable set is empty. Two
+        // globally-failed shapes, both order-independent:
+        //   * the import recorded in the COORDINATOR's `failed_tasks` (its OWN
+        //     non-affine upstream failed non-recoverably — the import never ran,
+        //     cells stay `NotDone`, the #648 pool-cascade edge);
+        //   * the import globally-failed ACROSS TIME (#674) — it FAILED on every
+        //     roster secondary at different times (the cells are non-sticky, so
+        //     no single instant shows all-`Failed`; the across-time watermark
+        //     remembers it). Without this clause a dependent of such an import is
+        //     never `Unsatisfiable` (every cell reads NotDone/Failed-but-not-all)
+        //     → never fast-failed → parked forever after the import's phase
+        //     drains (the #674 dependent-side of the flat-wedge).
+        if placement.affine_deps.iter().any(|(aid, import_hash)| {
+            self.failed_tasks.contains_key(import_hash)
+                || self.affine_import_globally_failed_across_time(*aid)
+        }) {
             return Vec::new();
         }
         self.affine_placement_secondaries()
@@ -955,26 +964,128 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
-    /// Whether one affine IMPORT (`affine_id`) can no longer run anywhere — its
-    /// cell is `Failed` on EVERY eligible roster secondary, with none left where
-    /// it is placeable (`Done`/`Queued`/`NotDone`). The import-level twin of
-    /// [`Self::affine_unit_satisfiable_secondaries`] (which asks the same
-    /// roster question for a WORK unit's full dep set): an all-`Failed` import
-    /// has reached its GLOBAL terminal-failure and must be recorded in the
-    /// pool's terminal set so its phase's affine guard clears (the
-    /// strand-forever otherwise). Reads the roster, not just the bitvector's
-    /// written cells, so a fresh all-`NotDone` secondary still counts as
-    /// placeable (the import is NOT yet globally failed).
-    pub(super) fn affine_import_globally_failed(&self, affine_id: SecondaryCellId) -> bool {
+    /// Whether one affine IMPORT (`affine_id`) can no longer run anywhere,
+    /// robust to the cell's NON-STICKINESS over TIME (#674) — the SINGLE
+    /// global-failure predicate every detection site reads (the genuine-fail
+    /// arm in `handle_affine_task_failed`, the reconcile backstop), so the
+    /// instantaneous and across-time conditions can never drift. The
+    /// import-level twin of [`Self::affine_unit_satisfiable_secondaries`] (which
+    /// asks the roster question for a WORK unit's full dep set).
+    ///
+    /// An import that has reached its GLOBAL terminal-failure must be recorded
+    /// in the pool's terminal set (`note_affine_failed`) so its phase's affine
+    /// guard (`phase_has_live_affine_prereq`) clears and the phase can drain
+    /// (the strand-forever / flat-wedge otherwise). Reads the CURRENT roster
+    /// ([`Self::affine_placement_secondaries`]), so a departed secondary never
+    /// pins the import globally-failed and a fresh secondary still counts as a
+    /// live route (the import is NOT yet globally failed).
+    ///
+    /// ORs two halves over the one roster (either ⇒ no live secondary left):
+    ///   * INSTANTANEOUS — cell `Failed` on EVERY roster secondary at this
+    ///     instant (failover-durable: the cells are replicated).
+    ///   * ACROSS-TIME — failed on every roster secondary since each one's last
+    ///     success, the node-local watermark that the non-sticky cell resets
+    ///     would otherwise lose ([`AffineScheduler::import_failed_on_every`]).
+    pub(super) fn affine_import_globally_failed_across_time(
+        &self,
+        affine_id: SecondaryCellId,
+    ) -> bool {
         let secondaries = self.affine_placement_secondaries();
         // An empty roster is not a global FAILURE — the import simply has no
         // secondary to run on yet (a transient bring-up window); treat it as
         // not-globally-failed so a momentarily-empty roster never records a
         // spurious terminal.
-        !secondaries.is_empty()
-            && secondaries
-                .iter()
-                .all(|sec| self.cluster_state.affine_state(sec, affine_id) == SecondaryCell::Failed)
+        if secondaries.is_empty() {
+            return false;
+        }
+        // INSTANTANEOUS half: the import's cell is `Failed` on EVERY eligible
+        // roster secondary at THIS instant. Survives failover (the cells are
+        // replicated), so it is the post-promotion backstop for an import the
+        // node-local watermark could not carry across the epoch.
+        let all_failed_now = secondaries
+            .iter()
+            .all(|sec| self.cluster_state.affine_state(sec, affine_id) == SecondaryCell::Failed);
+        // ACROSS-TIME half: the import failed on every roster secondary since
+        // each one's last success — the non-simultaneous all-failed the
+        // instantaneous read MISSES (the cell `Failed` is non-sticky, so a
+        // re-route resets each cell as the next is set; the cells are never all
+        // `Failed` at one instant). The node-local accumulator
+        // ([`AffineScheduler::import_failed_on_every`]) remembers the failures
+        // across the resets — the dominant 11-node-scale shape (#674).
+        all_failed_now
+            || self
+                .affine_scheduler
+                .import_failed_on_every(affine_id, &secondaries)
+    }
+
+    /// 5-min reconcile backstop (#674 option b): record `note_affine_failed`
+    /// for every live affine IMPORT that is globally-failed across time but has
+    /// not yet reached its pool terminal. The failover level-net for the
+    /// node-local watermark (see the call site in
+    /// [`Self::reconcile_orphaned_blocked_work`]): the live genuine-fail arm
+    /// already fires this terminal the instant the last roster secondary fails,
+    /// so on a healthy primary this sweep finds nothing new; it exists to catch
+    /// the post-promotion / lost-event case where the across-time accumulator
+    /// could not.
+    ///
+    /// Enumerates the affine imports from the ledger (the `SecondaryAffine`
+    /// defs), reads the SAME across-time global-failure predicate the live arm
+    /// reads (so no detection drift), and routes a not-yet-terminal globally-
+    /// failed import through the SAME `note_affine_failed` + lifecycle re-trigger
+    /// the live arm uses. The pool's own terminal sets gate idempotency
+    /// (`note_affine_failed` re-runs only an idempotent drain transition for an
+    /// import already in `failed_tasks`). Phase-neutral; no dependent cascade
+    /// here (the live fast-fail owns that — and once the import's phase drains,
+    /// the drain-edge finalize cascades any still-blocked dependents).
+    async fn backstop_globally_failed_affine_imports(&mut self) {
+        // Collect first (the read borrows `&self.cluster_state`; the
+        // `note_affine_failed` write borrows `&mut self.pending`). A
+        // `SecondaryAffine` def whose import is globally-failed across time AND
+        // not yet recorded in the pool's affine terminal sets.
+        let to_fail: Vec<(dynrunner_core::PhaseId, String)> = self
+            .cluster_state
+            .tasks_iter()
+            .filter_map(|(hash, state)| {
+                let def = state.def();
+                if !def.kind.is_secondary_affine() {
+                    return None;
+                }
+                let affine_id = self.cluster_state.affine_id_for_hash(hash)?;
+                if !self.affine_import_globally_failed_across_time(affine_id) {
+                    return None;
+                }
+                Some((def.phase_id.clone(), def.task_id.clone()))
+            })
+            .collect();
+        if to_fail.is_empty() {
+            return;
+        }
+        let mut fired = false;
+        for (phase, task_id) in &to_fail {
+            // Idempotent: skip an import the pool already holds terminal (the
+            // live arm or a prior sweep recorded it) so the sweep does not
+            // re-emit a spurious drain re-trigger every 5 min.
+            if self.pool().affine_import_terminal(task_id) {
+                continue;
+            }
+            tracing::warn!(
+                target: crate::primary::important_events::IMPORTANT_TARGET,
+                phase = %phase,
+                affine_import = %task_id,
+                "reconcile backstop: affine import failed on every roster \
+                 secondary across time; recording its global terminal so the \
+                 phase can drain (the #674 flat-wedge level-net)"
+            );
+            self.pool_mut().note_affine_failed(phase, task_id);
+            fired = true;
+        }
+        if fired {
+            // A freshly-drained phase needs the lifecycle cascade to observe it
+            // (drain edge → retry/doom of its now-unsatisfiable affine-dep
+            // dependents). The reconcile path holds no `command_rx` → `&mut None`,
+            // the non-callback cascade shape.
+            self.process_phase_lifecycle(&mut None).await;
+        }
     }
 
     /// Re-place `placement`'s still-not-done prereqs + the work onto `target`'s
@@ -1225,6 +1336,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for work_hash in &affine_orphans {
             self.affine_scheduler.unrecord_placed_work(work_hash);
         }
+
+        // GLOBALLY-FAILED-IMPORT BACKSTOP (#674 option b): re-evaluate every
+        // live affine import's across-time global-failure and record
+        // `note_affine_failed` for any that can no longer run anywhere. This is
+        // the FAILOVER backstop for the node-local watermark: a promoted primary
+        // starts with an EMPTY accumulator, so an import that was failing
+        // pre-promotion is not yet across-time-detectable — but if its cells are
+        // CURRENTLY all-`Failed` the instantaneous half of
+        // `affine_import_globally_failed_across_time` catches it here on the
+        // 5-min sweep (bounding the post-failover gap). On the live path the
+        // genuine-fail arm already fires the across-time terminal the instant the
+        // last secondary fails; this sweep is the level-net for anything that
+        // arm missed (a lost event, a failover). Phase-neutral, idempotent
+        // (`note_affine_failed` re-inserting an already-terminal import re-runs an
+        // idempotent drain transition).
+        self.backstop_globally_failed_affine_imports().await;
 
         if normal_count > 0 || affine_count > 0 {
             tracing::info!(
@@ -1770,6 +1897,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             AffinePlaceability::Placeable => "Placeable".into(),
             AffinePlaceability::Doomed => "Doomed".into(),
             AffinePlaceability::NotReady => "NotReady".into(),
+        }
+    }
+
+    /// Test-only inspector for the #674 across-time global-failure predicate
+    /// ([`Self::affine_import_globally_failed_across_time`]) by the import's
+    /// content hash — lets the non-simultaneous-failure regression assert the
+    /// across-time detection directly, distinguishing it from the instantaneous
+    /// all-`Failed` read (which is false when the cells were never all `Failed`
+    /// at one instant).
+    #[cfg(test)]
+    pub(crate) fn affine_import_globally_failed_across_time_for_test(
+        &self,
+        import_hash: &str,
+    ) -> bool {
+        match self.cluster_state.affine_id_for_hash(import_hash) {
+            Some(affine_id) => self.affine_import_globally_failed_across_time(affine_id),
+            None => false,
         }
     }
 }

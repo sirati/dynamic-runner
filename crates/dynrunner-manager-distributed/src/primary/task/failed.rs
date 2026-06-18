@@ -626,6 +626,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
                 self.apply_and_broadcast_cluster_mutations(vec![m]).await;
             }
+            // ACROSS-TIME global-failure WATERMARK (#674): the cell `Failed`
+            // flip above is NON-STICKY — a later re-route/retry overrides it —
+            // so the instantaneous all-`Failed` read (the instantaneous half of
+            // `affine_import_globally_failed_across_time`, below) can MISS an
+            // import that fails on every roster secondary at
+            // DIFFERENT times (the dependents re-route the import between fails,
+            // resetting each cell as the next is set). Record this fail into the
+            // per-import failed-since-success accumulator so the across-time
+            // all-failed condition is detectable even when the cells were never
+            // all `Failed` simultaneously. Recorded at the SAME site the cell
+            // flips `Failed`; the affine scheduler owns the accumulator.
+            if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+                self.affine_scheduler
+                    .record_import_failed(&secondary_id, affine_id);
+            }
             // EVENT-DRIVEN BATCH fast-fail: if this failure made the affine gate
             // all-eligible-`Failed` (the import can no longer run on any roster
             // secondary), terminal-fail EVERY now-`Unsatisfiable` dependent in ONE
@@ -658,20 +673,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // POOL TERMINAL-FAILURE MIRROR (the failed twin of the complete
             // path's `note_affine_terminal`). The per-secondary cell flip above
             // is NOT a global terminal — the import may still run on another
-            // secondary. But once it is `Failed` on EVERY eligible roster
-            // secondary it can no longer run anywhere: its GLOBAL terminal is a
-            // permanent failure. Record THAT in the pool's `failed_tasks` so the
-            // import's own phase's affine guard (`phase_has_live_affine_prereq`,
-            // which reads `!failed_tasks.contains`) clears and the phase can
-            // drain past it — without this a genuinely-failed affine holds Gate B
-            // forever. Phase-neutral + no dependent cascade (the fast-fail above
-            // already terminal-failed the now-`Unsatisfiable` dependents); this
-            // re-trigger is solely for the import's OWN phase. The lifecycle pass
-            // observes the freshly-drained phase (the affine terminal path holds
-            // no `command_rx`, so `&mut None` — the same shape the non-callback
-            // cascade entries use).
+            // secondary. But once it can no longer run anywhere its GLOBAL
+            // terminal is a permanent failure. Record THAT in the pool's
+            // `failed_tasks` so the import's own phase's affine guard
+            // (`phase_has_live_affine_prereq`, which reads `!failed_tasks.contains`)
+            // clears and the phase can drain past it — without this a
+            // genuinely-failed affine holds Gate B forever (the silent
+            // flat-wedge). Phase-neutral + no dependent cascade (the fast-fail
+            // above already terminal-failed the now-`Unsatisfiable` dependents);
+            // this re-trigger is solely for the import's OWN phase. The lifecycle
+            // pass observes the freshly-drained phase (the affine terminal path
+            // holds no `command_rx`, so `&mut None` — the same shape the
+            // non-callback cascade entries use).
+            //
+            // ACROSS-TIME (#674): the gate is `affine_import_globally_failed_across_time`,
+            // NOT a purely instantaneous all-`Failed` read — the cell
+            // `Failed` is non-sticky, so an import that failed on every roster
+            // secondary at DIFFERENT times never reads all-`Failed` at one
+            // instant and would never reach this terminal (the v19 flat-wedge:
+            // the phase drain edge stays pinned forever). The across-time
+            // predicate ORs the watermark just recorded above, so this fires the
+            // instant the LAST roster secondary fails-since-success.
             if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash)
-                && self.affine_import_globally_failed(affine_id)
+                && self.affine_import_globally_failed_across_time(affine_id)
                 && let Some((phase, task_id)) = self
                     .cluster_state
                     .task_state(&task_hash)

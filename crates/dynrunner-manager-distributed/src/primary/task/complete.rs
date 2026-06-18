@@ -388,6 +388,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, true) {
             self.apply_and_broadcast_cluster_mutations(vec![m]).await;
         }
+        // ACROSS-TIME global-failure WATERMARK clear (#674): this secondary's
+        // last event for the import is now a SUCCESS (`Done`), so it is no
+        // longer "failed since its last success" — drop it from the per-import
+        // failed-since-success accumulator. Cleared at the SAME site the cell
+        // flips `Done`, the symmetric inverse of the genuine-fail arm's
+        // `record_import_failed`. Keeps the across-time all-failed detection
+        // honest: an import that recovers on a secondary must NOT count that
+        // secondary toward a later global-failure declaration.
+        if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+            self.affine_scheduler
+                .record_import_succeeded(&secondary_id, affine_id);
+        }
 
         // (1b) PER-SECONDARY UNBLOCK (#652 concern B): the import's cell just
         // flipped `Done` on this secondary, so every work BLOCKED on this import

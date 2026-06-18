@@ -140,6 +140,36 @@ pub(crate) struct AffineScheduler {
     /// phase-drain authority.
     blocked_per_secondary:
         HashMap<(String, String), std::collections::HashSet<SecondaryCellId>>,
+    /// PER-IMPORT "failed-since-its-last-success" watermark (#674): `affine_id
+    /// → the set of secondaries that have recorded a GENUINE affine terminal
+    /// FAIL since that secondary's last SUCCESS (`Done`) of this import`. The
+    /// time-ACCUMULATOR that the instantaneous bitvector cannot express: an
+    /// import's cell `Failed` is NON-STICKY (a re-route's higher-gen
+    /// `Queued`/`NotDone` overrides it under the LWW lattice), so
+    /// the instantaneous global-failure read — which reads the cells SIMULTANEOUSLY —
+    /// can MISS an import that failed on every roster secondary across TIME but
+    /// never with all cells `Failed` at one instant (the dependents re-route
+    /// the import between failures, resetting each cell as the next is set).
+    /// That import never reaches a global terminal, so `phase_has_live_affine_prereq`
+    /// stays pinned TRUE, the phase drain edge is suppressed, and the
+    /// retry/doom machinery never runs → silent flat-wedge.
+    ///
+    /// This watermark closes that gap by REMEMBERING the failure across the
+    /// non-sticky cell resets: a secondary is recorded on its genuine FAIL and
+    /// removed on its SUCCESS, so [`Self::import_failed_on_every`] reports the
+    /// across-time all-failed condition the instantaneous read misses.
+    ///
+    /// NODE-LOCAL + failover-rebuilt, co-located with `queues` / `placed_work`
+    /// / `blocked_per_secondary` (the same node-local scheduling-overlay
+    /// concern, cleared together by [`Self::clear`]): a promoted primary starts
+    /// with an empty accumulator and re-populates as fresh failures arrive; the
+    /// 5-min reconcile's instantaneous re-check is the post-failover backstop
+    /// for a currently-all-`Failed` import. Adding it here keeps the affine
+    /// scheduler the SINGLE owner of the per-secondary failed-history the global
+    /// terminal detection needs, and adds NO replicated CRDT field (the
+    /// bitvector LWW lattice is untouched).
+    failed_since_success:
+        HashMap<SecondaryCellId, std::collections::HashSet<String>>,
 }
 
 impl AffineScheduler {
@@ -150,6 +180,56 @@ impl AffineScheduler {
         self.queues.clear();
         self.placed_work.clear();
         self.blocked_per_secondary.clear();
+        self.failed_since_success.clear();
+    }
+
+    /// Record a GENUINE affine terminal FAIL of import `affine_id` on
+    /// `secondary` into the failed-since-success watermark (#674). Called from
+    /// the manager's genuine-terminal affine-fail arm at the same site it flips
+    /// the cell `Failed`. Accumulates across the cell's non-sticky resets so an
+    /// import that failed on every roster secondary ACROSS TIME is detectable
+    /// via [`Self::import_failed_on_every`] even though the cells were never all
+    /// `Failed` at one instant.
+    pub(crate) fn record_import_failed(&mut self, secondary: &str, affine_id: SecondaryCellId) {
+        self.failed_since_success
+            .entry(affine_id)
+            .or_default()
+            .insert(secondary.to_string());
+    }
+
+    /// Clear `secondary` from import `affine_id`'s failed-since-success
+    /// watermark (#674) — the secondary's last event for this import is now a
+    /// SUCCESS (`Done`), so it is no longer "failed since its last success".
+    /// Called from the manager's affine-COMPLETE arm at the same site it flips
+    /// the cell `Done`. A no-op when the secondary was never recorded.
+    pub(crate) fn record_import_succeeded(&mut self, secondary: &str, affine_id: SecondaryCellId) {
+        if let Some(set) = self.failed_since_success.get_mut(&affine_id) {
+            set.remove(secondary);
+            if set.is_empty() {
+                self.failed_since_success.remove(&affine_id);
+            }
+        }
+    }
+
+    /// Whether import `affine_id` has recorded a fail-since-last-success on
+    /// EVERY secondary in `roster` (#674) — the across-time twin of the
+    /// instantaneous all-`Failed` bitvector read. An EMPTY roster is NOT a
+    /// global failure (no secondary to have run on — a transient bring-up
+    /// window), mirroring the global-failure predicate's empty-roster guard.
+    /// Reads the node-local watermark only; the caller supplies the live
+    /// roster, so the scheduler learns no roster source.
+    pub(crate) fn import_failed_on_every(
+        &self,
+        affine_id: SecondaryCellId,
+        roster: &[String],
+    ) -> bool {
+        if roster.is_empty() {
+            return false;
+        }
+        let Some(set) = self.failed_since_success.get(&affine_id) else {
+            return false;
+        };
+        roster.iter().all(|sec| set.contains(sec))
     }
 
     /// Block work `work_hash` on `secondary` until every cell in

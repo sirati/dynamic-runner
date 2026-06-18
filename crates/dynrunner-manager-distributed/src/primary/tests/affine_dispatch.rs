@@ -798,6 +798,245 @@ async fn affine_import_failed_everywhere_terminal_fails_dependent() {
         .await;
 }
 
+/// #674 ACROSS-TIME GLOBAL FAILURE (the LOAD-BEARING drain-edge un-pin): an
+/// affine import that FAILS on every roster secondary at DIFFERENT times —
+/// NEVER with all cells `Failed` at one instant — must STILL reach a global
+/// terminal so its phase drains and the run completes (not a silent flat-wedge).
+///
+/// PRE-FIX MECHANISM (the v19 flat-wedge): `Failed` is NON-STICKY under the LWW
+/// cell lattice, and at scale the dependents re-route the import between
+/// failures (resetting each secondary's cell as the next is set), so the
+/// instantaneous all-`Failed` read (`affine_import_globally_failed`) is NEVER
+/// true → the import never enters `failed_tasks` → `phase_has_live_affine_prereq`
+/// stays pinned TRUE → the `(0,0,0)` drain edge is SUPPRESSED → the retry/doom
+/// machinery never runs → the run hangs flat forever.
+///
+/// POST-FIX: the per-(import, secondary) failed-since-success watermark
+/// accumulates the failures across the non-sticky resets, so
+/// `affine_import_globally_failed_across_time` fires the instant the LAST roster
+/// secondary fails-since-success — even though the cells were never all `Failed`
+/// simultaneously. The import reaches its pool terminal → Gate B clears → the
+/// import phase drains `Done`.
+///
+/// REVERT-CHECK (RED without #1): the test injects a cell RESET between the two
+/// failures (the re-route's `Queued → NotDone`), so at the assertion instant the
+/// cells are `s0=NotDone, s1=Failed` — the instantaneous all-`Failed` predicate
+/// is FALSE. Only the across-time watermark detects the global failure; without
+/// it the import stays live and the phase never drains.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_failed_across_time_non_simultaneous_reaches_global_terminal() {
+    use dynrunner_scheduler_api::pending_pool::PhaseState;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut import = affine_import("import");
+            import.phase_id = PhaseId::from("import");
+            let import_hash = compute_task_hash(&import);
+
+            let mut build = make_binary("build", 20);
+            build.phase_id = PhaseId::from("build");
+            build.type_id = TypeId::from("default");
+            build.task_depends_on = vec![TaskDep {
+                task_id: "import".into(),
+                phase_id: PhaseId::from("import"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, _ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with_phase_deps(
+                    vec![import, build],
+                    HashMap::from([
+                        (PhaseId::from("import"), vec![]),
+                        (PhaseId::from("build"), vec![PhaseId::from("import")]),
+                    ]),
+                );
+            let on_start: OnPhaseStart = Box::new(|_p: &PhaseId| {});
+            let on_end: OnPhaseEnd = Box::new(move |_p, _c, _f, _o| {});
+            primary.register_phase_lifecycle_callbacks(on_start, on_end);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // While the import is live the import phase holds Active (Gate B).
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("import")),
+                Some(PhaseState::Active),
+                "the import phase holds Active while its import is still live"
+            );
+
+            // ── FAIL #1 on sec-0 (a genuine terminal). The cell flips Failed and
+            // the watermark records sec-0.
+            primary
+                .handle_task_failed(task_failed("sec-0", 0, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
+                SecondaryCell::Failed,
+                "fail #1 must flip sec-0's cell Failed"
+            );
+
+            // ── RE-ROUTE between the failures (the NON-SIMULTANEITY): reset sec-0's
+            // cell `Failed → NotDone` (the higher-gen `SecondaryCellUnqueued` a
+            // re-route emits). The two Failed cells now NEVER coexist — the exact
+            // v19 shape the instantaneous read misses.
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::SecondaryCellUnqueued {
+                    secondary: "sec-0".into(),
+                    cell_id: affine_id.0,
+                    generation: 1_000,
+                });
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
+                SecondaryCell::NotDone,
+                "the re-route reset sec-0's cell back to NotDone"
+            );
+
+            // ── FAIL #2 on sec-1. Now cells are sec-0=NotDone, sec-1=Failed — the
+            // instantaneous all-`Failed` read is FALSE — but the watermark now holds
+            // BOTH secondaries (sec-0 from fail #1, sec-1 from fail #2), so the
+            // across-time predicate fires and the genuine-fail arm records the
+            // global terminal.
+            primary
+                .handle_task_failed(task_failed("sec-1", 0, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            drain_commands(&mut primary).await;
+
+            // The cells were NEVER all-Failed simultaneously (revert-check anchor).
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
+                SecondaryCell::NotDone,
+                "sec-0's cell is NotDone at the assertion instant (re-route reset it)"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-1", affine_id),
+                SecondaryCell::Failed,
+                "only sec-1 is Failed now — the cells were never all-Failed at once"
+            );
+
+            // THE ACROSS-TIME DETECTION (RED without #1: the instantaneous read is
+            // false here, so the import would stay live forever).
+            assert!(
+                primary.affine_import_globally_failed_across_time_for_test(&import_hash),
+                "#674: the import failed on every roster secondary ACROSS TIME — it \
+                 must be detected globally-failed even though the cells were never \
+                 all-Failed simultaneously"
+            );
+
+            // THE FIX: the import reached its GLOBAL terminal (pool failed_tasks via
+            // note_affine_failed), Gate B cleared, and the import phase DRAINED to
+            // Done — instead of stranding Active forever (the flat-wedge).
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("import")),
+                Some(PhaseState::Done),
+                "#674: the import phase must drain to Done once its import is \
+                 globally-failed across time — RED without the watermark (the cells \
+                 are never all-Failed, so the instantaneous read never fires → the \
+                 phase stays pinned Active → silent flat-wedge)"
+            );
+
+            // The import phase drained Done → the dependent build phase activates;
+            // its build is now ready-in-bucket but DOOMED (its import is
+            // globally-failed across time → `affine_unit_satisfiable_secondaries`
+            // empty), so the placement pass collects it as doomed and terminalizes
+            // it (the #650/#648 bridge). Drive the recheck + command drain so that
+            // placement pass + its terminalization runs.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            drain_commands(&mut primary).await;
+
+            // The dependent build cascaded to a terminal: its import can never run,
+            // so it can never run — the run COMPLETES diagnosably rather than
+            // hanging on a parked build.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "#674: the build whose import is globally-failed must cascade to a \
+                 terminal so the run completes (not flat-wedge on a parked build)"
+            );
+        })
+        .await;
+}
+
+/// #674 RE-ROUTE RECOVERS (the watermark must NOT over-doom): an import that
+/// FAILS on sec-0 but then SUCCEEDS (`Done`) on sec-1 must NOT be declared
+/// globally-failed — the success clears sec-0... no: it clears sec-1's failed
+/// mark and, because not every roster secondary is failed-since-success, the
+/// across-time predicate stays FALSE. The re-route works when it can; the
+/// watermark only fires when EVERY secondary has failed since its last success.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_reroute_succeeds_is_not_globally_failed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+
+            let (mut primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            let _affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // FAIL on sec-0 (watermark records sec-0).
+            primary
+                .handle_task_failed(task_failed("sec-0", 0, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            drain_commands(&mut primary).await;
+
+            // Not yet globally-failed: sec-1 has not failed-since-success.
+            assert!(
+                !primary.affine_import_globally_failed_across_time_for_test(&import_hash),
+                "one failed secondary is not a global failure — sec-1 is still a live \
+                 route"
+            );
+
+            // SUCCEED on sec-1 (the re-route works): the import completes there. The
+            // success clears sec-1 from the watermark (it was never in it) and is a
+            // global TaskCompleted.
+            primary
+                .handle_task_complete(task_complete("sec-1", 0, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            drain_commands(&mut primary).await;
+
+            // STILL not globally-failed — the re-route succeeded, so the import is
+            // NOT doomed (it must NOT be over-declared failed just because one
+            // secondary failed). This is the watermark's correctness guard: it
+            // fires ONLY when EVERY roster secondary has failed since its last
+            // success.
+            assert!(
+                !primary.affine_import_globally_failed_across_time_for_test(&import_hash),
+                "#674: an import that SUCCEEDS on a re-route secondary must NOT be \
+                 declared globally-failed — the watermark must not over-doom a \
+                 recoverable import"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&import_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "the import reached a global terminal via its sec-1 COMPLETION (a \
+                 success, not a failure)"
+            );
+        })
+        .await;
+}
+
 /// AFFINE FAILED-PATH MIRROR (commit-1 fix): an affine-only IMPORT phase whose
 /// import FAILS on every eligible secondary must DRAIN its own phase to `Done` —
 /// the failed twin of the complete-path's `note_affine_terminal`. Pre-fix the

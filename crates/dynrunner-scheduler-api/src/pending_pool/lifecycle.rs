@@ -134,6 +134,19 @@ impl<I: Identifier> PendingPool<I> {
         self.maybe_transition_drain(phase_id);
     }
 
+    /// Whether an affine import `task_id` has already reached its GLOBAL pool
+    /// terminal — recorded in `completed_tasks` (via [`Self::note_affine_terminal`])
+    /// or `failed_tasks` (via [`Self::note_affine_failed`]). The idempotency
+    /// read seam for the #674 reconcile backstop: a globally-failed import the
+    /// live arm (or a prior sweep) already terminalized must not be re-recorded
+    /// and re-trigger a spurious drain transition every 5 min. It reads the SAME
+    /// terminal sets the affine drain guard `phase_has_live_affine_prereq` reads
+    /// to clear Gate B, so the backstop's "already terminal" matches the guard's
+    /// "no longer live".
+    pub fn affine_import_terminal(&self, task_id: &str) -> bool {
+        self.completed_tasks.contains(task_id) || self.failed_tasks.contains(task_id)
+    }
+
     /// Record `id` completed and unblock every dependent whose final
     /// unresolved prereq this resolves: move it `blocked → FRONT of its
     /// bucket` (matching `requeue` so freshly-unblocked tasks dispatch ahead
