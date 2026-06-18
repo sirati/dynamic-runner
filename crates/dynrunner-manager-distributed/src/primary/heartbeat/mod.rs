@@ -646,6 +646,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // paths can never drift. Runs AFTER requeue: `release_worker`
         // clears the affinity record the recovery above used for routing.
         self.evict_secondary_local_caches(&secondary_id);
+        // PER-SECONDARY BLOCKED DRAIN on death (#652 concern B's dead-secondary
+        // edge): a work BLOCKED on an import of the now-dead secondary must not
+        // wait for the 5-min reconcile — the secondary will never flip its cell
+        // `Done`. Drain the whole per-secondary blocked map for `secondary_id`
+        // and re-route each work to a still-eligible secondary (or terminalize
+        // it if its import is now unsatisfiable everywhere). Runs AFTER the
+        // cache eviction so `affine_placement_secondaries` already excludes the
+        // dead secondary (the re-route never re-targets it). The work stays a
+        // pool item (its in-flight copy was already requeued above); this only
+        // re-decides its per-secondary scheduling overlay. No `command_rx` on
+        // this path (a non-callback cascade entry), so `&mut None` — the same
+        // shape the affine terminal-mirror path uses.
+        self.reroute_affine_blocked_on(&secondary_id, None, &mut None)
+            .await;
 
         // Authoritative origination, one batch: the dead secondary's
         // in-flight tasks transition `InFlight → Pending` in the CRDT

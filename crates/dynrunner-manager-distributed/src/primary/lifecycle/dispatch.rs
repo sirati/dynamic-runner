@@ -339,7 +339,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // Extract the owned consumption ticket — the view's last
                 // use, releasing the pool borrow for the take below.
                 let selection = view.select(binary_index);
-                let binary = self.pool_mut().take_selected(selection);
+                // `take_selected` re-checks readiness at the consume point
+                // (#652 D.1): a reconcile-pushed (concern C) item that turns
+                // out not-ready is re-blocked and yields `None`, so this slot
+                // simply gets no dispatch this tick (refresh the budget
+                // snapshot + move on, exactly like the empty-view path). On the
+                // steady-state path the view never offers a not-ready item, so
+                // this is always `Some` and byte-identical to before.
+                let Some(binary) = self.pool_mut().take_selected(selection) else {
+                    all_infos[worker_idx] = self.workers[worker_idx].budget_info();
+                    continue;
+                };
                 // The single-task dispatch transaction (commit → gather →
                 // build → send → originate, with the in-flight-bookkeeping
                 // triple + rollback) lives in `dispatch_one_assignment`,

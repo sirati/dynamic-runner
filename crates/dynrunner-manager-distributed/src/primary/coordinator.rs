@@ -4468,6 +4468,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.affine_scheduler.placed_but_unqueued_count()
     }
 
+    /// Test-only inspector (#652 concern B): whether `(secondary, work_hash)` is
+    /// currently in the per-secondary blocked-on-import map. Lets the
+    /// affine-as-blocked tests assert a work WAITS (blocked, not enqueued) on an
+    /// unmet per-secondary import, and is unblocked on the import's `Finished`.
+    #[cfg(test)]
+    pub fn affine_is_blocked_on_import_for_test(&self, secondary: &str, work_hash: &str) -> bool {
+        self.affine_scheduler.is_blocked_on_import(secondary, work_hash)
+    }
+
     /// Test-only seam: record `work_hash` in the affine scheduler's
     /// `placed_work` guard, reproducing the state the placement trigger leaves
     /// behind. Used by the dead-upstream terminalization test to stage an

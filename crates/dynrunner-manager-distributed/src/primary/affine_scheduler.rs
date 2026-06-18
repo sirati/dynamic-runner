@@ -121,6 +121,25 @@ pub(crate) struct AffineScheduler {
     /// (returns `false` if already placed — the gate) and undoes it via
     /// [`Self::unrecord_placed_work`].
     placed_work: std::collections::HashSet<String>,
+    /// PER-SECONDARY blocked WORK tasks (#652 concern B): `(secondary, work
+    /// hash) → the set of affine import cells still NOT `Done` on that
+    /// secondary`. A work task whose import is not yet imported on its chosen
+    /// secondary is NOT enqueued onto that secondary's queue (which would
+    /// spin-requeue on every `TasksAdded`); it WAITS here until every pending
+    /// import cell flips `Done` ([`Self::on_cell_finished`] empties its set and
+    /// returns it for enqueue). The edge is PER-SECONDARY because the same
+    /// affine work runs on multiple secondaries — a block on `(S, W)` is
+    /// independent of `(S', W)`.
+    ///
+    /// Co-located with `queues` + `placed_work` (the same scheduling-state
+    /// concern, reset together by [`Self::clear`] on failover rebuild). The
+    /// pool's global-`task_id`-keyed `blocked` map cannot express the
+    /// `(import D, secondary S)` readiness this needs (#652 FLAG #3), and the
+    /// work task STAYS in the pool bucket as its phase-drain token while blocked
+    /// here — this map is a pure per-secondary scheduling overlay, never the
+    /// phase-drain authority.
+    blocked_per_secondary:
+        HashMap<(String, String), std::collections::HashSet<SecondaryCellId>>,
 }
 
 impl AffineScheduler {
@@ -130,6 +149,151 @@ impl AffineScheduler {
     pub(crate) fn clear(&mut self) {
         self.queues.clear();
         self.placed_work.clear();
+        self.blocked_per_secondary.clear();
+    }
+
+    /// Block work `work_hash` on `secondary` until every cell in
+    /// `pending_imports` is `Done` there (#652 concern B). Records the
+    /// per-secondary blocked entry; the work is NOT enqueued onto the
+    /// secondary's queue (the caller dispatches the missing import on-demand and
+    /// returns — the work re-enters the queue via [`Self::on_cell_finished`]
+    /// when its imports complete). An empty `pending_imports` is a no-op (the
+    /// caller should enqueue directly via `place` in that all-`Done` case).
+    /// Idempotent: re-blocking the same `(secondary, work_hash)` overwrites with
+    /// the current pending set (the freshest gate read).
+    pub(crate) fn block_until_import(
+        &mut self,
+        secondary: &str,
+        work_hash: &str,
+        pending_imports: Vec<SecondaryCellId>,
+    ) {
+        if pending_imports.is_empty() {
+            return;
+        }
+        self.blocked_per_secondary.insert(
+            (secondary.to_string(), work_hash.to_string()),
+            pending_imports.into_iter().collect(),
+        );
+    }
+
+    /// Bitvector-cell-`Finished` handler (#652 concern B): an affine import's
+    /// cell just flipped `Done` on `secondary`. Return + UNBLOCK every work on
+    /// THIS secondary that was waiting on `affine_id` — the caller re-enqueues
+    /// each onto the secondary's queue via `place` so it RE-POPS + re-gates.
+    ///
+    /// Why unblock EVERY waiter (not only the now-fully-`Done` ones): a
+    /// multi-import work (e.g. `[base, delta]`) waits on the FIRST not-`Done`
+    /// import in list order — `dispatch_affine_import_on_demand` kicked only
+    /// `base`. When `base` flips `Done` the work must re-pop so the gate sees
+    /// `delta` is now the first not-`Done` import and kicks IT (then re-blocks
+    /// the work on `delta`). Re-enqueuing on EACH cell-finish drives that
+    /// list-order progression one import per real `Finished` EVENT — never a
+    /// spin (the work leaves the queue again immediately on the re-block, and
+    /// every cycle makes forward progress on exactly one import). A work whose
+    /// imports are now ALL `Done` re-pops `Ready` and dispatches. Removing the
+    /// entry keeps the map free of stale blocks; the re-pop re-blocks it on its
+    /// remaining imports if any.
+    pub(crate) fn on_cell_finished(
+        &mut self,
+        secondary: &str,
+        affine_id: SecondaryCellId,
+    ) -> Vec<String> {
+        let mut freed = Vec::new();
+        self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
+            if sec == secondary && pending.contains(&affine_id) {
+                freed.push(work_hash.clone());
+                false // unblock — the caller re-enqueues for a re-pop + re-gate
+            } else {
+                true
+            }
+        });
+        freed
+    }
+
+    /// Bitvector-cell-`Failed` / dead-secondary drain (#652 concern B's
+    /// import-FAIL + dead-secondary edges): remove + RETURN every blocked work
+    /// on `secondary` (optionally filtered to those waiting on `affine_id`) so
+    /// the caller can make a fresh route/terminalize decision RIGHT NOW — never
+    /// leaving the work stranded until the 5-min reconcile. `affine_id = None`
+    /// drains the whole secondary (dead-secondary); `Some(aid)` drains only the
+    /// works waiting on that import (one import failed). The returned works are
+    /// no longer blocked here; the caller is responsible for re-placing or
+    /// terminalizing them.
+    pub(crate) fn drain_blocked_on(
+        &mut self,
+        secondary: &str,
+        affine_id: Option<SecondaryCellId>,
+    ) -> Vec<String> {
+        let mut drained = Vec::new();
+        self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
+            if sec != secondary {
+                return true;
+            }
+            let hit = match affine_id {
+                Some(aid) => pending.contains(&aid),
+                None => true,
+            };
+            if hit {
+                drained.push(work_hash.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drained
+    }
+
+    /// 5-min reconcile sweep for the per-secondary blocked map (#652 concern C):
+    /// the ORPHAN net for affine-blocked work, the complement of the pool's
+    /// `reconcile_blocked`. For each `(secondary, work_hash, pending imports)`,
+    /// the entry is ORPHANED — its unblock event will never come — when EITHER:
+    ///   * its `secondary` is no longer `reachable` (the dead-secondary drain
+    ///     should already have caught this; reconcile is the backstop for a
+    ///     miss), OR
+    ///   * a pending import is neither `Done` (an already-fired `Finished` was
+    ///     lost) nor in-flight (`Queued`) on that secondary — i.e. no terminal is
+    ///     coming to flip its cell (the lost-`Finished` / lost-bounce window).
+    ///
+    /// An orphaned entry is REMOVED and its `work_hash` RETURNED so the caller
+    /// routes the work to the general-queue head (clearing its placement-dedup so
+    /// a fresh affine placement re-derives it). A blocked entry whose secondary
+    /// is reachable AND every pending import is `Done`/`Queued` there is healthy
+    /// (its unblock is still coming) and is left untouched.
+    ///
+    /// `reachable(secondary)` is the live-roster predicate; `cell_of(secondary,
+    /// affine_id)` is the bitvector read (both supplied by the caller — this
+    /// module owns no replicated state).
+    pub(crate) fn reconcile_per_secondary_blocked<R, F>(
+        &mut self,
+        reachable: R,
+        cell_of: F,
+    ) -> Vec<String>
+    where
+        R: Fn(&str) -> bool,
+        F: Fn(&str, SecondaryCellId) -> SecondaryCell,
+    {
+        let mut orphaned = Vec::new();
+        self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
+            let unreachable = !reachable(sec);
+            let no_terminal_coming = pending.iter().any(|aid| {
+                !matches!(cell_of(sec, *aid), SecondaryCell::Done | SecondaryCell::Queued)
+            });
+            if unreachable || no_terminal_coming {
+                orphaned.push(work_hash.clone());
+                false // remove the orphan
+            } else {
+                true // healthy — unblock still coming
+            }
+        });
+        orphaned
+    }
+
+    /// Whether `(secondary, work_hash)` is currently blocked-on-import — the
+    /// read seam the concern-B tests assert against.
+    #[cfg(test)]
+    pub(crate) fn is_blocked_on_import(&self, secondary: &str, work_hash: &str) -> bool {
+        self.blocked_per_secondary
+            .contains_key(&(secondary.to_string(), work_hash.to_string()))
     }
 
     /// Record `work_hash` as PLACED (the placement trigger queued its unit) and
@@ -385,9 +549,17 @@ impl AffineScheduler {
         C: Fn(&str, &str) -> bool,
     {
         // Pick the donor T: longest queue, name tie-break, never S itself, must
-        // be non-empty AND its head schedulable unit's work must be steal-eligible
-        // (no in-flight import on T). The eligibility is an ADDED filter; the
-        // longest/name `max_by` tie-break is unchanged.
+        // be non-empty AND CONTAIN A WORK unit whose import is steal-eligible (no
+        // in-flight import on T). A queue with NO work unit is NOT a donor (#652
+        // concern B): under lazy import a queue normally holds only work units,
+        // but a refused on-demand import dispatch can leave a BARE `Affine`
+        // import unit requeued at its front. That import is per-secondary —
+        // committed to T because a dependent there triggered it — so it must
+        // NEVER migrate to S (stealing it would dispatch the import on a
+        // secondary whose dependent's earlier deps are not yet met — e.g. a
+        // delta whose base is still `NotDone` on S). The eligibility +
+        // has-work filter is an ADDED filter; the longest/name `max_by`
+        // tie-break is unchanged.
         let donor = self
             .queues
             .iter()
@@ -396,7 +568,10 @@ impl AffineScheduler {
                     && !q.is_empty()
                     && match q.iter().find(|u| u.is_work()) {
                         Some(QueuedUnit::Work { hash }) => can_steal_work(t, hash),
-                        _ => true,
+                        // No work unit (only a bare requeued import) → NOT a
+                        // donor: nothing schedulable to steal, and the import
+                        // must stay on its own secondary.
+                        _ => false,
                     }
             })
             .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(a.0)))
@@ -941,5 +1116,81 @@ mod tests {
         sched.clear();
         assert!(sched.queue("s1").is_empty());
         assert_eq!(sched.queue_len("s1"), 0);
+    }
+
+    #[test]
+    fn block_until_import_records_and_on_cell_finished_unblocks() {
+        // #652 B: block a work on its not-Done import cells; on_cell_finished
+        // returns + unblocks every work waiting on that import on that secondary.
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![aid(0), aid(1)]);
+        assert!(sched.is_blocked_on_import("s1", "w1"));
+        // A cell-finish for an import this work does NOT wait on (different sec)
+        // returns nothing.
+        assert!(sched.on_cell_finished("s2", aid(0)).is_empty());
+        assert!(sched.is_blocked_on_import("s1", "w1"));
+        // The first import finishing unblocks the work (re-pop drives the next).
+        let freed = sched.on_cell_finished("s1", aid(0));
+        assert_eq!(freed, vec!["w1".to_string()]);
+        assert!(!sched.is_blocked_on_import("s1", "w1"), "unblocked on cell-finish");
+    }
+
+    #[test]
+    fn block_until_import_empty_pending_is_noop() {
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![]);
+        assert!(!sched.is_blocked_on_import("s1", "w1"), "empty pending → no block");
+    }
+
+    #[test]
+    fn drain_blocked_on_filters_by_affine_id_or_whole_secondary() {
+        // #652 B import-FAIL + dead-secondary edges.
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![aid(0)]);
+        sched.block_until_import("s1", "w2", vec![aid(1)]);
+        sched.block_until_import("s2", "w3", vec![aid(0)]);
+        // Filtered to aid(0) on s1 → only w1.
+        let drained = sched.drain_blocked_on("s1", Some(aid(0)));
+        assert_eq!(drained, vec!["w1".to_string()]);
+        assert!(!sched.is_blocked_on_import("s1", "w1"));
+        assert!(sched.is_blocked_on_import("s1", "w2"), "w2 (aid 1) untouched");
+        // Whole-secondary drain (dead s1) → w2.
+        let drained = sched.drain_blocked_on("s1", None);
+        assert_eq!(drained, vec!["w2".to_string()]);
+        assert!(sched.is_blocked_on_import("s2", "w3"), "other secondary untouched");
+    }
+
+    #[test]
+    fn clear_drops_blocked_map() {
+        let mut sched = AffineScheduler::default();
+        sched.block_until_import("s1", "w1", vec![aid(0)]);
+        sched.clear();
+        assert!(!sched.is_blocked_on_import("s1", "w1"), "clear drops the blocked map");
+    }
+
+    #[test]
+    fn reconcile_per_secondary_blocked_returns_orphans_keeps_healthy() {
+        // #652 C: a blocked entry on an UNREACHABLE secondary is an orphan; a
+        // blocked entry whose import cell is Queued/Done on a reachable secondary
+        // is healthy (its unblock is still coming); a blocked entry whose cell is
+        // NotDone (no terminal coming) is an orphan.
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        // healthy: cell Queued on reachable s1.
+        cells.set("s1", aid(0), SecondaryCell::Queued);
+        sched.block_until_import("s1", "healthy", vec![aid(0)]);
+        // orphan-A: dead (unreachable) secondary s_dead.
+        sched.block_until_import("s_dead", "orphan_dead", vec![aid(0)]);
+        // orphan-B: reachable s1 but cell NotDone (no terminal coming).
+        sched.block_until_import("s1", "orphan_lost", vec![aid(1)]);
+
+        let reachable = |s: &str| s == "s1";
+        let mut orphans = sched.reconcile_per_secondary_blocked(reachable, cells.of());
+        orphans.sort();
+        assert_eq!(orphans, vec!["orphan_dead".to_string(), "orphan_lost".to_string()]);
+        // The healthy one is kept; the orphans are removed.
+        assert!(sched.is_blocked_on_import("s1", "healthy"));
+        assert!(!sched.is_blocked_on_import("s_dead", "orphan_dead"));
+        assert!(!sched.is_blocked_on_import("s1", "orphan_lost"));
     }
 }

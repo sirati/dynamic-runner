@@ -582,6 +582,38 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
+    /// Push `item` to the FRONT of its `(phase, type, affinity)` bucket
+    /// WITHOUT touching the in-flight counter — the move primitive for the
+    /// 5-min reconcile arm (#652 concern C).
+    ///
+    /// Distinct from [`Self::requeue`]: requeue is the inverse of a DISPATCH
+    /// (the item WAS in flight, so it decrements the in-flight count). A
+    /// reconcile-moved item was NEVER in flight (it sat blocked / queued
+    /// waiting on an orphaned dep), so there is no in-flight count to undo —
+    /// decrementing here would corrupt a sibling's slot. The item is pushed to
+    /// the HEAD so the reconcile-surfaced work is re-evaluated before the rest of
+    /// its bucket; the [`Self::take_at_if_ready`] pop-time guard (#652 D.1) then
+    /// re-routes it (dispatch if its deps are in fact met, else re-block).
+    ///
+    /// Like `requeue`, a `Draining` phase is flipped back to `Active` so the
+    /// re-surfaced item is dispatchable.
+    pub fn push_to_queue_head(&mut self, item: Arc<TaskInfo<I>>) {
+        let phase_id = item.phase_id.clone();
+        let key = (
+            item.phase_id.clone(),
+            item.type_id.clone(),
+            affinity_key(&item),
+        );
+        self.buckets
+            .entry(key)
+            .or_insert_with(Bucket::new)
+            .items
+            .push_front(item);
+        if self.phase_state.get(&phase_id) == Some(&PhaseState::Draining) {
+            self.phase_state.insert(phase_id, PhaseState::Active);
+        }
+    }
+
     /// Re-inject an item whose previous attempt has already been
     /// finalised via `on_item_finished` (so it is no longer counted as
     /// in-flight). Pushes to the BACK of its bucket and, if the phase
@@ -687,6 +719,78 @@ impl<I: Identifier> PendingPool<I> {
                 bucket.pinned_workers.retain(|w| *w != worker_id);
             }
         }
+    }
+
+    /// 5-min reconcile sweep for the `blocked` map (#652 concern C) — the ONE
+    /// level-net that replaces the deleted per-task DispatchBackoff. A blocked
+    /// dependent is ORPHANED when one of its unmet deps will never resolve: the
+    /// dep is neither `completed` (the pool's own ledger) NOR alive per the
+    /// caller's `dep_alive` predicate (in-flight on a reachable secondary). Such
+    /// an entry's unblock event will never come — its dep's holder died, or a
+    /// completion was lost — so it would sit blocked forever (the dropped-task
+    /// net the deleted backoff used to recover).
+    ///
+    /// Each orphaned entry is REMOVED (its `blocked` / `dependents_of` /
+    /// `task_deps` / `blocked_per_phase` edges torn down identically to a normal
+    /// unblock) and its `TaskInfo` RETURNED so the caller pushes it to the
+    /// general-queue HEAD ([`Self::push_to_queue_head`]), where the idempotent
+    /// pop-time re-check (#652 D.1) re-routes it: dispatch if its deps are in
+    /// fact met now, else re-block. A blocked entry whose every unmet dep is
+    /// `completed`-or-alive is HEALTHY (its unblock is still coming) and is left
+    /// untouched.
+    ///
+    /// `dep_alive(dep_task_id)` is the caller-supplied "this dep is in-flight on
+    /// a reachable secondary" predicate (the manager owns the in-flight ledger +
+    /// roster). The pool ORs it with its own `completed_tasks` membership, so the
+    /// caller need only answer the in-flight half. Pure read of the caller's
+    /// predicate per unmet dep; no dep-resolution logic is re-implemented here
+    /// (the dep set is the same `task_deps` the ingest router built).
+    pub fn reconcile_blocked<P>(&mut self, dep_alive: P) -> Vec<Arc<TaskInfo<I>>>
+    where
+        P: Fn(&str) -> bool,
+    {
+        // Identify orphaned blocked ids: any whose `task_deps` set holds a dep
+        // that is neither completed nor alive. Collected first (the removal
+        // borrows `self` mutably and tears down edges).
+        let orphaned_ids: Vec<String> = self
+            .blocked
+            .keys()
+            .filter(|id| {
+                self.task_deps
+                    .get(*id)
+                    .is_some_and(|deps| {
+                        deps.iter().any(|dep| {
+                            !self.completed_tasks.contains(dep.as_str()) && !dep_alive(dep)
+                        })
+                    })
+            })
+            .cloned()
+            .collect();
+
+        let mut orphaned = Vec::new();
+        for id in orphaned_ids {
+            // Tear down the orphan's blocked-edges identically to a normal
+            // unblock (the `extract_live_dependent` blocked branch), then return
+            // its TaskInfo for general-queue-head re-routing.
+            let Some(item) = self.blocked.remove(&id) else {
+                continue;
+            };
+            if let Some(c) = self.blocked_per_phase.get_mut(&item.phase_id) {
+                *c = c.saturating_sub(1);
+            }
+            if let Some(deps) = self.task_deps.remove(&id) {
+                for dep in deps {
+                    if let Some(rev) = self.dependents_of.get_mut(&dep) {
+                        rev.retain(|d| d != &id);
+                        if rev.is_empty() {
+                            self.dependents_of.remove(&dep);
+                        }
+                    }
+                }
+            }
+            orphaned.push(item);
+        }
+        orphaned
     }
 
     /// Return the set of phases that just transitioned to `Drained`

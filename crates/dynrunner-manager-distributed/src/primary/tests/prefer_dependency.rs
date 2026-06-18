@@ -362,7 +362,7 @@ async fn armed_dispatch_of_prerequisite_refills_ready_pool() {
             // index 0) by taking the selected slot directly.
             let view = primary.dispatch_view_for_worker(0, true);
             let selection = view.select(0);
-            let taken = primary.pool_mut().take_selected(selection);
+            let taken = primary.pool_mut().take_selected(selection).expect("ready item dispatches (D.1)");
             assert_eq!(
                 taken.task_id, "prod_dep",
                 "the armed view's index-0 candidate is the prerequisite"

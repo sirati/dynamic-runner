@@ -77,7 +77,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // Owned consumption ticket — the view's last use,
                 // releasing the pool borrow for the take below.
                 let selection = view.select(binary_index);
-                let binary = self.pool_mut().take_selected(selection);
+                // Pop-time readiness re-check (#652 D.1): a not-ready item is
+                // re-blocked and yields `None`. The local manager never pushes
+                // a not-ready item to a bucket head (no reconcile arm — that is
+                // distributed-primary-only), so this is always `Some` here; the
+                // guard is the type contract, returning a no-op if it ever fired.
+                let Some(binary) = self.pool_mut().take_selected(selection) else {
+                    return;
+                };
                 self.total_assigned_resources.add(&estimated_usage);
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let name = binary

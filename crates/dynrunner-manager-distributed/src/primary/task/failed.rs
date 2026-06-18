@@ -328,16 +328,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         },
                     ])
                     .await;
-                    // The requeued binary is a pool-entry edge AND the
-                    // backpressured worker's slot just freed. EMIT a
-                    // `TasksAdded` so the worker-management recheck picks
-                    // it up (the recheck bypasses the per-secondary
-                    // backoff: the slot is genuinely free now — that's
-                    // what the terminal freed — so the freed worker, on
-                    // this OR any other secondary, is a valid target).
+                    // The requeued binary is a pool-entry edge. The recheck
+                    // signal it emits depends on WHY the task bounced (#652):
+                    //
+                    //   * GENUINE CAPACITY exhaustion ("No idle worker available"
+                    //     — the secondary's workers are busy with OTHER work): the
+                    //     secondary is at CAPACITY, so the recheck must NOT
+                    //     re-target it (re-dispatching to its just-freed model-slot
+                    //     would bounce again → recheck → the 24k-redispatch
+                    //     hot-loop, the general-dispatch sibling of the affine spin
+                    //     and the brake the deleted DispatchBackoff used to
+                    //     provide). Emit `TasksReadyBackpressureAware` → a
+                    //     bypass=FALSE recheck: the per-secondary gate skips ONLY
+                    //     the bounced secondary (other idle secondaries still take
+                    //     the task immediately); the bounced secondary resumes on
+                    //     its next REAL capacity event (a genuine terminal or a
+                    //     capacity-growth, both of which clear its flag) — the
+                    //     500ms timer is a pure bounded fallback.
+                    //   * EVERY OTHER bounce shape (worker pipe broken/respawning,
+                    //     no-fault preempt, reconciliation-loss, stale addressee
+                    //     gen): the secondary is NOT capacity-exhausted — its
+                    //     worker DIED / was preempted / the lease was stale — so it
+                    //     must recover PROMPTLY on the same secondary once its
+                    //     worker is back (it is the only place a respawned worker's
+                    //     local state lives). Emit a genuine `TasksAdded` →
+                    //     bypass=TRUE recheck (the unchanged pre-#652 behaviour),
+                    //     so the respawn/preempt recovery is not held behind the
+                    //     500ms window. The capacity hot-loop never arises for these
+                    //     shapes — they do not repeat per-tick like an at-capacity
+                    //     secondary does.
+                    //
                     // Decoupled emit, never a direct dispatch call.
-                    self.cluster_state
-                        .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+                    let signal = if error_message == "No idle worker available" {
+                        WorkerMgmtSignal::TasksReadyBackpressureAware
+                    } else {
+                        WorkerMgmtSignal::TasksAdded
+                    };
+                    self.cluster_state.emit_worker_mgmt(signal);
                 }
                 return;
             }
@@ -545,6 +572,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &task_hash) {
                 self.apply_and_broadcast_cluster_mutations(vec![m]).await;
             }
+            // PER-SECONDARY UNBLOCK on bounce (#652 concern B): a work blocked
+            // on this import here is waiting on a cell that just went `Queued →
+            // NotDone` (the import never ran). Re-enqueue it so it re-pops
+            // `StrandedHere` and re-derives the import on-demand — otherwise it
+            // would wait forever on a cell no terminal will ever flip `Done`
+            // (the bounce already consumed the only in-flight run). Reuses the
+            // cell-finished re-enqueue seam (it re-appends + re-gates uniformly).
+            if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+                self.reenqueue_affine_unblocked_on_cell(&secondary_id, affine_id)
+                    .await;
+            }
             tracing::debug!(
                 secondary = %secondary_id,
                 worker_id,
@@ -573,6 +611,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // whose overflow would drop dependents at scale.
             self.fast_fail_affine_dependents_if_unsatisfiable(&task_hash, command_rx)
                 .await;
+            // PER-SECONDARY BLOCKED RE-ROUTE on genuine fail (#652 concern B's
+            // import-FAIL edge): a work BLOCKED on this import HERE must not wait
+            // for the 5-min reconcile — its cell is now `Failed`, so drain it
+            // from the per-secondary blocked map and re-decide RIGHT NOW: re-route
+            // to a still-eligible secondary (clear its placement guard so the
+            // next placement pass re-derives it), or terminalize it if the import
+            // failed on every eligible secondary (the shared #648/#650 batch).
+            // The fast-fail above already terminalized the bucket entries of the
+            // globally-doomed dependents; this additionally clears their stale
+            // blocked-map overlay and re-routes the still-satisfiable ones.
+            if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
+                self.reroute_affine_blocked_on(&secondary_id, Some(affine_id), command_rx)
+                    .await;
+            }
             self.drop_supplanted_holder(&task_hash);
             // POOL TERMINAL-FAILURE MIRROR (the failed twin of the complete
             // path's `note_affine_terminal`). The per-secondary cell flip above

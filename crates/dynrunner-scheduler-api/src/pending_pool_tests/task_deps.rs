@@ -961,3 +961,48 @@ fn reinject_completed_dep_reblocks_cross_phase_dependent() {
         "P is not Drained — b is live-blocked work"
     );
 }
+
+/// #652 concern C: `reconcile_blocked` returns ONLY orphaned blocked entries
+/// (an unmet dep that is neither completed nor alive per the caller predicate),
+/// removing them + tearing down their edges; a healthy blocked entry (its unmet
+/// dep is alive / in-flight) is left untouched. The returned orphan is then
+/// re-routable via `push_to_queue_head` (the move primitive), where the
+/// pop-time re-check (D.1) re-blocks it if still not ready.
+#[test]
+fn reconcile_blocked_returns_only_orphans_keeps_healthy() {
+    // `dep` known (in batch) but never completed; `child` blocks on it.
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "dep", &[]),
+        t_with_id("P", "T", "", 1, "child", &["dep"]),
+    ])
+    .expect("valid extend");
+    // Take `dep` out so it is no longer queued (simulating it in-flight); the
+    // child stays blocked on it.
+    let _dep = p.pop_for_worker(1).expect("dep dispatches");
+
+    // dep_alive = true → child is HEALTHY (its dep is in-flight): not returned.
+    let kept = p.reconcile_blocked(|d| d == "dep");
+    assert!(kept.is_empty(), "a blocked entry whose dep is alive must be kept");
+
+    // dep_alive = false AND dep not completed → child is ORPHANED: returned +
+    // removed from blocked.
+    let orphans = p.reconcile_blocked(|_| false);
+    assert_eq!(orphans.len(), 1, "the orphaned blocked child must be returned");
+    assert_eq!(orphans[0].task_id, "child");
+
+    // Re-route the orphan to the general-queue head; the pop-time re-check
+    // re-blocks it (its dep is still not completed).
+    p.push_to_queue_head(std::sync::Arc::clone(&orphans[0]));
+    assert!(
+        p.pop_for_worker(2).is_none(),
+        "the re-routed orphan is still not ready → re-blocked on pop (D.1)"
+    );
+
+    // Completing the dep makes the child ready; it re-surfaces + dispatches.
+    p.on_item_finished(&phase("P"), Some("dep"));
+    assert!(
+        p.pop_for_worker(2).is_some(),
+        "once its dep completes, the reconciled child dispatches"
+    );
+}

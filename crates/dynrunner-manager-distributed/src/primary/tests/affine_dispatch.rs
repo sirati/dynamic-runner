@@ -3019,3 +3019,468 @@ async fn placement_waves_with_dead_import_do_not_grow_placed_but_unqueued() {
         })
         .await;
 }
+
+// ── #652 concern B: affine-dep-as-blocked (per-secondary) ──
+
+/// #652 B core: an affine-dep WORK task whose per-secondary import is NOT yet
+/// `Done` WAITS in the per-secondary blocked map (it is NOT enqueued + spun on
+/// the per-secondary queue, the old `InFlightHere => requeue_front` churn). It is
+/// enqueued + dispatched ONLY once its import cell flips `Done`. While it waits,
+/// its phase stays open (the blocked work is still its pool phase-drain token —
+/// owner requirement #3: a blocked-in-affine-map work must NOT let the phase
+/// drain prematurely).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_waits_blocked_until_import_finished() {
+    use dynrunner_scheduler_api::pending_pool::PhaseState;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            // First recheck wave: placement routes the build onto a secondary,
+            // its pop gates `StrandedHere` (import NotDone there), dispatches the
+            // IMPORT on-demand, and BLOCKS the build (does NOT enqueue/spin it).
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // Exactly the import dispatched in this wave — NOT the build (it is
+            // blocked, waiting on its per-secondary import cell).
+            let mut wave: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                wave.extend(assignments(rx));
+            }
+            assert!(
+                wave.iter().all(|(_, _, _, h)| *h != build_hash),
+                "the build must NOT dispatch before its import is Done; got {wave:?}"
+            );
+            let (import_sec, import_worker) = wave
+                .iter()
+                .find(|(_, _, _, h)| *h == import_hash)
+                .map(|(_, sec, w, _)| (sec.clone(), *w))
+                .expect("the import dispatched on-demand for the blocked build");
+
+            // The build is BLOCKED on its import on that secondary (not queued).
+            assert!(
+                primary.affine_is_blocked_on_import_for_test(&import_sec, &build_hash),
+                "the build must WAIT in the per-secondary blocked map on {import_sec}"
+            );
+            // Owner requirement #3: phase "work" must NOT drain while the build
+            // waits blocked — it is still a live pool item holding the phase open.
+            assert_ne!(
+                primary.pool().phase_state(&PhaseId::from("work")),
+                Some(PhaseState::Done),
+                "phase 'work' must stay open while a build is blocked-on-import"
+            );
+
+            // Complete the import on its secondary → cell `Done` → on_cell_finished
+            // unblocks + re-enqueues the build → it dispatches there.
+            primary
+                .handle_task_complete(
+                    task_complete(&import_sec, import_worker, &import_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+
+            // The build is no longer blocked (it was unblocked on cell-Finished).
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&import_sec, &build_hash),
+                "the build must be unblocked once its import is Done"
+            );
+            // And it dispatched (on the secondary whose import is now Done).
+            let mut after: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                after.extend(assignments(rx));
+            }
+            let build_dispatch = after.iter().find(|(_, _, _, h)| *h == build_hash);
+            assert!(
+                build_dispatch.is_some(),
+                "the build must dispatch once its import is Done; got {after:?}"
+            );
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .unwrap();
+            let (_, build_sec, _, _) = build_dispatch.unwrap();
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(build_sec, affine_id),
+                SecondaryCell::Done,
+                "the build dispatched only on a secondary whose import cell is Done"
+            );
+        })
+        .await;
+}
+
+/// #652 B acceptance signature: an IDLE secondary actually attempts affine work
+/// and triggers its OWN on-demand import — it does not sit idle while all builds
+/// concentrate on one secondary (the asm-dataset-nix symptom). With one build
+/// per secondary, BOTH secondaries' imports run (each node imports locally),
+/// proving the idle secondary received a share, popped it, and kicked its own
+/// import via the per-secondary blocked → on-demand path.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_idle_secondary_triggers_own_import() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build_0 = work_dep("build_0", "import");
+            let build_1 = work_dep("build_1", "import");
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build_0, build_1]);
+            confirm_two(&mut primary).await;
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .unwrap();
+
+            // Drive to quiescence, completing every dispatched IMPORT (so each
+            // secondary's cell can reach Done and its build can run).
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_secs: std::collections::HashSet<String> = Default::default();
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == import_hash {
+                        import_secs.insert(sec.clone());
+                    }
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // THE ACCEPTANCE SIGNATURE: BOTH secondaries ran the import — the
+            // formerly-idle secondary triggered its OWN on-demand import rather
+            // than staying idle while sec-0 took every build.
+            assert_eq!(
+                import_secs.len(),
+                2,
+                "BOTH secondaries must trigger their own import (idle-secondary \
+                 under-utilization fix); import ran on: {import_secs:?}"
+            );
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::Done,
+                    "the idle secondary {sec} imported locally (cell Done)"
+                );
+            }
+        })
+        .await;
+}
+
+/// #652 B import-FAIL edge (owner requirement): when a blocked build's import
+/// FAILS on its secondary but is still SATISFIABLE on another, the failure event
+/// drains the build from the per-secondary blocked map IMMEDIATELY and re-routes
+/// it — it does not strand until the 5-min reconcile. The build ultimately runs
+/// on the surviving secondary and the run completes.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_import_failed_reroutes_blocked_build() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            // ONE build → it is blocked on exactly one secondary at a time.
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            // Find where the import dispatched (the build is blocked there).
+            let mut wave: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                wave.extend(assignments(rx));
+            }
+            let (fail_sec, fail_worker) = wave
+                .iter()
+                .find(|(_, _, _, h)| *h == import_hash)
+                .map(|(_, sec, w, _)| (sec.clone(), *w))
+                .expect("import dispatched for the blocked build");
+            assert!(
+                primary.affine_is_blocked_on_import_for_test(&fail_sec, &build_hash),
+                "the build is blocked on {fail_sec} before the import fails"
+            );
+
+            // FAIL the import on that secondary (genuine terminal). The cell
+            // flips Failed, the import is still satisfiable on the OTHER
+            // secondary, so the blocked build must be drained + re-routed NOW.
+            primary
+                .handle_task_failed(task_failed(&fail_sec, fail_worker, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+            // The build is no longer blocked on the failed secondary.
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&fail_sec, &build_hash),
+                "the failed import must drain the blocked build from {fail_sec} immediately"
+            );
+
+            // Drive to quiescence, completing imports/builds. The build re-routes
+            // to the surviving secondary, its import runs there, and it completes.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "the re-routed build must complete on the surviving secondary"
+            );
+            assert!(
+                primary.run_complete_check(),
+                "the run completes after the import fails on one secondary + re-routes"
+            );
+        })
+        .await;
+}
+
+/// #652 concern C: the 5-min reconcile arm is the ORPHAN net for affine-blocked
+/// work. A build BLOCKED on a per-secondary import whose unblock event was LOST
+/// (its cell is neither Done nor Queued — e.g. the import's holder died without a
+/// terminal) is drained from the blocked map by `reconcile_orphaned_blocked_work`
+/// and its placement-dedup guard cleared, so the next placement pass re-routes
+/// it (instead of stranding forever). A still-healthy block (cell Queued —
+/// import in flight) is left untouched by the same sweep.
+#[tokio::test(flavor = "current_thread")]
+async fn reconcile_reroutes_orphaned_affine_blocked_work() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            // Find the secondary the build is blocked on (where its import ran).
+            let mut wave: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                wave.extend(assignments(rx));
+            }
+            let blocked_sec = wave
+                .iter()
+                .find(|(_, _, _, h)| *h == import_hash)
+                .map(|(_, sec, _, _)| sec.clone())
+                .expect("import dispatched for the blocked build");
+            assert!(primary.affine_is_blocked_on_import_for_test(&blocked_sec, &build_hash));
+            assert!(primary.affine_work_is_placed_for_test(&build_hash));
+
+            // HEALTHY case: the import cell is Queued (in flight) on a reachable
+            // secondary → reconcile keeps the block untouched.
+            primary.reconcile_orphaned_blocked_work().await;
+            assert!(
+                primary.affine_is_blocked_on_import_for_test(&blocked_sec, &build_hash),
+                "a healthy block (cell Queued, reachable) survives reconcile"
+            );
+
+            // LOST-EVENT: reset the import cell Queued → NotDone (the import's
+            // holder died without a terminal — no Finished/bounce will arrive).
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .unwrap();
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::SecondaryCellUnqueued {
+                    secondary: blocked_sec.clone(),
+                    cell_id: affine_id.0,
+                    generation: 1,
+                });
+
+            // Reconcile now sees an orphan (cell NotDone, no terminal coming):
+            // drains the block + clears the placement guard so it re-routes.
+            primary.reconcile_orphaned_blocked_work().await;
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&blocked_sec, &build_hash),
+                "the orphaned block must be drained by reconcile"
+            );
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "reconcile clears the orphan's placement guard so it re-routes"
+            );
+        })
+        .await;
+}
+
+// ── #652 backpressure-bounce hot-loop (general-dispatch sibling of the affine spin) ──
+
+/// A plain (non-affine) WORK task in phase "work" — the general-dispatch fixture
+/// for the backpressure-bounce tests.
+fn plain_work(name: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 20);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t
+}
+
+/// A CAPACITY-shaped backpressure `TaskFailed` ("No idle worker available") —
+/// the genuine at-capacity bounce the #652 hot-loop fix gates (distinct from the
+/// worker-respawn "worker pipe broken; respawning" shape, which recovers
+/// promptly). The secondary's workers are busy with OTHER work; it could not
+/// place this inbound assignment.
+fn task_failed_capacity(secondary: &str, worker: u32, task_hash: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: secondary.into(),
+        timestamp: 0.0,
+        secondary_id: secondary.into(),
+        worker_id: worker,
+        task_hash: task_hash.into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "No idle worker available".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    }
+}
+
+/// #652 backpressure hot-loop fix: a backpressure-bounced task must NOT be
+/// re-dispatched to the secondary that just bounced it (it is at capacity) —
+/// the bounce no longer drives a bypass-backpressure recheck that re-targets the
+/// full secondary (the 24k-redispatch hot-loop). With one secondary + one task,
+/// the bounce requeues the task and the recheck leaves it queued (the bounced
+/// secondary is gated), instead of bouncing it forever.
+#[tokio::test(flavor = "current_thread")]
+async fn backpressure_bounce_does_not_redispatch_to_same_full_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let task = plain_work("t0");
+            let task_hash = compute_task_hash(&task);
+
+            // One secondary, one worker.
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![task]);
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            // (sec-1 is NOT confirmed — the task can only go to sec-0.)
+
+            // Initial dispatch: the task goes to sec-0's worker.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut first: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                first.extend(assignments(rx));
+            }
+            let (_, sec, worker, _) = first
+                .iter()
+                .find(|(_, _, _, h)| *h == task_hash)
+                .cloned()
+                .expect("the task dispatched to sec-0");
+            assert_eq!(sec, "sec-0");
+
+            // sec-0 BACKPRESSURE-bounces it (no idle worker). The task requeues;
+            // sec-0 is flagged backpressured.
+            primary
+                .handle_task_failed(task_failed_capacity(&sec, worker, &task_hash), &mut None)
+                .await;
+            settle_pump().await;
+            // The bounce-emitted recheck must NOT re-target the full sec-0.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut after: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                after.extend(assignments(rx));
+            }
+            assert!(
+                after.iter().all(|(_, s, _, _)| s != "sec-0"),
+                "the bounced task must NOT be re-dispatched to the at-capacity \
+                 sec-0 (the hot-loop fix); got {after:?}"
+            );
+        })
+        .await;
+}
+
+/// #652 backpressure fix point 3: a bounced task is re-dispatched to a DIFFERENT
+/// idle secondary IMMEDIATELY (the per-secondary gate skips only the bounced
+/// one, not the whole pool). sec-0 bounces; sec-1 is idle → the task lands there.
+#[tokio::test(flavor = "current_thread")]
+async fn backpressure_bounce_redispatches_to_other_idle_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let task = plain_work("t0");
+            let task_hash = compute_task_hash(&task);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![task]);
+            confirm_two(&mut primary).await;
+
+            // Initial dispatch lands the single task on one secondary.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut first: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                first.extend(assignments(rx));
+            }
+            let (_, first_sec, worker, _) = first
+                .iter()
+                .find(|(_, _, _, h)| *h == task_hash)
+                .cloned()
+                .expect("the task dispatched");
+
+            // That secondary bounces it. The OTHER secondary is idle, so the
+            // requeued task must re-dispatch THERE immediately.
+            primary
+                .handle_task_failed(
+                    task_failed_capacity(&first_sec, worker, &task_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut after: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                after.extend(assignments(rx));
+            }
+            let redispatch = after.iter().find(|(_, _, _, h)| *h == task_hash);
+            assert!(
+                redispatch.is_some(),
+                "the bounced task must re-dispatch to the OTHER idle secondary \
+                 immediately; got {after:?}"
+            );
+            let (_, new_sec, _, _) = redispatch.unwrap();
+            assert_ne!(
+                *new_sec, first_sec,
+                "the re-dispatch must go to a DIFFERENT secondary than the bounced one"
+            );
+        })
+        .await;
+}
