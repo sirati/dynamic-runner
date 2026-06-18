@@ -45,14 +45,15 @@ where
     /// originates NO CRDT mutation and drives NO phase machine — the
     /// same-peer `PrimaryCoordinator` owns authoritative accounting,
     /// reached via the `send_to_primary` loopback.
-    // TODO(affine-reimpl): `_factory` is currently unused here — the affine
-    // gate-body intercept that consumed it was removed. The signature is kept
-    // so callers (and the affine rebuild) need not re-thread it.
+    // `factory` is the worker factory the operational loop owns; this
+    // handler uses it (on the failure arms) to read the dying worker's
+    // captured stdout/stderr tail and splice it onto the failure report's
+    // `error_message` so the consumer can see WHY the task failed.
     pub(in crate::secondary) async fn handle_worker_event(
         &mut self,
         event: WorkerEvent<I>,
         oom_watcher: &OomWatcher,
-        _factory: &mut impl WorkerFactory<M>,
+        factory: &mut impl WorkerFactory<M>,
     ) -> Result<Option<WorkerId>, String> {
         // Generation gate (root fix for the type-shift-respawn wedge).
         //
@@ -212,9 +213,18 @@ where
                             worker_id,
                             task_hash: hash.clone(),
                             error_type,
-                            error_message: result
-                                .error_message
-                                .unwrap_or_else(|| "Unknown error".into()),
+                            // Splice the worker process's stdout/stderr tail
+                            // onto the failure text so the consumer can see
+                            // WHY the task raised (an interpreter traceback,
+                            // a native fault, a bare print) — not just the
+                            // wire `error_message`. The factory owns the
+                            // capture-file location; we only ask + splice.
+                            error_message: dynrunner_manager_local::append_stdio_tail(
+                                result
+                                    .error_message
+                                    .unwrap_or_else(|| "Unknown error".into()),
+                                factory.worker_stdio_tail(worker_id),
+                            ),
                             // Stamped at the send_to_primary chokepoint (#352).
                             delivery_seq: None,
                             // Stamped at the send_to_primary chokepoint (ordering gate).
@@ -435,7 +445,17 @@ where
                         worker_id,
                         task_hash: hash,
                         error_type: wire_error_type,
-                        error_message: wire_error_message,
+                        // A disconnect means the worker process DIED without
+                        // sending a clean wire error, so its last
+                        // stdout/stderr is the only evidence of WHY. Splice
+                        // the captured tail onto the synthesised failure text
+                        // (read here, BEFORE the outer loop's restart replaces
+                        // the slot, so the dead process's capture file is
+                        // still on disk). The factory owns the file location.
+                        error_message: dynrunner_manager_local::append_stdio_tail(
+                            wire_error_message,
+                            factory.worker_stdio_tail(worker_id),
+                        ),
                         // Stamped at the send_to_primary chokepoint (#352).
                         delivery_seq: None,
                         // Stamped at the send_to_primary chokepoint (ordering gate).

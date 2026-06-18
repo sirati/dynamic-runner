@@ -51,13 +51,10 @@
 //! * [`queries`] — read-only accessors (`len`, `is_empty`, `iter`,
 //!   `is_run_complete`, `active_phases`, `phase_state`, `in_flight`)
 //!   plus the queued-side primitives `retain`,
-//!   `update_first_match_in_place`, `take_first_match`.
-//! * [`backoff`] — the per-task re-dispatch backoff state
-//!   ([`DispatchBackoff`](backoff::DispatchBackoff)): stamped on
-//!   `requeue`/`reinject`, consulted by the dispatch read paths,
-//!   surfaced to managers via `next_dispatch_backoff_expiry`.
+//!   `update_first_match_in_place`, `take_first_match`, and the
+//!   manager's phase-drain re-surface re-poll cadence
+//!   ([`PHASE_RESURFACE_REPOLL_INTERVAL`](queries::PHASE_RESURFACE_REPOLL_INTERVAL)).
 
-mod backoff;
 mod dispatch;
 mod extend;
 mod lifecycle;
@@ -68,7 +65,6 @@ mod reservation;
 mod types;
 mod view;
 
-pub use backoff::{DISPATCH_BACKOFF_BASE, DISPATCH_BACKOFF_CAP};
 pub use partition::IngestPartition;
 pub use pool::PendingPool;
 pub use reservation::ReservationKey;

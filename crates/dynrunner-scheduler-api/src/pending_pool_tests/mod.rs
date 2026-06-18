@@ -13,7 +13,6 @@ pub(super) use dynrunner_core::{
 };
 
 mod bucket_dispatch;
-mod dispatch_backoff;
 mod dispatch_rank;
 mod partition;
 mod phase_graph;
