@@ -610,6 +610,111 @@ fn same_phase_work_plus_affine_drains_on_work_completion() {
     );
 }
 
+/// AFFINE-TERMINAL MIRROR — OPT-2 (sticky global terminal): an affine import's
+/// GLOBAL terminal must NOT be un-completed by a reinject. A `SecondaryAffine`
+/// token has no regenerable global output (its dependents' readiness is the
+/// per-secondary bitvector), so `reinject` must leave its `completed_tasks`
+/// entry intact and NOT re-block its dependents — the
+/// `reblock_dependents_on_uncompleted` skip for `affine_prereq_ids`.
+///
+/// Pre-fix: the reinject un-completed the affine, Gate B
+/// (`phase_has_live_affine_prereq`) flipped back TRUE, and the import phase was
+/// held live forever (the lost-mirror strand). Post-fix Gate B stays FALSE.
+#[test]
+fn affine_global_terminal_is_sticky_across_reinject() {
+    use dynrunner_core::{TaskInfo, TaskKind};
+
+    let mut import: TaskInfo<()> = t("import", "T", "", 1);
+    import.task_id = "import-id".to_string();
+    import.kind = TaskKind::SecondaryAffine;
+
+    let mut p = pool_with(&["import"], &[]);
+    p.mark_affine_prereqs(["import-id".to_string()]);
+    p.extend([import.clone()]).expect("valid extend");
+
+    // The import terminals globally — recorded in the pool's completed set, so
+    // Gate B is FALSE for the import phase.
+    p.note_affine_terminal(&phase("import"), "import-id");
+    assert!(
+        !p.phase_has_live_affine_prereq_for_test(&phase("import")),
+        "Gate B is clear after the import's global terminal"
+    );
+
+    // Reinject the SAME affine token (an operator/spawn-batch reinject funnels
+    // through `reblock_dependents_on_uncompleted`). OPT-2 skips the
+    // un-complete for the affine id, so Gate B MUST stay FALSE.
+    p.reinject(std::sync::Arc::new(import));
+    assert!(
+        !p.phase_has_live_affine_prereq_for_test(&phase("import")),
+        "OPT-2: an affine global terminal is sticky — reinject must NOT \
+         un-complete it (Gate B stays clear)"
+    );
+}
+
+/// AFFINE-TERMINAL MIRROR — #617 preserved: a genuinely NON-terminal affine
+/// import (never run, neither completed nor failed) must KEEP Gate B held. The
+/// mirror fixes only converge the pool to the GLOBAL terminal truth; they must
+/// not relax the guard for an import that has not reached any terminal.
+#[test]
+fn affine_non_terminal_holds_gate_b() {
+    use dynrunner_core::{TaskInfo, TaskKind};
+
+    let mut import: TaskInfo<()> = t("import", "T", "", 1);
+    import.task_id = "import-id".to_string();
+    import.kind = TaskKind::SecondaryAffine;
+
+    let mut p = pool_with(&["import"], &[]);
+    p.mark_affine_prereqs(["import-id".to_string()]);
+    p.extend([import]).expect("valid extend");
+
+    // No terminal recorded — the import is genuinely live.
+    assert!(
+        p.phase_has_live_affine_prereq_for_test(&phase("import")),
+        "#617: a never-run affine import holds Gate B (genuinely non-terminal)"
+    );
+}
+
+/// AFFINE-TERMINAL MIRROR — failed-path twin: a genuinely-FAILED affine import
+/// (recorded via `note_affine_failed`, the global all-`Failed` terminal) must
+/// clear Gate B so its phase can drain past it. Pre-fix the failed path
+/// recorded NOTHING in the pool, so a globally-failed affine held Gate B
+/// forever (the failed-terminal twin of the missing complete-path mirror).
+#[test]
+fn affine_global_failure_clears_gate_b_and_drains() {
+    use dynrunner_core::{TaskInfo, TaskKind};
+
+    let mut import: TaskInfo<()> = t("import", "T", "", 1);
+    import.task_id = "import-id".to_string();
+    import.kind = TaskKind::SecondaryAffine;
+
+    let mut p = pool_with(&["import"], &[]);
+    p.mark_affine_prereqs(["import-id".to_string()]);
+    p.extend([import]).expect("valid extend");
+
+    // The import phase is held Active by Gate B while the import is live.
+    p.drain_empty_active_phases();
+    assert_eq!(p.phase_state(&phase("import")), Some(PhaseState::Active));
+    assert!(p.phase_has_live_affine_prereq_for_test(&phase("import")));
+
+    // The import reaches its GLOBAL terminal-FAILURE (failed on every eligible
+    // secondary). `note_affine_failed` records it in the pool's failed set and
+    // re-runs the drain transition.
+    p.note_affine_failed(&phase("import"), "import-id");
+    assert!(
+        !p.phase_has_live_affine_prereq_for_test(&phase("import")),
+        "failed-path: a globally-failed affine clears Gate B"
+    );
+    assert_eq!(
+        p.phase_state(&phase("import")),
+        Some(PhaseState::Drained),
+        "the import phase drains once its import reaches a global terminal failure"
+    );
+    assert!(
+        p.poll_drain_transitions().contains(&phase("import")),
+        "the drain edge for the now-failed import phase is emitted"
+    );
+}
+
 /// PHASE-DRAIN LEVEL-NET (a): a phase driven genuinely all-clear (terminal
 /// work, no live affine, predecessors done) whose drain SURFACE was lost — the
 /// `Drained` transition fired and was consumed off `drained_pending` by

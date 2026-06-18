@@ -557,6 +557,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
+    /// Whether one affine IMPORT (`affine_id`) can no longer run anywhere — its
+    /// cell is `Failed` on EVERY eligible roster secondary, with none left where
+    /// it is placeable (`Done`/`Queued`/`NotDone`). The import-level twin of
+    /// [`Self::affine_unit_satisfiable_secondaries`] (which asks the same
+    /// roster question for a WORK unit's full dep set): an all-`Failed` import
+    /// has reached its GLOBAL terminal-failure and must be recorded in the
+    /// pool's terminal set so its phase's affine guard clears (the
+    /// strand-forever otherwise). Reads the roster, not just the bitvector's
+    /// written cells, so a fresh all-`NotDone` secondary still counts as
+    /// placeable (the import is NOT yet globally failed).
+    pub(super) fn affine_import_globally_failed(&self, affine_id: SecondaryCellId) -> bool {
+        let secondaries = self.affine_placement_secondaries();
+        // An empty roster is not a global FAILURE — the import simply has no
+        // secondary to run on yet (a transient bring-up window); treat it as
+        // not-globally-failed so a momentarily-empty roster never records a
+        // spurious terminal.
+        !secondaries.is_empty()
+            && secondaries
+                .iter()
+                .all(|sec| self.cluster_state.affine_state(sec, affine_id) == SecondaryCell::Failed)
+    }
+
     /// Re-place `placement`'s still-not-done prereqs + the work onto `target`'s
     /// per-secondary queue (the design's "re-derive and re-queue the missing
     /// affine deps") and re-nudge the recheck so the freshly-queued import is
