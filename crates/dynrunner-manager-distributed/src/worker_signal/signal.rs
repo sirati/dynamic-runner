@@ -37,6 +37,22 @@ pub enum WorkerMgmtSignal {
     /// assigned. Carries no payload — the recheck reads the current
     /// task view itself.
     TasksAdded,
+    /// Work re-entered the pool from a per-secondary BACKPRESSURE BOUNCE — a
+    /// secondary refused an assignment because it had no idle worker (it is at
+    /// CAPACITY), so the task was requeued. Worker management re-checks like
+    /// [`Self::TasksAdded`] BUT does NOT bypass the per-secondary backpressure
+    /// gate: a bounce is the OPPOSITE of a capacity event, so the bounced
+    /// secondary must NOT be re-targeted until it emits a real capacity event (a
+    /// genuine terminal, which clears its backpressure flag). The per-secondary
+    /// gate is per-secondary, so OTHER idle secondaries still receive the
+    /// requeued task immediately — only the at-capacity one waits.
+    ///
+    /// This is the brake that replaces the deleted per-task DispatchBackoff for
+    /// the GENERAL-dispatch bounce (#652): without it, a bounce's `TasksAdded`
+    /// drove a bypass-backpressure recheck that re-targeted the full secondary →
+    /// bounce → recheck → self-sustaining hot-loop. Distinct from `TasksAdded` so
+    /// the 47 genuine capacity-event emit sites keep their (correct) bypass.
+    TasksReadyBackpressureAware,
     /// A phase started and needs at least `min` workers to make
     /// progress. Worker management uses this to drive scale-up toward
     /// the phase's floor.

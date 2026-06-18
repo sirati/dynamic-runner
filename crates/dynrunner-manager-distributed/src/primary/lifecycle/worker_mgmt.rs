@@ -54,6 +54,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         let mut tasks_added = false;
+        let mut bp_aware_ready = false;
         for signal in batch.signals {
             match signal {
                 // Coalesce: a batch may carry several `TasksAdded`
@@ -62,6 +63,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // every just-spawned task is in the pool first.
                 WorkerMgmtSignal::TasksAdded => {
                     tasks_added = true;
+                }
+                // A backpressure-bounce requeue (#652): re-check, but do NOT
+                // bypass the per-secondary backpressure gate (a bounce is the
+                // opposite of a capacity event). Coalesced into the SAME single
+                // recheck below; the bypass flag is `tasks_added` (true only if a
+                // genuine capacity event also shared this batch), so a batch
+                // carrying ONLY backpressure-aware signals runs `bypass=false`.
+                WorkerMgmtSignal::TasksReadyBackpressureAware => {
+                    bp_aware_ready = true;
                 }
                 WorkerMgmtSignal::PhaseStartedNeedsWorkers { phase, min } => {
                     self.handle_phase_started_needs_workers(&phase, min);
@@ -83,13 +93,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
             }
         }
-        if tasks_added {
-            // A genuine `TasksAdded` recheck BYPASSES the per-secondary
-            // backpressure backoff: circumstances changed (new work
-            // entered the pool, or a worker freed elsewhere), so a freed
-            // slot on a recently-backpressured secondary is a valid
-            // dispatch target again. The OOM single-worker mask is NOT
-            // bypassed (that one is correctness, not a rate-limit).
+        if tasks_added || bp_aware_ready {
+            // One coalesced recheck for either trigger. The per-secondary
+            // backpressure gate is BYPASSED only for a genuine capacity event
+            // (`tasks_added`): circumstances changed (new work entered the pool,
+            // or a worker freed elsewhere), so a freed slot on a recently-
+            // backpressured secondary is a valid dispatch target again. A
+            // BACKPRESSURE-BOUNCE requeue (`bp_aware_ready` alone) does NOT
+            // bypass — the bounced secondary is at capacity, so the per-secondary
+            // gate (per-secondary, so OTHER idle secondaries still receive the
+            // requeued task) must skip it until it emits a real capacity event
+            // (a genuine terminal clears its backpressure flag). This is the
+            // brake that replaces the deleted per-task DispatchBackoff for the
+            // general-dispatch bounce (#652): without it, the bounce's recheck
+            // re-targeted the full secondary → bounce → recheck → hot-loop. The
+            // OOM single-worker mask is NOT bypassed either way (correctness,
+            // not a rate-limit).
+            let bypass_backpressure = tasks_added;
             // Affine placement runs BEFORE the worker recheck so the
             // per-secondary queues it populates are drained by the SAME
             // recheck's per-secondary-first pop (placement emits only cell
@@ -116,7 +136,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Send failures are logged + rolled back inside the recheck;
             // `.ok()` swallows the transient so the reaction can't abort
             // the loop.
-            self.dispatch_to_idle_workers(true).await.ok();
+            self.dispatch_to_idle_workers(bypass_backpressure).await.ok();
             // Setup-task dispatch: the symmetric SELECTION pass for
             // `TaskKind::Setup` tasks (a setup task entering the pool emits
             // the same `TasksAdded`). Routes each setup task whose affinity
@@ -191,6 +211,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// worker becoming ready after its phase's assignment) converge here.
     pub(crate) fn react_to_capacity_growth(&mut self) {
         self.reconstruct_workers_from_cluster_state();
+        // Capacity-growth is a REAL capacity-restoring event (#652): a secondary
+        // that returned backpressure ("no idle worker") and then gained a fresh
+        // worker is no longer at capacity, so its backpressure flag must clear on
+        // THIS event — not wait out the 500ms timer (which must stay a pure
+        // bounded FALLBACK, never the load-bearing clear). The backpressure
+        // premise is "no idle worker"; after the rebuild, any secondary that now
+        // HAS an idle worker has falsified that premise, so its flag is cleared.
+        // This is the capacity-growth twin of the TaskComplete clear
+        // (complete.rs) — every real capacity-restoring event clears the flag, so
+        // the dispatch recheck below (emitted via `TasksAdded`) can target the
+        // restored secondary immediately. Self-correcting + precise: a secondary
+        // that gained no idle slot keeps its flag.
+        let restored: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|w| w.is_idle())
+            .map(|w| w.secondary_id.clone())
+            .filter(|sec| self.backpressured_secondaries.contains_key(sec))
+            .collect();
+        for sec in restored {
+            self.backpressured_secondaries.remove(&sec);
+        }
         self.cluster_state
             .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
     }

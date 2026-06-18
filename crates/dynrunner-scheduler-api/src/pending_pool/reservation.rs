@@ -154,9 +154,9 @@ impl TaskReservation {
     /// worker took it). Drop its holder entry; the window closes the
     /// moment the last reserved task drains, so the overlay is
     /// self-maintaining across the normal confirm→dispatch path with no
-    /// explicit close call. Mirrors `DispatchBackoff::note_taken`'s slot
-    /// in `take_at` — called via a disjoint `self.reservation` field
-    /// borrow so the live bucket borrow there stays valid.
+    /// explicit close call. Called from `take_at` via a disjoint
+    /// `self.reservation` field borrow so the live bucket borrow there
+    /// stays valid.
     pub(super) fn note_taken(&mut self, key: &ReservationKey) {
         if !self.active {
             return;

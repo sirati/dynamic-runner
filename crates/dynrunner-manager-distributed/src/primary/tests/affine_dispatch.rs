@@ -3340,3 +3340,147 @@ async fn reconcile_reroutes_orphaned_affine_blocked_work() {
         })
         .await;
 }
+
+// ── #652 backpressure-bounce hot-loop (general-dispatch sibling of the affine spin) ──
+
+/// A plain (non-affine) WORK task in phase "work" — the general-dispatch fixture
+/// for the backpressure-bounce tests.
+fn plain_work(name: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 20);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t
+}
+
+/// A CAPACITY-shaped backpressure `TaskFailed` ("No idle worker available") —
+/// the genuine at-capacity bounce the #652 hot-loop fix gates (distinct from the
+/// worker-respawn "worker pipe broken; respawning" shape, which recovers
+/// promptly). The secondary's workers are busy with OTHER work; it could not
+/// place this inbound assignment.
+fn task_failed_capacity(secondary: &str, worker: u32, task_hash: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: secondary.into(),
+        timestamp: 0.0,
+        secondary_id: secondary.into(),
+        worker_id: worker,
+        task_hash: task_hash.into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "No idle worker available".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    }
+}
+
+/// #652 backpressure hot-loop fix: a backpressure-bounced task must NOT be
+/// re-dispatched to the secondary that just bounced it (it is at capacity) —
+/// the bounce no longer drives a bypass-backpressure recheck that re-targets the
+/// full secondary (the 24k-redispatch hot-loop). With one secondary + one task,
+/// the bounce requeues the task and the recheck leaves it queued (the bounced
+/// secondary is gated), instead of bouncing it forever.
+#[tokio::test(flavor = "current_thread")]
+async fn backpressure_bounce_does_not_redispatch_to_same_full_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let task = plain_work("t0");
+            let task_hash = compute_task_hash(&task);
+
+            // One secondary, one worker.
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![task]);
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            // (sec-1 is NOT confirmed — the task can only go to sec-0.)
+
+            // Initial dispatch: the task goes to sec-0's worker.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut first: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                first.extend(assignments(rx));
+            }
+            let (_, sec, worker, _) = first
+                .iter()
+                .find(|(_, _, _, h)| *h == task_hash)
+                .cloned()
+                .expect("the task dispatched to sec-0");
+            assert_eq!(sec, "sec-0");
+
+            // sec-0 BACKPRESSURE-bounces it (no idle worker). The task requeues;
+            // sec-0 is flagged backpressured.
+            primary
+                .handle_task_failed(task_failed_capacity(&sec, worker, &task_hash), &mut None)
+                .await;
+            settle_pump().await;
+            // The bounce-emitted recheck must NOT re-target the full sec-0.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut after: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                after.extend(assignments(rx));
+            }
+            assert!(
+                after.iter().all(|(_, s, _, _)| s != "sec-0"),
+                "the bounced task must NOT be re-dispatched to the at-capacity \
+                 sec-0 (the hot-loop fix); got {after:?}"
+            );
+        })
+        .await;
+}
+
+/// #652 backpressure fix point 3: a bounced task is re-dispatched to a DIFFERENT
+/// idle secondary IMMEDIATELY (the per-secondary gate skips only the bounced
+/// one, not the whole pool). sec-0 bounces; sec-1 is idle → the task lands there.
+#[tokio::test(flavor = "current_thread")]
+async fn backpressure_bounce_redispatches_to_other_idle_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let task = plain_work("t0");
+            let task_hash = compute_task_hash(&task);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![task]);
+            confirm_two(&mut primary).await;
+
+            // Initial dispatch lands the single task on one secondary.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut first: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                first.extend(assignments(rx));
+            }
+            let (_, first_sec, worker, _) = first
+                .iter()
+                .find(|(_, _, _, h)| *h == task_hash)
+                .cloned()
+                .expect("the task dispatched");
+
+            // That secondary bounces it. The OTHER secondary is idle, so the
+            // requeued task must re-dispatch THERE immediately.
+            primary
+                .handle_task_failed(
+                    task_failed_capacity(&first_sec, worker, &task_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut after: Vec<(String, String, u32, String)> = Vec::new();
+            for (_id, rx, _tx) in ends.iter_mut() {
+                after.extend(assignments(rx));
+            }
+            let redispatch = after.iter().find(|(_, _, _, h)| *h == task_hash);
+            assert!(
+                redispatch.is_some(),
+                "the bounced task must re-dispatch to the OTHER idle secondary \
+                 immediately; got {after:?}"
+            );
+            let (_, new_sec, _, _) = redispatch.unwrap();
+            assert_ne!(
+                *new_sec, first_sec,
+                "the re-dispatch must go to a DIFFERENT secondary than the bounced one"
+            );
+        })
+        .await;
+}
