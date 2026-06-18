@@ -34,6 +34,7 @@ const ARM_SETTLED_SPILL: usize = 13;
 const ARM_PULL: usize = 14;
 const ARM_PERSISTENT_DIAL_FAILURE: usize = 15;
 const ARM_DISCOVERY: usize = 16;
+const ARM_PHASE_RESURFACE: usize = 17;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -55,6 +56,7 @@ pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
     "pull",
     "persistent_dial_failure",
     "discovery",
+    "phase_resurface",
 ];
 
 /// Follow-on batch-drain cap for the inbox arm (#491, mirrored from the
@@ -833,6 +835,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // borrow `self`.
             let task_backoff_due = self.next_task_dispatch_backoff_expiry();
 
+            // Phase-drain re-surface wake deadline, recomputed each
+            // iteration from the pool's PERSISTENT drain state (the same
+            // persistent-deadline law as `task_backoff_due` — an absolute
+            // instant, never a relative sleep, so it survives a sibling arm
+            // winning every iteration). `Some(now + bounded interval)` while
+            // a phase is stranded short of its drain edge
+            // (`phases_stuck_drainable` non-empty), `None` otherwise → the
+            // arm parks on `pending()` and DISARMS (no hot-spin). Computed
+            // OUTSIDE the `select!` so the arm's future does not borrow
+            // `self`.
+            let phase_resurface_due = self.next_phase_resurface_expiry();
+
             // Cancellation safety: `transport.recv_peer` is the
             // mpsc-backed unified inbound demux (cancel-safe — see
             // `TunneledPeerTransport::recv_peer`). The two timer
@@ -1538,6 +1552,46 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     arm_stats.record(ARM_TASK_BACKOFF);
                     self.cluster_state
                         .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+                }
+                // Phase-drain re-surface wake. `phase_resurface_due`
+                // (computed at the top of this iteration) is `Some` only
+                // while a phase is stranded short of its drain edge — a
+                // persistent absolute deadline, so parking on the instant
+                // survives sibling arms winning every iteration (the
+                // watchdog law). `process_phase_lifecycle` is purely
+                // event-driven; when its driving event stream (the
+                // completion hooks) has gone silent, a phase left all-clear
+                // but un-surfaced (the never-flipped transient) or
+                // `Drained`-but-not-`Done` (a flipped-then-consumed race) by
+                // its last event would strand forever — this LEVEL-trigger
+                // recovers it. The drain-edge analogue of `ARM_TASK_BACKOFF`.
+                // When `phase_resurface_due` is `None` the arm parks on
+                // `pending()` → DISARMED, no hot-spin; while a phase is
+                // legitimately undrainable (a live affine import, unfinished
+                // predecessors) it re-checks once per bounded interval and
+                // holds the phase, never advancing it.
+                //
+                // The arm fires ONLY when no sibling arm is ready (the event
+                // stream is idle) — so NO `process_phase_lifecycle` cascade is
+                // in flight here. That is the safe context to recover the
+                // flipped-then-`Drained`-but-not-`Done` strand
+                // (`resurface_drained_pending`, re-pushed onto
+                // `drained_pending`): doing it inline during an active cascade
+                // would re-enter the drained-block per queued command and
+                // recurse unboundedly, so it is confined to this idle arm. The
+                // subsequent `process_phase_lifecycle` then re-flips the
+                // never-flipped transient (its inline `drain_empty_active_phases`)
+                // AND consumes the just-re-pushed Drained phase through the
+                // existing `on_phase_end` / `mark_phase_done` block.
+                _ = async {
+                    match phase_resurface_due {
+                        Some(due) => tokio::time::sleep_until(due.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_PHASE_RESURFACE);
+                    self.pool_mut().resurface_drained_pending();
+                    self.process_phase_lifecycle(&mut command_rx).await;
                 }
             }
         }

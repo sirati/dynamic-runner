@@ -3186,6 +3186,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .and_then(|p| p.next_dispatch_backoff_expiry())
     }
 
+    /// The operational loop's phase-drain re-surface wake deadline — a
+    /// BOUNDED level-trigger that re-enters `process_phase_lifecycle` when the
+    /// event stream that ordinarily drives it has gone silent.
+    ///
+    /// `process_phase_lifecycle` is purely event-driven (its only callers are
+    /// the bootstrap cascade and the `note_item_*` / `note_affine_terminal`
+    /// completion hooks). A phase whose LAST event left it all-clear but
+    /// stranded short of its drain edge (a momentarily-unsettled counter at
+    /// that instant, or a flipped-`Drained`-then-consumed race) has no further
+    /// event to re-surface it — the drain-edge analogue of the #640 dispatch
+    /// deadlock the `task_backoff` arm fixes. While the pool reports any such
+    /// phase ([`PendingPool::phases_stuck_drainable`]) this returns
+    /// `Some(now + repoll_interval)` so the level-trigger arm re-enters the
+    /// cascade; when none remain (or the pool is not yet initialised) it
+    /// returns `None` and the arm parks on `pending()` — DISARMED, no
+    /// hot-spin. The interval is the SAME bounded re-poll cadence the
+    /// per-task backoff level-trigger uses ([`PendingPool::dispatch_repoll_interval`]),
+    /// so a legitimately-undrainable phase is re-checked once per interval
+    /// rather than spun on. A PERSISTENT (absolute) deadline recomputed each
+    /// loop iteration, exactly like [`Self::next_task_dispatch_backoff_expiry`].
+    pub(super) fn next_phase_resurface_expiry(&self) -> Option<std::time::Instant> {
+        let pool = self.pending.as_ref()?;
+        if pool.phases_stuck_drainable().is_empty() {
+            None
+        } else {
+            Some(std::time::Instant::now() + pool.dispatch_repoll_interval())
+        }
+    }
+
     /// #519 ready-pool-depth multiplier: the per-recheck dispatch bias is
     /// armed only while the count of READY (deps-met, dispatchable) tasks is
     /// strictly below `PREFER_DEPENDENCY_READY_MULTIPLIER × |total fleet
@@ -6649,6 +6678,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if self.drive_soft_finalize_deadlock(command_rx).await {
                     continue;
                 }
+                // Still nothing through the ordinary poll. Restore the
+                // phase-drain LEVEL-NET: a phase whose LAST mutating event left
+                // it all-clear but stranded short of its drain edge has no
+                // further event to re-surface it (the drain-edge analogue of
+                // the #640 dispatch deadlock). Re-evaluates the SAME drain
+                // gates, relaxes none (an affine-only phase whose import has
+                // not run stays held). If anything surfaced, re-enter so the
+                // EXISTING `poll_drain_transitions` → `on_phase_end` /
+                // `phase_can_proceed` / `mark_phase_done` block processes it
+                // unchanged — no duplicated per-phase decision. Inline this
+                // recovers ONLY the never-flipped transient (recursion-safe —
+                // see the helper); the flipped-then-`Drained`-but-not-`Done`
+                // strand is recovered by the idle `ARM_PHASE_RESURFACE` path.
+                if self.resurface_stuck_drainable_phases() {
+                    continue;
+                }
                 break;
             }
             for p in &drained {
@@ -6969,6 +7014,70 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             acted = true;
         }
         acted
+    }
+
+    /// Restore the phase-drain LEVEL-NET: re-surface any phase that should
+    /// have reached the manager's drain edge but is stranded short of it
+    /// after its last event.
+    ///
+    /// `process_phase_lifecycle` is purely event-driven — once the event
+    /// stream that drives it (the `note_item_*` / `note_affine_terminal`
+    /// hooks) stops, nothing re-runs the drain check. A phase whose last event
+    /// left it all-clear but un-surfaced (a momentarily-unsettled counter at
+    /// that instant) or `Drained`-but-not-`Done` (a flipped-then-consumed
+    /// race) is then stranded forever — the drain-edge analogue of the #640
+    /// dispatch deadlock the `task_backoff` arm closes. This drive (called
+    /// from the empty-poll site of `process_phase_lifecycle`, AFTER the
+    /// soft-finalize breaker, AND from the bounded `ARM_PHASE_RESURFACE`
+    /// level-trigger that re-enters `process_phase_lifecycle` when the event
+    /// stream is silent) re-evaluates the drain edge two ways:
+    ///
+    ///   * [`PendingPool::drain_empty_active_phases`] re-runs
+    ///     `maybe_transition_drain` for every `Active`/`Draining` phase,
+    ///     re-flipping one that is now all-clear (the never-flipped transient).
+    ///   * [`PendingPool::resurface_drained_pending`] re-pushes any phase in
+    ///     state `Drained`-but-not-`Done` onto `drained_pending` (the
+    ///     flipped-then-consumed race; `drain_empty_active_phases` cannot reach
+    ///     it because `maybe_transition_drain` early-returns for a
+    ///     non-`Active`/`Draining` phase).
+    ///
+    /// Returns whether either surfaced a phase — the caller re-enters its
+    /// cascade loop so the EXISTING `poll_drain_transitions` →
+    /// `on_phase_end` / `phase_can_proceed` / `mark_phase_done` block runs the
+    /// per-phase decision UNCHANGED. RE-EVALUATES the same gates the ordinary
+    /// drain path uses, RELAXING none (an affine-only phase whose import has
+    /// not terminalized still reads `phase_has_live_affine_prereq == true` and
+    /// is never surfaced; a phase with live blocked work or unfinished
+    /// predecessors stays held). The drain-edge twin of
+    /// [`Self::drive_soft_finalize_deadlock`]: that breaks a soft-root
+    /// deadlock the ordinary poll cannot resolve, this restores a drain edge
+    /// the ordinary poll lost track of. Takes no `command_rx` — it mutates
+    /// pool drain state only; the per-phase cascade (with its
+    /// callback-command drain) runs on the caller's re-entry.
+    ///
+    /// Re-flips an `Active`/`Draining` phase that is now all-clear but whose
+    /// last event left it un-surfaced (the never-flipped transient).
+    /// `drain_empty_active_phases` re-runs `maybe_transition_drain` for every
+    /// such phase, pushing each re-flipped one onto `drained_pending`. Returns
+    /// whether anything is now queued (a NON-destructive peek — the caller's
+    /// `poll_drain_transitions` on re-entry consumes the queue).
+    ///
+    /// Recursion-safe inside the cascade: an `Active → Drained` re-flip here is
+    /// completed by the caller's `continue` → drained-block → `mark_phase_done`
+    /// (phase → `Done`), so a subsequent empty-poll for the SAME phase no
+    /// longer surfaces it (a `Done` phase is not all-clear-Active) — the
+    /// re-entry TERMINATES. (The orthogonal flipped-then-`Drained`-but-not-
+    /// `Done` strand is NOT recovered here: re-pushing a phase whose
+    /// `mark_phase_done` is merely pending higher on the cascade stack would
+    /// re-enter the drained-block per queued command and recurse unboundedly.
+    /// That strand — a genuinely stranded `Drained` phase with no in-flight
+    /// cascade — is recovered by the idle-only `ARM_PHASE_RESURFACE`
+    /// level-trigger via [`PendingPool::resurface_drained_pending`], where no
+    /// cascade is in flight.)
+    fn resurface_stuck_drainable_phases(&mut self) -> bool {
+        let pool = self.pool_mut();
+        pool.drain_empty_active_phases();
+        pool.has_drained_pending()
     }
 
     /// Per-completion bookkeeping shared between `handle_task_complete`
