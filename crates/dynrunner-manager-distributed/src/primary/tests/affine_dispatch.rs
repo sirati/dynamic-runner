@@ -1103,6 +1103,127 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
         .await;
 }
 
+/// #660 (the #659 affine-strand twin): an ON-DEMAND import dispatch whose inner
+/// dispatch does NOT COMMIT (`dispatch_affine_unit` returns `false` — a
+/// `CommitRefused`, the target worker slot is not idle, or a `SendFailed`) must
+/// HONOR that outcome: reset the import cell `Queued → NotDone` and re-derive
+/// the dependent blocked work, exactly as the backpressure-bounce arm treats a
+/// wire bounce. Without the fix the helper SWALLOWS the inner outcome — the cell
+/// stays phantom-`Queued` with no holding slot, the dependent waits
+/// `InFlightHere` on a cell no terminal will ever flip `Done`, and recovery
+/// depends on the 5-min reconcile (reconcile-paced drain) instead of being
+/// continuous.
+///
+/// The non-commit is forced as the `CommitRefused` shape: the worker the build
+/// pops on is pre-occupied (busy), so the on-demand import — dispatched to that
+/// SAME worker — hits the #517 idle-guard and `commit_assignment` refuses, the
+/// `false` outcome. (The mesh egress always accepts a queued send in the test
+/// harness, so `SendFailed` is not separately inducible here; `CommitRefused`
+/// and `SendFailed` are the same `false` branch the fix keys on.)
+///
+/// REVERT-CHECK: with the swallow restored (the inner bool discarded), the cell
+/// stays `Queued` and the build stays blocked-on-import — stranded until the
+/// 5-min reconcile orphans the phantom-Queued cell.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_on_demand_import_noncommit_resets_cell_and_redrains_dependent() {
+    use dynrunner_core::ResourceMap;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build.clone()]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // STAGE the strand on sec-0: enqueue the build on sec-0's per-secondary
+            // affine queue (the lazy-import placement state), cell NotDone. Then
+            // OCCUPY sec-0's worker so the on-demand import — which dispatches to
+            // that SAME worker — is refused (#517 idle-guard).
+            let placement = primary.affine_placement_for(&build);
+            let _: Vec<ClusterMutation<TestId>> = primary.affine_scheduler.place(
+                "sec-0",
+                &placement,
+                |_s: &str, _a: crate::cluster_state::SecondaryCellId| SecondaryCell::NotDone,
+            );
+            let worker_idx = primary
+                .worker_idx_for("sec-0", 0)
+                .expect("sec-0 has a worker in the roster");
+            let occupier = make_binary("occupier", 10);
+            assert!(
+                primary.commit_assignment(
+                    worker_idx,
+                    std::sync::Arc::new(occupier.clone()),
+                    compute_task_hash(&occupier),
+                    ResourceMap::new(),
+                ),
+                "occupier must commit onto the idle slot (the #517 guard takes here)"
+            );
+
+            // Pre-state: cell NotDone, no holding slot for the import.
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
+                SecondaryCell::NotDone,
+            );
+
+            // DRIVE the per-secondary pop for the (now-busy) worker. The build pops
+            // → `StrandedHere` (cell NotDone) → the build is BLOCKED + the import
+            // is dispatched on-demand to this SAME (busy) worker → the inner
+            // `commit_assignment` is REFUSED (slot not idle) → `dispatch_affine_unit`
+            // returns `false` (the non-committed branch).
+            let committed = primary.try_affine_pop_for_worker(worker_idx).await;
+            settle_pump().await;
+            assert!(
+                !committed,
+                "the work pop's gate took the StrandedHere arm (it does not commit \
+                 the work; it blocks it and kicks the import)"
+            );
+
+            // GREEN: the swallowed non-commit reset the import cell back to
+            // `NotDone` (no phantom `Queued`-no-holder), no holding slot landed for
+            // the import, and the build was re-derived (drained from the blocked
+            // map). RED pre-fix: the cell stays `Queued` and the build stays
+            // blocked-on-import until the 5-min reconcile.
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
+                SecondaryCell::NotDone,
+                "a non-committed on-demand import must reset its cell Queued → \
+                 NotDone (RED pre-fix: left phantom-Queued with no holding slot)"
+            );
+            assert!(
+                !primary.secondary_has_slot_holding_hash("sec-0", &import_hash),
+                "the refused import never landed a holding slot on sec-0"
+            );
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test("sec-0", &build_hash),
+                "the dependent build must be re-derived (drained from sec-0's \
+                 per-secondary blocked map), NOT stranded until reconcile (RED \
+                 pre-fix: still blocked on the phantom-Queued cell)"
+            );
+
+            // The build is still pending, NOT terminal-failed: a non-commit is a
+            // RECOVERABLE refusal (the import can re-run), never a genuine import
+            // failure — the cell reset to NotDone (not Failed) and the dependent
+            // stays alive.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "a recoverable on-demand non-commit must NOT terminal-fail the dependent"
+            );
+        })
+        .await;
+}
+
 /// #656 M2 (affine import-bounce capacity brake): an on-demand affine import
 /// refused with the GENUINE CAPACITY shape ("No idle worker available") must set
 /// the secondary's backpressure flag so `should_skip_worker_for_dispatch`
