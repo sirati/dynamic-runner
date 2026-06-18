@@ -1703,6 +1703,93 @@ async fn affine_dep_work_backpressure_bounce_recovers_to_affine_queue_not_strand
         .await;
 }
 
+/// AFFINE-DEP-WORK TERMINAL CLEARS THE PLACEMENT GUARD + the strand diagnostic
+/// NEVER names a terminal task (#663). Two assertions:
+///   (a1, ROOT) a COMPLETED affine-dep work task is `unrecord_placed_work`'d out
+///       of the placement-dedup guard on its terminal — `placed_work` must not
+///       grow with completed tasks (a scale leak) and a completed task is NOT
+///       in flight, so a lingering guard entry shows as a FALSE strand.
+///   (a2, BELT-AND-SUSPENDERS) even under a clear-RACE (the guard re-recorded
+///       AFTER the terminal, simulating a path that missed the clear), the
+///       coordinator strand diagnostic STILL excludes the hash because it filters
+///       out `completed_tasks ∪ failed_tasks` — so a terminal task can never be
+///       named as a strand regardless of the guard's state.
+///
+/// RED before #663: the completion path flipped only the affine cell (an import
+/// def's bitvector) and never cleared the affine-DEP WORK task's `placed_work`
+/// guard, so a completed work lingered placed-but-unqueued-and-not-in-flight =
+/// the false strand the consumer chased (asm-dataset 549509fa, a matrix_eval
+/// named 4–8 min after completion).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_terminal_clears_guard_and_strand_diagnostic_excludes_terminal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            // Drive the import Done, let the dependent build commit; capture its
+            // holder. The build is now placed (guard SET) and in flight.
+            let (sec, worker) = drive_until_work_dispatches(
+                &mut primary,
+                &mut ends,
+                &mut wm_rx,
+                &import_hash,
+                &build_hash,
+            )
+            .await;
+            assert!(
+                primary.affine_work_is_placed_for_test(&build_hash),
+                "the build's placement guard must be SET before its terminal"
+            );
+
+            // ── THE TERMINAL: a genuine TaskComplete for the WORK task. ──
+            primary
+                .handle_task_complete(task_complete(&sec, worker, &build_hash), &mut None)
+                .await;
+            settle_pump().await;
+
+            // (a1) ROOT: the terminal cleared the placement-dedup guard. RED
+            // before #663: only the affine cell flipped; the guard stayed set.
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "a COMPLETED affine-dep work must be UNRECORDED from the \
+                 placement guard on its terminal (RED before #663: it lingered \
+                 → false strand + unbounded placed_work growth at scale)"
+            );
+            // The strand diagnostic is 0 — nothing placed-but-unqueued survives.
+            assert_eq!(
+                primary.affine_scheduler_placed_but_unqueued_for_test(),
+                0,
+                "no false strand after a clean terminal clear"
+            );
+
+            // (a2) BELT-AND-SUSPENDERS: simulate a clear-RACE by RE-recording the
+            // guard for the (now-completed) hash. The root clear is bypassed, so
+            // the guard is set AND the hash sits in no queue AND is not in flight
+            // (it terminated). The ONLY thing keeping it out of the strand list
+            // is the diagnostic's terminal filter.
+            assert!(
+                primary.affine_record_placed_work_for_test(&build_hash),
+                "re-recording the completed hash reinstates the racy guard entry"
+            );
+            assert_eq!(
+                primary.affine_scheduler_placed_but_unqueued_for_test(),
+                0,
+                "the strand diagnostic must EXCLUDE a terminal hash even when its \
+                 placement guard lingers (clear-race) — the completed/failed \
+                 terminal filter is the belt-and-suspenders guard (#663)"
+            );
+        })
+        .await;
+}
+
 /// AFFINE-DEP-WORK DEAD-SECONDARY RECOVERY (the mid-run-leg-drop variant of the
 /// same recovery): when the holder of a committed affine-dep WORK task DIES,
 /// `recover_inflight_for_dead_secondary` requeues it — and must clear the

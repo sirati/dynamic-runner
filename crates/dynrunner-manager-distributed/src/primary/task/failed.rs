@@ -407,7 +407,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // backpressure-requeue arm above (the hash re-enters the pool,
             // so the next dispatch must still be fenced) and NOT done on
             // the already-held arm (the task stays in flight on the holder).
-            self.drop_supplanted_holder(&task_hash);
+            self.drop_local_terminal_residue(&task_hash);
             // Genuine terminal (#497): a real `TaskFailed` settles the hash,
             // so clear its per-task reconciliation-loss requeue counter. NOT
             // done on the backpressure-requeue arm above (the reconciliation-
@@ -566,7 +566,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // affine-id — but the caller already gated on `affine_id_for_hash`,
             // so it is `Some` here; the `if let` is defensive. NO `Failed`
             // flip, NO `fast_fail` (the import is recoverable), and NO
-            // `drop_supplanted_holder` (symmetric with the work-pool
+            // `drop_local_terminal_residue` (symmetric with the work-pool
             // backpressure arm: the hash re-enters, so the next on-demand
             // dispatch must still be fenced).
             if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &task_hash) {
@@ -660,7 +660,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.reroute_affine_blocked_on(&secondary_id, Some(affine_id), command_rx)
                     .await;
             }
-            self.drop_supplanted_holder(&task_hash);
+            self.drop_local_terminal_residue(&task_hash);
             // POOL TERMINAL-FAILURE MIRROR (the failed twin of the complete
             // path's `note_affine_terminal`). The per-secondary cell flip above
             // is NOT a global terminal — the import may still run on another
@@ -822,7 +822,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .insert(dep_hash.clone(), dynrunner_core::ErrorType::NonRecoverable);
             // Pre-start fence A side-map drop (#530a): the cascade is a
             // terminal — no further dispatch will fence on this hash.
-            self.drop_supplanted_holder(&dep_hash);
+            self.drop_local_terminal_residue(&dep_hash);
             tracing::warn!(
                 task_id = %dep.task_id,
                 phase = %dep.phase_id,
