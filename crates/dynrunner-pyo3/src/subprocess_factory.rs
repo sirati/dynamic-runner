@@ -754,6 +754,26 @@ impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
     async fn cleanup(&mut self) {
         self.cleanup_all();
     }
+
+    /// Read the bounded tail of this worker's captured stdout/stderr.
+    ///
+    /// Every spawn (initial pool + per-type respawn) routes the worker's
+    /// OS-stdout + stderr (append) to `worker_<id>.log` — the SAME file the
+    /// factory derives here from `log_paths` + `log_dir` + `worker_id` (both
+    /// the legacy-argv and `WorkerSpec` render paths set `stdio_capture` to
+    /// exactly this path). Returning its tail lets a failure-report site
+    /// splice the dying process's last output onto the failure's
+    /// `error_message` — the only WHY-it-died evidence on a worker
+    /// disconnect, where no clean wire error is ever sent. Best-effort: a
+    /// missing/empty/unreadable file yields `None` (see
+    /// [`dynrunner_manager_local::read_file_tail`]).
+    fn worker_stdio_tail(&self, worker_id: WorkerId) -> Option<String> {
+        let path = self.log_paths.worker_log(&self.log_dir, worker_id);
+        dynrunner_manager_local::read_file_tail(
+            &path,
+            dynrunner_manager_local::DEFAULT_STDIO_TAIL_BYTES,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1303,6 +1323,35 @@ mod tests {
         assert_eq!(
             initial.stdio_capture, respawn.stdio_capture,
             "stdio capture path must be byte-identical"
+        );
+    }
+
+    /// `worker_stdio_tail` reads the SAME `worker_<id>.log` the factory
+    /// captures a worker's OS-stdout/stderr to (derived from `log_paths` +
+    /// `log_dir` + `worker_id`), so a failure-report site can splice the
+    /// dying process's last output onto the failure text. Write a fake
+    /// capture file at the factory's derived path and assert the tail comes
+    /// back; assert `None` for a worker whose file does not exist.
+    #[test]
+    fn worker_stdio_tail_reads_the_per_worker_capture_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut factory = make_factory_with_two_types();
+        factory.log_dir = tmp.path().to_path_buf();
+
+        // The factory derives this exact path for worker 0's stdio capture.
+        let log_path = factory.log_paths.worker_log(&factory.log_dir, 0);
+        std::fs::write(&log_path, "Traceback (most recent call last):\nRuntimeError: kaboom\n")
+            .unwrap();
+
+        let tail = factory.worker_stdio_tail(0).expect("tail for captured worker");
+        assert!(
+            tail.contains("RuntimeError: kaboom"),
+            "tail must carry the captured stderr; got: {tail:?}"
+        );
+        // A worker with no capture file yields None (best-effort).
+        assert!(
+            factory.worker_stdio_tail(7).is_none(),
+            "missing capture file must yield None"
         );
     }
 
