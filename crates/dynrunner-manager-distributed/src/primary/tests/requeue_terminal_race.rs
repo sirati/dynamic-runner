@@ -481,10 +481,8 @@ async fn replayed_wire_terminal_reclaims_requeued_task_from_pool() {
 /// BACKPRESSURE-requeued (the pre-mesh "not ready" bounce), and THEN a
 /// genuine `TaskComplete` for that hash lands from the secondary that
 /// actually ran it. The completion must SETTLE (CRDT → Completed,
-/// succeeded += 1) exactly once, the pool's per-task re-dispatch backoff
-/// must be cleared so the Bug-B level-trigger stops re-firing for the
-/// settled hash, and the task must never re-dispatch — without a deadlock
-/// or a double-count.
+/// succeeded += 1) exactly once and the task must never re-dispatch —
+/// without a deadlock or a double-count.
 #[tokio::test(flavor = "current_thread")]
 async fn genuine_completion_after_backpressure_requeue_settles_and_stops_repoll() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -500,38 +498,15 @@ async fn genuine_completion_after_backpressure_requeue_settles_and_stops_repoll(
             );
             let task = make_binary("ran-elsewhere", 100);
             let hash = seed_live_inflight(&mut primary, task).await;
-            // Tight backoff so the level-trigger window is observable. Set
-            // AFTER seed: the pool is built by `hydrate_from_cluster_state`.
-            primary.pool_mut().set_dispatch_backoff_params(
-                Duration::from_millis(20),
-                Duration::from_millis(80),
-            );
             let _ = drain_assigned_task_ids(&mut ends[0].1);
 
-            // BOUNCE #1 (pre-mesh "not ready"): a backpressure requeue.
-            // streak 1 is free, so a SECOND bounce engages the brake and
-            // stamps the backoff (the level-trigger's home).
+            // BOUNCE (pre-mesh "not ready"): a backpressure requeue returns
+            // the hash to the pool's queue, no longer in flight here.
             primary
                 .handle_task_failed(backpressure_bounce("sec-0", 0, &hash), &mut None)
                 .await;
-            settle_pump().await;
-            // Re-dispatch the free re-entry so it re-commits in-flight, then
-            // bounce again → streak 2 → a real backoff stamp.
-            primary
-                .dispatch_to_idle_workers(true)
-                .await
-                .expect("dispatch recheck");
             settle_pump().await;
             let _ = drain_assigned_task_ids(&mut ends[0].1);
-            primary
-                .handle_task_failed(backpressure_bounce("sec-0", 0, &hash), &mut None)
-                .await;
-            settle_pump().await;
-            assert!(
-                primary.next_task_dispatch_backoff_expiry().is_some(),
-                "fixture: the second backpressure bounce stamped a backoff \
-                 (the Bug-B level-trigger is armed for this hash)"
-            );
 
             // The genuine completion finally arrives from the secondary that
             // ACTUALLY ran it (the task was queued/backed-off here, NOT
@@ -569,15 +544,6 @@ async fn genuine_completion_after_backpressure_requeue_settles_and_stops_repoll(
                 primary.outcome_summary().succeeded,
                 1,
                 "the completion must count exactly once (no succeeded=0 strand)"
-            );
-
-            // RE-POLL STOPS: the settle cleared the dispatch_backoff stamp, so
-            // the Bug-B level-trigger no longer re-fires for the settled hash
-            // (the important interaction with the Bug B fix).
-            assert!(
-                primary.next_task_dispatch_backoff_expiry().is_none(),
-                "a settled-but-untracked terminal must clear the backoff stamp \
-                 so the level-trigger does not re-poll an already-completed hash"
             );
 
             // NO RE-DISPATCH / NO DOUBLE-COUNT: a later idle re-poll must not

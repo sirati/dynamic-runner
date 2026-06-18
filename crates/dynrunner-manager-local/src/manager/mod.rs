@@ -564,19 +564,6 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // `PrimaryCoordinator::register_phase_no_barrier`); an empty
         // set (the common strict-barrier run) is a no-op.
         pool.set_no_barrier_phases(self.phase_no_barrier_decl.iter().cloned());
-        // The pool's per-task re-dispatch backoff exists for the
-        // EVENT-DRIVEN dispatch loop (the distributed primary), where
-        // a requeued task is otherwise re-assignable at memory speed.
-        // The LocalManager's phase-sequenced loop has no such edge:
-        // every failure is CHARGED by `record_result` (bounded by
-        // `retry_max_attempts`), the retry channel re-runs via its own
-        // phase pass, and its worker loop STOPS workers when a view is
-        // empty — a hidden-under-backoff item would end the phase
-        // early instead of pacing it. Disable the stamps here.
-        pool.set_dispatch_backoff_params(
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-        );
         self.pending = Some(pool);
         // Mirror the initial batch into `task_by_hash` BEFORE
         // `pool.extend`. The mirror is the command-channel handler's

@@ -113,7 +113,7 @@ fn phase_resurface_expiry_disarms_when_nothing_stuck() {
     // raw, never unbounded) — the no-hot-spin property the arm relies on.
     let due = primary.next_phase_resurface_expiry().unwrap();
     assert!(
-        due <= std::time::Instant::now() + primary.pool().dispatch_repoll_interval(),
+        due <= std::time::Instant::now() + primary.pool().phase_resurface_repoll_interval(),
         "the wake is bounded by the re-poll interval"
     );
 }

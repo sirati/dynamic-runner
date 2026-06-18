@@ -24,7 +24,27 @@ use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 use super::pool::PendingPool;
 use super::types::{BucketKey, DispatchRank, PhaseState, affinity_key, no_affinity};
 
+/// Bounded re-poll cadence for the manager's phase-drain re-surface
+/// level-trigger. `process_phase_lifecycle` is purely event-driven; when
+/// its driving event stream has gone silent a phase left all-clear but
+/// stranded short of its drain edge has no further event to re-surface it,
+/// so the manager's re-surface arm re-checks the pool on this bounded
+/// cadence (`next_phase_resurface_expiry` parks on `now + this`). Bounded
+/// (never `now` raw) so a legitimately-undrainable phase is re-checked once
+/// per interval rather than hot-spun.
+pub const PHASE_RESURFACE_REPOLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl<I: Identifier> PendingPool<I> {
+    /// The bounded re-poll cadence the manager's phase-drain re-surface
+    /// level-trigger ([`next_phase_resurface_expiry`]) parks on. A thin
+    /// accessor over [`PHASE_RESURFACE_REPOLL_INTERVAL`] kept as a stable
+    /// pool seam so the manager need not name the const directly.
+    ///
+    /// [`next_phase_resurface_expiry`]: crate seam in the distributed primary.
+    pub fn phase_resurface_repoll_interval(&self) -> std::time::Duration {
+        PHASE_RESURFACE_REPOLL_INTERVAL
+    }
+
     /// True iff the entire pool is empty AND no phase is `Active` or
     /// `Draining`. Manager loop predicate.
     pub fn is_run_complete(&self) -> bool {
@@ -235,11 +255,11 @@ impl<I: Identifier> PendingPool<I> {
     /// eligible item is seen and abandons the rest of the queue.
     ///
     /// "Ready" is the SAME gate the dispatch view emits: an item in an
-    /// `Active` phase that is [`Self::dispatch_eligible_now`] (worker-
-    /// assignable kind AND not parked under an unexpired re-dispatch
-    /// backoff). A `Setup`/`SecondaryAffine` task, a backed-off task, or an
-    /// item in a non-`Active` phase is NOT ready — exactly the items a
-    /// worker view would skip. Composes `active_phases()` (the dispatchable-
+    /// `Active` phase that is [`Self::dispatch_eligible`] (worker-assignable
+    /// kind AND no affine dep). A `Setup`/`SecondaryAffine` task, an
+    /// affine-dep work task, or an item in a non-`Active` phase is NOT
+    /// ready — exactly the items a worker view would skip. Composes
+    /// `active_phases()` (the dispatchable-
     /// phase set, as `has_queued_dispatchable`) with the single eligibility
     /// seam, so it can never diverge from what a dispatch actually sees.
     ///
@@ -256,7 +276,7 @@ impl<I: Identifier> PendingPool<I> {
                 continue;
             }
             for item in &bucket.items {
-                if !self.dispatch_eligible_now(item) {
+                if !self.dispatch_eligible(item) {
                     continue;
                 }
                 counted += 1;

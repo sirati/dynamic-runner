@@ -42,16 +42,15 @@ impl<I: Identifier> PendingPool<I> {
     /// becomes empty, its pinned workers' affinity records are
     /// cleared so they fall back to the free pool on subsequent calls.
     pub fn pop_for_worker(&mut self, worker_id: WorkerId) -> Option<Arc<TaskInfo<I>>> {
-        let now = std::time::Instant::now();
-        let key = self.choose_bucket_for(worker_id, now)?;
+        let key = self.choose_bucket_for(worker_id)?;
         // Pop the first dispatch-ELIGIBLE item of the chosen bucket (a
-        // backed-off item at the front must not block its eligible
-        // siblings, nor be dispatched early). `choose_bucket_for` only
+        // non-dispatchable item — `Setup` kind or affine-dep — at the front
+        // must not block its eligible siblings). `choose_bucket_for` only
         // returns buckets with at least one eligible item. take_at
         // handles affinity / in-flight bookkeeping and drain
         // transitions.
         let bucket = self.buckets.get(&key)?;
-        let index = self.first_eligible_index(bucket, now)?;
+        let index = self.first_eligible_index(bucket)?;
         Some(self.take_at(&key, index, worker_id))
     }
 
@@ -110,12 +109,11 @@ impl<I: Identifier> PendingPool<I> {
         // chunks correspond, in order, to: pin, typed, free-pool, co-pin.
         let mut chunks: [Vec<Paired<'p, I>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-        // Re-dispatch backoff filter: an item parked under an
-        // unexpired backoff stamp is invisible to dispatch (it still
-        // counts as queued for the phase machine). Locators index the
-        // ORIGINAL bucket positions, so skipping an item here keeps
-        // every emitted locator valid for `take_selected`.
-        let now = std::time::Instant::now();
+        // Dispatch-eligibility filter: a non-worker-assignable item (a
+        // `Setup` kind, or a work task with an affine dep) is invisible to
+        // dispatch (it still counts as queued for the phase machine).
+        // Locators index the ORIGINAL bucket positions, so skipping an item
+        // here keeps every emitted locator valid for `take_selected`.
         let collect_bucket = |key: &BucketKey,
                               bucket: &'p Bucket<I>,
                               emitted: &mut HashSet<BucketKey>,
@@ -125,10 +123,10 @@ impl<I: Identifier> PendingPool<I> {
                 // inner `&TaskInfo` (deref the Arc) so the view's value
                 // shape is unchanged — it still BORROWS, clones nothing.
                 let item: &TaskInfo<I> = item.as_ref();
-                // The SINGLE dispatch-eligibility gate (re-dispatch backoff
-                // AND worker-assignable kind) — a `Setup` task is invisible
-                // to the worker view here, never via a scattered kind check.
-                if !self.dispatch_eligible(item, now) {
+                // The SINGLE dispatch-eligibility gate (worker-assignable
+                // kind AND no affine dep) — a `Setup` task is invisible to
+                // the worker view here, never via a scattered kind check.
+                if !self.dispatch_eligible(item) {
                     continue;
                 }
                 sink.push((item, (key.clone(), idx)));
@@ -278,15 +276,11 @@ impl<I: Identifier> PendingPool<I> {
             .remove(index)
             .expect("take_at called with out-of-range index");
 
-        // The item left the queue: drop its backoff stamp (the streak
-        // persists — a later requeue keeps doubling).
-        self.dispatch_backoff.note_taken(&item.task_id);
         // Drop its bring-up reservation holder entry (the holder confirmed
         // and a worker took its share); the formation window closes itself
         // when the last reserved task drains. Inert outside the window.
         // Disjoint field borrow (`reservation`, not whole `self`) so the
-        // live `bucket` borrow below stays valid — mirrors the backoff
-        // line above.
+        // live `bucket` borrow below stays valid.
         self.reservation
             .note_taken(&(item.phase_id.clone(), item.task_id.clone()));
 
@@ -327,10 +321,10 @@ impl<I: Identifier> PendingPool<I> {
     /// Pure: doesn't mutate state — `take_at` performs the actual claim.
     ///
     /// A bucket qualifies only when it holds at least one
-    /// dispatch-ELIGIBLE item at `now` (an item parked under an
-    /// unexpired re-dispatch backoff is invisible here, same as in
+    /// dispatch-ELIGIBLE item (a non-worker-assignable item — `Setup` kind
+    /// or affine-dep — is invisible here, same as in
     /// [`Self::view_for_worker`]).
-    fn choose_bucket_for(&self, worker_id: WorkerId, now: std::time::Instant) -> Option<BucketKey> {
+    fn choose_bucket_for(&self, worker_id: WorkerId) -> Option<BucketKey> {
         let no_aff = no_affinity();
 
         // Step 1: existing affinity, if its phase is Active or Draining
@@ -342,7 +336,7 @@ impl<I: Identifier> PendingPool<I> {
             );
             if phase_ok
                 && let Some(bucket) = self.buckets.get(key)
-                && self.first_eligible_index(bucket, now).is_some()
+                && self.first_eligible_index(bucket).is_some()
             {
                 return Some(key.clone());
             }
@@ -351,7 +345,7 @@ impl<I: Identifier> PendingPool<I> {
         // Step 2: unpinned, non-free-pool, Active-phase bucket with
         // eligible items.
         for (key, bucket) in &self.buckets {
-            if self.first_eligible_index(bucket, now).is_none() {
+            if self.first_eligible_index(bucket).is_none() {
                 continue;
             }
             if key.2 == no_aff {
@@ -367,7 +361,7 @@ impl<I: Identifier> PendingPool<I> {
 
         // Step 3: free-pool bucket of any Active phase.
         for (key, bucket) in &self.buckets {
-            if self.first_eligible_index(bucket, now).is_none() {
+            if self.first_eligible_index(bucket).is_none() {
                 continue;
             }
             if key.2 != no_aff {
@@ -382,7 +376,7 @@ impl<I: Identifier> PendingPool<I> {
         // Step 4: any bucket with eligible items in an Active phase
         // (co-pin).
         for (key, bucket) in &self.buckets {
-            if self.first_eligible_index(bucket, now).is_none() {
+            if self.first_eligible_index(bucket).is_none() {
                 continue;
             }
             if self.phase_state.get(&key.0) != Some(&PhaseState::Active) {
@@ -394,41 +388,44 @@ impl<I: Identifier> PendingPool<I> {
         None
     }
 
-    /// Index of the first dispatch-eligible item in `bucket` at `now`
-    /// (`None` when the bucket is empty or every item is parked under
-    /// an unexpired re-dispatch backoff stamp, or is a non-worker-
-    /// assignable kind).
-    fn first_eligible_index(&self, bucket: &Bucket<I>, now: std::time::Instant) -> Option<usize> {
+    /// Index of the first dispatch-eligible item in `bucket` (`None` when
+    /// the bucket is empty or every item is non-worker-assignable — a
+    /// `Setup` kind or a work task with an affine dep).
+    fn first_eligible_index(&self, bucket: &Bucket<I>) -> Option<usize> {
         bucket
             .items
             .iter()
-            .position(|item| self.dispatch_eligible(item, now))
+            .position(|item| self.dispatch_eligible(item))
     }
 
-    /// Whether `item` may be dispatched to a WORKER at `now`. The SINGLE
+    /// Whether `item` may be dispatched to a WORKER. The SINGLE
     /// worker-dispatch-eligibility predicate, consulted by every dispatch
     /// read path (`view_for_worker`'s per-item filter and
     /// [`Self::first_eligible_index`], which backs `pop_for_worker` /
     /// `choose_bucket_for`). It is the conjunction of two independent
-    /// gates over the same "can this go to a worker right now" concern:
+    /// structural gates over the same "can this go to a worker" concern:
     ///
-    ///   * the per-task re-dispatch BACKOFF (timing — a recently-bounced
-    ///     task is parked until its stamp expires), and
-    ///   * the task KIND (structural — only a `TaskKind::Work` task is
-    ///     worker-assignable; a `TaskKind::Setup` task is executed
-    ///     in-process by its affinity member and must NEVER appear in a
-    ///     worker dispatch view).
+    ///   * the task KIND (only a `TaskKind::Work` task is worker-assignable;
+    ///     a `TaskKind::Setup` task is executed in-process by its affinity
+    ///     member and must NEVER appear in a worker dispatch view), and
+    ///   * the AFFINE-DEP hide (a work task depending on a `SecondaryAffine`
+    ///     import dispatches ONLY through the primary's per-secondary affine
+    ///     queue, never the global worker view — see [`Self::has_affine_dep`]).
     ///
     /// A `Setup` task therefore sits in its bucket invisible to workers
     /// (still counted as queued, so it holds its phase open) until its
     /// in-process executor consumes it — the scheduling seam of the
-    /// setup-task primitive. Folding the kind gate in here (rather than
-    /// scattering `if kind == Setup` across the four soft-pin classes)
-    /// keeps the kind→behavior mapping at one seam.
-    fn dispatch_eligible(&self, item: &TaskInfo<I>, now: std::time::Instant) -> bool {
-        item.kind.is_worker_assignable()
-            && self.dispatch_backoff.is_eligible(&item.task_id, now)
-            && !self.has_affine_dep(item)
+    /// setup-task primitive. Folding both gates in here (rather than
+    /// scattering kind / affine-dep checks across the four soft-pin classes)
+    /// keeps the eligibility mapping at one seam.
+    ///
+    /// `pub` for the callers OUTSIDE the dispatch read paths that need the
+    /// SAME worker-dispatch-eligibility gate (the primary's
+    /// estimate-escalation rescue, and the pool's own
+    /// `ready_dispatchable_below` depth read) — they must see exactly the
+    /// tasks a worker view would, never a re-implemented filter.
+    pub fn dispatch_eligible(&self, item: &TaskInfo<I>) -> bool {
+        item.kind.is_worker_assignable() && !self.has_affine_dep(item)
     }
 
     /// Whether `item` depends on a `TaskKind::SecondaryAffine` prereq — the
@@ -456,15 +453,4 @@ impl<I: Identifier> PendingPool<I> {
             .any(|d| self.affine_prereq_ids.contains(d.task_id.as_str()))
     }
 
-    /// [`Self::dispatch_eligible`] sampled at the current instant — the
-    /// public seam for callers OUTSIDE the dispatch read paths that need
-    /// the SAME worker-dispatch-eligibility gate without threading a
-    /// `now`. Used by the primary's estimate-escalation pass to decide
-    /// which queued tasks the best-effort rescue should consider (it must
-    /// see exactly the tasks a worker view would, never a re-implemented
-    /// filter). Stays on the SINGLE eligibility seam so the two never
-    /// diverge.
-    pub fn dispatch_eligible_now(&self, item: &TaskInfo<I>) -> bool {
-        self.dispatch_eligible(item, std::time::Instant::now())
-    }
 }

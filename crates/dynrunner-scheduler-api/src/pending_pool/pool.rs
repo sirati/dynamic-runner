@@ -161,12 +161,6 @@ pub struct PendingPool<I: Identifier> {
     /// distinguishes "phase truly empty" from "phase has blocked
     /// items waiting for unresolved prereqs in another phase".
     pub(super) blocked_per_phase: HashMap<PhaseId, u32>,
-    /// Per-task re-dispatch backoff: stamped by `requeue`/`reinject`,
-    /// consulted by the dispatch read paths so a task whose every
-    /// dispatch bounces (or whose every attempt fails instantly)
-    /// cannot cycle requeue → re-assign at memory speed. See
-    /// [`super::backoff`] for the contract.
-    pub(super) dispatch_backoff: super::backoff::DispatchBackoff,
     /// Bring-up FORMATION-WINDOW reservation overlay: tags each queued
     /// task with the member it is reserved for, so a first-confirmed
     /// member's idle workers drain only their own pre-computed share
@@ -284,29 +278,8 @@ impl<I: Identifier> PendingPool<I> {
             affine_prereq_ids: HashSet::new(),
             in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
-            dispatch_backoff: super::backoff::DispatchBackoff::default(),
             reservation: super::reservation::TaskReservation::default(),
         })
-    }
-
-    /// Override the per-task re-dispatch backoff parameters (the
-    /// exponential's base delay and saturation cap). Defaults are
-    /// [`super::backoff::DISPATCH_BACKOFF_BASE`] /
-    /// [`super::backoff::DISPATCH_BACKOFF_CAP`].
-    pub fn set_dispatch_backoff_params(
-        &mut self,
-        base: std::time::Duration,
-        cap: std::time::Duration,
-    ) {
-        self.dispatch_backoff.set_params(base, cap);
-    }
-
-    /// Override the expired-but-undispatched re-poll cadence (the
-    /// level-trigger interval; default
-    /// [`super::backoff::DISPATCH_REPOLL_INTERVAL`]). Tests use a
-    /// millisecond scale to drive the missed-recheck path fast.
-    pub fn set_dispatch_repoll_interval(&mut self, interval: std::time::Duration) {
-        self.dispatch_backoff.set_re_poll_interval(interval);
     }
 
     /// Mark the listed phases as `PhaseSpec.barrier=False`: their initial
@@ -346,31 +319,6 @@ impl<I: Identifier> PendingPool<I> {
                 *state = super::types::PhaseState::Active;
             }
         }
-    }
-
-    /// The earliest wake an event-driven manager loop should park on to
-    /// re-service the backoff queue, or `None` when nothing needs
-    /// re-checking. Either a still-future stamp (a backed-off task's
-    /// window expiry) or — once a stamp expires and the task is eligible
-    /// but its dispatch recheck missed (no idle worker, transport-gate
-    /// skip, affine-dep) — a bounded re-poll wake that persists until
-    /// the task is actually taken. The re-poll cadence is bounded (see
-    /// [`set_dispatch_repoll_interval`](Self::set_dispatch_repoll_interval)),
-    /// so a legitimately-undispatchable task is re-checked once per
-    /// interval, never hot-spun. See [`super::backoff`] for the
-    /// level-trigger contract and the #640 deadlock it closes.
-    pub fn next_dispatch_backoff_expiry(&mut self) -> Option<std::time::Instant> {
-        self.dispatch_backoff.next_expiry(std::time::Instant::now())
-    }
-
-    /// The bounded level-trigger re-poll cadence (default
-    /// [`super::backoff::DISPATCH_REPOLL_INTERVAL`], overridable via
-    /// [`Self::set_dispatch_repoll_interval`]). The manager's phase-drain
-    /// re-surface level-trigger reuses this so its wake interval is the SAME
-    /// bounded cadence the per-task dispatch backoff arm uses (and honours a
-    /// test's millisecond override on the one shared knob).
-    pub fn dispatch_repoll_interval(&self) -> std::time::Duration {
-        self.dispatch_backoff.re_poll_interval()
     }
 
     /// Pre-seed `completed_tasks` with task ids the cluster has
