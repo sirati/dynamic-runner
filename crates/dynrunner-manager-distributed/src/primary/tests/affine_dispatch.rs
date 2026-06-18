@@ -1473,6 +1473,125 @@ async fn affine_dep_work_dead_secondary_recovery_clears_placement_guard() {
         .await;
 }
 
+/// AFFINE-DEP-WORK ILLEGAL-ASSIGNMENT-BOUNCE RECOVERY (#659): the THIRD
+/// requeue-of-recovered-work site — the illegal-assignment bounce handler. When
+/// a secondary bounces a committed affine-dep WORK task with an
+/// `IllegallyAssignedToNonidleWorker` divergence report, the handler requeues
+/// it; that requeue MUST be affine-aware (clear `placed_work`), exactly as the
+/// backpressure-failed and dead-secondary siblings already are.
+///
+/// RED with the bare `pool.requeue` (pre-#659): the requeue left `placed_work`
+/// SET, so the affine-dep work was hidden from the global worker view by
+/// `has_affine_dep` AND blocked from re-placement by the placement-dedup guard
+/// — permanently unassignable, and NOT recovered by the 5-min reconcile (a
+/// bounced work is not in `blocked_per_secondary`). GREEN: routing through
+/// `requeue_affine_aware` clears the guard so the same-tick `TasksAdded` recheck
+/// re-derives its per-secondary unit and re-dispatches it.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_illegal_assignment_bounce_recovers_not_stranded() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            // Drive the import Done + let the dependent build commit; capture
+            // the (secondary, worker) the build committed onto.
+            let (sec, worker) = drive_until_work_dispatches(
+                &mut primary,
+                &mut ends,
+                &mut wm_rx,
+                &import_hash,
+                &build_hash,
+            )
+            .await;
+
+            // Pre-bounce: the build is committed and its placement-dedup guard
+            // is SET (it was placed).
+            assert!(
+                primary.secondary_has_slot_holding_hash(&sec, &build_hash),
+                "the build slot must be Assigned on {sec} before the bounce"
+            );
+            assert!(
+                primary.affine_work_is_placed_for_test(&build_hash),
+                "the build's placement-dedup guard must be SET (it was placed)"
+            );
+
+            // ── THE BOUNCE: an illegal-assignment divergence report for the
+            // committed WORK task. (No incumbent: the requeue half — the path
+            // under test — runs regardless; the slot-reconcile half is
+            // independently covered by the #517/#531 illegal-assignment tests.) ──
+            primary
+                .handle_illegally_assigned(DistributedMessage::IllegallyAssignedToNonidleWorker {
+                    target: None,
+                    sender_id: sec.clone(),
+                    timestamp: 0.0,
+                    secondary_id: sec.clone(),
+                    worker_id: worker,
+                    assigned: dynrunner_protocol_primary_secondary::AssignedTaskRef {
+                        hash: build_hash.clone(),
+                        task_id: TestId("build".into()),
+                    },
+                    incumbent: None,
+                })
+                .await;
+            settle_pump().await;
+
+            // GREEN (the #659 fix): the placement-dedup guard was CLEARED by the
+            // affine-aware requeue, so the work re-admits to placement. RED with
+            // the bare `pool.requeue`: the guard stayed SET → permanently
+            // unassignable (the strand).
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "the illegal-assignment bounce must UNRECORD the affine-dep \
+                 work's placement guard so the placement pass re-derives its \
+                 queue unit (RED with the bare pool.requeue: the guard stayed \
+                 set → stranded)"
+            );
+            assert_eq!(
+                primary.affine_scheduler_placed_but_unqueued_for_test(),
+                0,
+                "post-bounce the affine-dep work is not placed-but-unqueued \
+                 (guard cleared); RED with the bare requeue it was the strand"
+            );
+
+            // Not terminal-failed — a bounce is recoverable.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "an illegal-assignment bounce must NOT terminal-fail the work"
+            );
+
+            // The SAME same-tick TasksAdded the bounce emitted re-derives the
+            // unit + re-dispatches it. RED with the bare requeue: no
+            // re-derivation (guard set) → no affine-queue entry → stranded.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut build_redispatched = false;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, _sec, _worker, h) in assignments(rx) {
+                    if h == build_hash {
+                        build_redispatched = true;
+                    }
+                }
+            }
+            assert!(
+                build_redispatched,
+                "the affine-dep work must be RE-DISPATCHED after the bounce \
+                 cleared its placement guard — not wedged hidden-in-pool / \
+                 absent-from-every-affine-queue forever"
+            );
+        })
+        .await;
+}
+
 /// RELOCATION-REBUILD under lazy import (c): the rebuild re-derives ONLY the
 /// dependent WORK units — it never reconstructs an import unit on the queue,
 /// regardless of the inherited `Queued` cell. The import is a DEPENDENCY derived

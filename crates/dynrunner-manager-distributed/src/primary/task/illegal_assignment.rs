@@ -124,7 +124,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // releases the type slot, returning the binary. A hash not in the
         // ledger yields `None` (already requeued / terminal): safe no-op.
         if let Some(entry) = self.free_slot_on_terminal(&secondary_id, worker_id, &assigned.hash) {
-            self.pool_mut().requeue(entry.task);
+            // Affine-aware (the SAME recovery seam the dead-secondary and
+            // backpressure-failed requeue-of-recovered-work sites use): an
+            // affine-dependent work task must clear the affine scheduler's
+            // `placed_work` dedup on requeue, or it is hidden from the global
+            // worker view AND blocked from re-placement — permanently
+            // unassignable (and NOT recovered by the reconcile, since a bounced
+            // work is not in `blocked_per_secondary`). `requeue_affine_aware`
+            // clears the guard so the same-tick `TasksAdded` recheck re-derives
+            // its per-secondary unit; a non-affine-dep task takes the unchanged
+            // `pool.requeue` (byte-identical to before).
+            self.requeue_affine_aware(entry.task);
             self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskRequeued {
                 hash: assigned.hash.clone(),
                 // Stamped at the origination choke point.

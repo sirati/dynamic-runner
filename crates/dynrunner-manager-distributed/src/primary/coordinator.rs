@@ -4449,6 +4449,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
+    /// DIAGNOSTIC: the GENUINELY-stranded affine-dep-work signal for the
+    /// unassignable-park line — `(count, up-to-`limit`-hashes)`. Takes the
+    /// scheduler's raw placed-but-unqueued-and-not-blocked candidate set (the
+    /// scheduler owns the queue + blocked exclusions) and applies the in-flight
+    /// (ledger) exclusion HERE, because the coordinator — not the scheduler —
+    /// owns the in-flight ledger: a placed work hash the ledger still holds was
+    /// popped-not-terminal (in flight on a worker), legitimately absent from the
+    /// queue, NOT stranded. Completed/failed work is already gone from
+    /// `placed_work` (the scheduler unrecords on terminal), so a hash that
+    /// survives both filters is a placed work with no queue unit, not blocked on
+    /// an import, and not in flight — the actual permanently-unassignable trap.
+    /// The count and the bounded hash list are computed from the SAME filtered
+    /// set so they can never disagree.
+    pub(super) fn affine_dep_strand_count_and_hashes(&self, limit: usize) -> (usize, Vec<String>) {
+        let mut stranded: Vec<String> = self
+            .affine_scheduler
+            .placed_but_unqueued_hashes_all()
+            .into_iter()
+            .filter(|hash| !self.in_flight.contains_key(hash))
+            .collect();
+        let count = stranded.len();
+        // Deterministic, bounded sample (stable across log lines for grep).
+        stranded.sort();
+        stranded.truncate(limit);
+        (count, stranded)
+    }
+
     /// Test-only inspector: is `work_hash` currently recorded in the affine
     /// scheduler's `placed_work` placement-dedup guard? Lets the
     /// affine-dep-work requeue-recovery test assert the guard is SET after a
@@ -4465,7 +4492,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// assert the strand is cleared after recovery.
     #[cfg(test)]
     pub fn affine_scheduler_placed_but_unqueued_for_test(&self) -> usize {
-        self.affine_scheduler.placed_but_unqueued_count()
+        self.affine_dep_strand_count_and_hashes(usize::MAX).0
     }
 
     /// Test-only inspector (#652 concern B): whether `(secondary, work_hash)` is
