@@ -3700,6 +3700,81 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Recover the in-flight binary for an ILLEGAL-ASSIGNMENT BOUNCE of a
+    /// WORK task — the WORK twin of [`Self::free_affine_slot_on_terminal`].
+    ///
+    /// This is NOT a terminal: an `IllegallyAssignedToNonidleWorker` bounce
+    /// is an occupancy-DIVERGENCE report (the task never ran here), so the
+    /// committed hold MUST be returned to the pool, never accounted. The
+    /// caller (`handle_illegally_assigned`'s non-import arm) requeues the
+    /// returned binary. The concern this seam owns, and why it is distinct
+    /// from [`Self::free_slot_on_terminal`]: a bounce recovers the binary
+    /// EVEN WHEN the committed holder's physical slot is gone — the roster
+    /// shrank between `commit_assignment` and the bounce, so `worker_idx_for`
+    /// no longer resolves the stable `local_worker_id` to a live slot.
+    ///
+    /// `free_slot_on_terminal` returns `None` in that slot-gone case (a safe
+    /// no-op for the genuine-terminal callers — a completed task whose slot
+    /// was already freed must NOT be requeued), which would here SKIP the
+    /// requeue AND leave a phantom in-flight ledger entry: the strand. So the
+    /// bounce path takes THIS seam instead, which removes-and-returns the
+    /// ledger entry whenever the ledger HAS it (mirroring
+    /// `commit_assignment`'s inverse), independent of whether the slot
+    /// resolves — leaving the terminal callers' `None` contract untouched.
+    ///
+    /// Symmetric inverse of `commit_assignment` (type-slot reserve + ledger
+    /// insert + slot Assigned), the three steps each guarded on what is still
+    /// present:
+    ///   * RELEASE the type slot from the LEDGER entry's `type_id` (not the
+    ///     slot's held task — the slot may be gone), unconditionally: the
+    ///     reserve was taken at commit and outlives the slot.
+    ///   * VACATE the holding slot to `Idle` only if it still resolves AND
+    ///     still holds THIS hash (a slot reassigned to a later task must not
+    ///     be vacated). When the slot is gone (roster shrank), there is
+    ///     nothing to vacate — the recovery proceeds anyway.
+    ///   * REMOVE + RETURN the ledger entry so no phantom in-flight survives
+    ///     and the caller can requeue the binary.
+    ///
+    /// A hash absent from the ledger (already requeued / a raced terminal)
+    /// returns `None` — a safe no-op, exactly as for the terminal callers.
+    /// Inherited (pre-owned, `local_worker_id` is `None`) entries hold no
+    /// slot and no type slot: just remove and return the ledger entry.
+    pub(super) fn recover_work_on_illegal_bounce(
+        &mut self,
+        task_hash: &str,
+    ) -> Option<InFlightEntry<I>> {
+        // The ledger is the single source of truth. A hash not tracked is
+        // already requeued / terminal — nothing to recover.
+        let local_holder = match self.in_flight.get(task_hash) {
+            Some(e) => e.local_worker_id.map(|lw| (e.secondary_id.clone(), lw)),
+            None => return None,
+        };
+
+        if let Some((holder_secondary, holder_local_id)) = local_holder {
+            // Locally-dispatched entry: a type slot was reserved at commit and
+            // outlives the slot, so release it from the ledger entry's own
+            // `type_id` regardless of whether the slot still resolves.
+            let type_id = self.in_flight[task_hash].task.type_id.clone();
+            self.release_type_slot(&type_id);
+            // Vacate the holding slot ONLY if it still resolves AND still holds
+            // THIS hash. When the roster shrank the slot is gone (no index) —
+            // there is nothing to vacate, but the recovery still proceeds: the
+            // bounce must not strand the work on a slot that no longer exists.
+            if let Some(idx) = self.worker_idx_for(&holder_secondary, holder_local_id) {
+                let held_matches = matches!(
+                    &self.workers[idx].state,
+                    SlotState::Assigned { task_hash: h, .. } if h == task_hash
+                );
+                if held_matches {
+                    self.workers[idx].state = SlotState::Idle;
+                }
+            }
+        }
+        // Both the locally-dispatched and the inherited (no-slot) arms remove
+        // and return the ledger entry — no phantom in-flight survives.
+        self.in_flight.remove(task_hash)
+    }
+
     /// Recover every in-flight task targeting `secondary_id` when that
     /// secondary dies: requeue each task into the pool (which
     /// decrements its phase's in-flight counter) and drop the ledger

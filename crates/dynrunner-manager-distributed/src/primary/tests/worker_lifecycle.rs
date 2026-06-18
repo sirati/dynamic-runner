@@ -615,6 +615,154 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
         .await;
 }
 
+/// WORK-BOUNCE-ON-SHRUNK-ROSTER (#667): the non-affine twin of the
+/// affine-import slot-gone recovery (#665). A WORK task is committed onto
+/// `(sec-0, w0)` — slot Assigned, ledger entry, type slot reserved. The
+/// roster then SHRINKS (sec-0's worker is dropped from the Vec — a
+/// mid-run leg drop) while the ledger entry survives. An
+/// `IllegallyAssignedToNonidleWorker` bounce for that committed WORK then
+/// arrives. The handler MUST requeue the work and remove the phantom
+/// in-flight entry.
+///
+/// RED before the fix: the bounce path went through `free_slot_on_terminal`,
+/// whose slot-resolved arm returns `None` when `worker_idx_for` finds no
+/// live slot for the (now-gone) stable `local_worker_id`. That `None`
+/// made the `if let Some` body skip → `requeue_affine_aware` never ran →
+/// the work was un-requeued AND the in-flight ledger entry was LEFT (a
+/// phantom holding a phase in-flight count + a type slot forever). The
+/// strand.
+///
+/// GREEN: the bounce path takes `recover_work_on_illegal_bounce`, which
+/// removes-and-returns the ledger entry whenever the ledger HAS it
+/// (independent of slot resolution), releasing the type slot from the
+/// ledger entry's `type_id` and vacating the slot only when it still
+/// resolves. The work is requeued (back to `Pending`) and no phantom
+/// in-flight survives.
+#[tokio::test(flavor = "current_thread")]
+async fn work_illegal_bounce_recovers_when_holding_slot_gone() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let phase = PhaseId::from("work");
+            let x = phased("task-x", "work");
+            let y = phased("task-y", "work");
+            let hash_x = compute_task_hash(&x);
+            let hash_y = compute_task_hash(&y);
+            let (mut primary, _ends) = primary_two_secondaries_with_pool(vec![x, y]);
+
+            // Dispatch X to sec-0/w0 and Y to sec-1/w0 through the real
+            // request path so each ledger entry + slot + type slot is set
+            // exactly as production does. The scheduler is free to order
+            // them; re-bind which secondary holds which from the slots.
+            primary
+                .handle_task_request(task_request("sec-0", 0), &mut None)
+                .await
+                .unwrap();
+            primary
+                .handle_task_request(task_request("sec-1", 0), &mut None)
+                .await
+                .unwrap();
+            let sec0_holds_x = primary.slot_holds_hash_for_test("sec-0", 0, &hash_x);
+            // The to-be-bounced work is the one on sec-0 (the secondary
+            // whose roster we shrink); its survivor sibling stays on sec-1.
+            let (bounced_hash, survivor_hash) = if sec0_holds_x {
+                (hash_x.clone(), hash_y.clone())
+            } else {
+                (hash_y.clone(), hash_x.clone())
+            };
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &bounced_hash),
+                "sec-0/w0 holds the to-be-bounced work before the shrink"
+            );
+            assert_eq!(primary.in_flight_len_for_test(), 2, "both works in flight");
+            assert_eq!(primary.pool().in_flight(&phase), 2);
+            assert_eq!(
+                primary.in_flight_per_type_for_test(&TypeId::from("default")),
+                2,
+                "both works hold a type slot"
+            );
+
+            // ── THE ROSTER SHRINK: drop sec-0's worker slot from the Vec
+            // (a mid-run leg drop) WITHOUT the dead-secondary recovery that
+            // would otherwise clean the ledger — leaving the committed
+            // work's ledger entry alive but its holding slot UNRESOLVABLE
+            // (`worker_idx_for("sec-0", 0)` now `None`). This is the exact
+            // window the bug needs: the slot is gone, the ledger entry is
+            // not. ──
+            primary.workers.retain(|w| w.secondary_id != "sec-0");
+            assert!(
+                primary.worker_idx_for("sec-0", 0).is_none(),
+                "sec-0's slot must be unresolvable after the shrink"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                2,
+                "the shrink leaves the committed work's ledger entry alive (phantom-prone)"
+            );
+
+            // ── THE BOUNCE: an illegal-assignment divergence report for the
+            // committed WORK whose holding slot just vanished. (No incumbent:
+            // the requeue half — the path under test — runs regardless.) ──
+            primary
+                .handle_illegally_assigned(
+                    DistributedMessage::IllegallyAssignedToNonidleWorker {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        secondary_id: "sec-0".into(),
+                        worker_id: 0,
+                        assigned: dynrunner_protocol_primary_secondary::AssignedTaskRef {
+                            hash: bounced_hash.clone(),
+                            task_id: TestId("task".into()),
+                        },
+                        incumbent: None,
+                    },
+                )
+                .await;
+
+            // GREEN: the work was REQUEUED (back to Pending in the pool) and
+            // the phantom in-flight entry is GONE — the type slot released,
+            // the phase in-flight counter drained for the bounced work.
+            // RED before the fix: the work was dropped (never requeued) and
+            // the ledger entry stayed phantom.
+            let queued: Vec<String> = primary
+                .pool()
+                .iter()
+                .map(compute_task_hash)
+                .collect();
+            assert!(
+                queued.contains(&bounced_hash),
+                "the bounced work must be REQUEUED into the pool (RED before \
+                 the fix: dropped, never requeued — the strand)"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                1,
+                "the bounced work's ledger entry is GONE — only the survivor \
+                 remains (RED before the fix: 2, the phantom in-flight)"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&bounced_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "an illegal-assignment bounce must NOT terminal-fail the work"
+            );
+            assert_eq!(
+                primary.in_flight_per_type_for_test(&TypeId::from("default")),
+                1,
+                "the bounced work's type slot was released — only the \
+                 survivor's reserve remains (RED before the fix: 2, leaked)"
+            );
+            // The survivor on sec-1 is untouched by the bounce.
+            assert!(
+                primary.slot_holds_hash_for_test("sec-1", 0, &survivor_hash),
+                "the survivor work on sec-1 must be untouched by the bounce"
+            );
+        })
+        .await;
+}
+
 /// (b-variant) A completion whose hash does NOT match the held slot —
 /// distinct from the dedup case — must be a pure no-op. Drives the
 /// `free_slot_on_terminal` "non-held hash" arm directly: the slot
