@@ -228,6 +228,17 @@ impl ObserverTaskNarrator {
     /// Returns whether a line was emitted — the caller's wake-stream
     /// piggyback seam (a narrated transition is a wake-stream HOST, exactly
     /// like `RunNarrator::observe`'s return).
+    ///
+    /// #651 seed-flood guard: a CREATE (no prior state) INTO `pending` —
+    /// the initial baseline-seed every task enters at spawn — is NOT a
+    /// narration-worthy per-task transition (the converged seed is the
+    /// once-per-run `narrate_baseline` / `flush_catch_up` summary's job),
+    /// so it returns `false` without emitting. Sits ON TOP of #635's
+    /// committed-transition gate (the seed IS a committed transition, but a
+    /// CREATE-into-default-state is not operator-meaningful per task) and
+    /// preserves #631 field hygiene + #633 role-prefix routing for every
+    /// arm that DOES narrate. A RE-entry into pending (a known prior state)
+    /// is a real transition and still narrates per-task.
     pub(crate) fn narrate_live(&self, event: &TaskStateChangeEvent) -> bool {
         if !self.baseline_emitted {
             return false;
@@ -277,7 +288,10 @@ impl ObserverTaskNarrator {
             TaskStateChange::Other { state } => match event.from {
                 // The transition is the operator's primary interest for a
                 // non-terminal change, so when a prior state is known the
-                // line reads "changed state from {prev} to {new}".
+                // line reads "changed state from {prev} to {new}". This
+                // includes a RE-entry into pending (a requeue / cascade
+                // resume from a known prior state) — a genuine transition
+                // the operator wants per-task, distinct from the seed.
                 Some(prev) => {
                     tracing::info!(
                         target: PER_TASK_TARGET,
@@ -285,6 +299,25 @@ impl ObserverTaskNarrator {
                     );
                 }
                 // A CREATE (spawn-time first write) names no prior state.
+                //
+                // #651 seed-flood guard: a CREATE INTO `pending` is the
+                // initial baseline SEED — every task enters its DEFAULT
+                // state at spawn (the `e<epoch>.v0.a0` seed batch). At 120k
+                // tasks a relocated/late-join observer mirrors the new
+                // primary's recompose-seed as 120k LIVE broadcasts; each is
+                // a CREATE-into-pending. Narrating one operator line per
+                // task makes narration O(tasks-at-seed) — a multi-hour,
+                // 300MB+ replay that wedges the observer behind the
+                // pending-seed before it can narrate a single completion.
+                // Pending is not a meaningful per-task transition for an
+                // observer to narrate; the converged seed is reported ONCE
+                // by `narrate_baseline` (pre-loop mirror) / `flush_catch_up`
+                // (in-loop restore). So a CREATE-into-pending narrates
+                // NOTHING — narration stays O(meaningful transitions). Every
+                // OTHER CREATE (blocked = a dependency wait,
+                // skipped-already-done = a terminal, etc.) is a meaningful
+                // first state and DOES narrate.
+                None if *state == "pending" => return false,
                 None => {
                     tracing::info!(
                         target: PER_TASK_TARGET,
