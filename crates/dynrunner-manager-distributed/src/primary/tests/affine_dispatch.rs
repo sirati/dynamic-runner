@@ -2034,6 +2034,180 @@ async fn rebuild_queues_only_work_import_derived_on_demand() {
         .await;
 }
 
+/// FAILOVER REBUILD vs IMPORT-READINESS (#669): the rebuild must NOT place an
+/// affine-dep WORK whose import is NOT yet ready-in-bucket — i.e. the import's
+/// OWN non-affine upstream is still incomplete. The live placement trigger gates
+/// each placement on `all_ready` (every affine import sitting in a pool bucket =
+/// its own deps met); the failover rebuild placed EVERY affine-dep work with no
+/// such gate, so a promoted primary queued a work whose pop dispatched the
+/// not-ready import — the import ran with a PARTIAL `gather_predecessor_outputs`
+/// (its upstream's output missing) → failed → spurious cascade. The fix routes
+/// BOTH paths through the one shared placeability predicate
+/// (`affine_work_placeability` over `affine_ready_in_bucket_imports`), so the
+/// rebuild defers a not-ready work exactly as the live trigger does.
+///
+/// Topology: ordinary Work upstream U → affine import I (non-affine edge on U) →
+/// affine-dep Work W (affine edge on I). At rebuild time U is INCOMPLETE, so I
+/// is blocked on U (NOT a ready bucket item). Assert the rebuild does NOT place
+/// W (so the not-ready import is never dispatched off a rebuilt queue). THEN
+/// complete U so I becomes ready-in-bucket, run the LIVE placement, and assert W
+/// IS now placed + its import dispatches — the deferred work is correctly picked
+/// up once its import is ready.
+///
+/// RED without the gate: the rebuild places W → W is in an affine queue right
+/// after the rebuild (the premature placement this gate removes). GREEN: the
+/// queues are empty post-rebuild and W places only after U completes.
+#[tokio::test(flavor = "current_thread")]
+async fn rebuild_defers_work_whose_import_upstream_incomplete() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = work_upstream("import_upstream");
+            let upstream_hash = compute_task_hash(&upstream);
+            let import = affine_import_dep("import", "import_upstream");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![upstream, import, build]);
+            confirm_two(&mut primary).await;
+
+            // Precondition: the import is BLOCKED on its incomplete non-affine
+            // upstream — it is NOT a ready bucket item, so it is NOT in the
+            // ready-in-bucket set the placeability gate reads. The affine-dep
+            // work W, by contrast, IS a ready bucket item (its only dep is the
+            // affine import, excluded from its global blocking set).
+            assert!(
+                !primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == import_hash),
+                "the affine import must be BLOCKED on its incomplete upstream \
+                 (not a ready bucket item)"
+            );
+            assert!(
+                primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == build_hash),
+                "the affine-dep work must be a READY bucket item (its affine \
+                 import dep is excluded from its global blocking set)"
+            );
+
+            // ── THE REBUILD (promoted-primary seam) while the import is not yet
+            // ready-in-bucket. ──
+            primary.reconstruct_workers_from_cluster_state();
+            primary.rebuild_affine_schedule();
+
+            // GREEN (the #669 gate): the rebuild placed NOTHING — W is deferred
+            // because its import is not ready-in-bucket, so no per-secondary
+            // queue holds a work whose pop would dispatch the not-ready import.
+            // RED without the gate: the rebuild placed EVERY affine-dep work, so
+            // W would already be in a queue here (the premature placement).
+            let post_rebuild: Vec<String> = primary
+                .affine_queue_hashes_for_test("sec-0")
+                .into_iter()
+                .chain(primary.affine_queue_hashes_for_test("sec-1"))
+                .collect();
+            assert!(
+                post_rebuild.is_empty(),
+                "the rebuild must NOT place a work whose import upstream is \
+                 incomplete (the not-ready import must not be dispatchable off a \
+                 rebuilt queue); got {post_rebuild:?}"
+            );
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "the deferred work must NOT have its placement-dedup guard set, \
+                 so the live placement trigger can place it once its import is \
+                 ready"
+            );
+
+            // ── COMPLETE THE UPSTREAM so the import becomes ready-in-bucket,
+            // then drive the whole arc to quiescence. U dispatches as an ordinary
+            // work task; the import derives + runs ONLY after U completes; W is
+            // placed + dispatched off the per-secondary queue (not stranded). We
+            // record that the import NEVER dispatched before its upstream
+            // completed (the premature-import shape the rebuild gate prevents).
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id for the import");
+            let mut upstream_done = false;
+            let mut import_dispatched = false;
+            let mut import_before_upstream = false;
+            let mut build_dispatched = false;
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == upstream_hash {
+                        upstream_done = true;
+                    }
+                    if *h == import_hash {
+                        import_dispatched = true;
+                        if !upstream_done {
+                            import_before_upstream = true;
+                        }
+                    }
+                    if *h == build_hash {
+                        build_dispatched = true;
+                    }
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+            assert!(
+                upstream_done,
+                "the non-affine upstream must dispatch + complete so the import \
+                 becomes ready-in-bucket"
+            );
+
+            // The import dispatched ONLY AFTER its upstream completed — never off
+            // a prematurely-rebuilt queue. (The rebuild deferred W, so no pop
+            // dispatched the not-ready import; the live trigger placed W and
+            // dragged the import in only once it was ready-in-bucket.)
+            assert!(
+                import_dispatched,
+                "the import must derive + run once its upstream completed (the \
+                 deferred work is picked up + dispatched, not stranded)"
+            );
+            assert!(
+                !import_before_upstream,
+                "the import must NOT dispatch before its non-affine upstream \
+                 completes — a premature import would gather partial predecessor \
+                 outputs and fail (the #669 failover asymmetry)"
+            );
+
+            // W ran (it was placed by the LIVE trigger once its import became
+            // ready) and the whole affine arc drained — the deferred work was
+            // not stranded.
+            assert!(
+                build_dispatched,
+                "the deferred affine-dep work must dispatch once its import is \
+                 ready — placed by the LIVE trigger, not stranded"
+            );
+            let import_ran = ["sec-0", "sec-1"].iter().any(|sec| {
+                primary.cluster_state_for_test().affine_state(sec, affine_id)
+                    == SecondaryCell::Done
+            });
+            assert!(
+                import_ran,
+                "the import's per-secondary cell must be Done — it derived + ran"
+            );
+        })
+        .await;
+}
+
 /// REGRESSION (affine run-completion): a per-secondary affine import that RUNS
 /// ON BOTH SECONDARIES (same hash, N concurrent terminals) plus its dependent
 /// builds must, once everything terminals, satisfy the operational loop's
