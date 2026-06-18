@@ -2439,6 +2439,32 @@ async fn affine_multiworker_same_node_delta_never_assigned_before_base_done() {
         .await;
 }
 
+/// A `Work` task depending on a NON-affine gate `gate` AND an affine import
+/// `import` — the #650 shape: the gate holds the work BLOCKED (not a dispatchable
+/// bucket item) so the #648 fast-fail bridge MISSES it when the import is
+/// globally-failed; once the gate completes the work becomes ready-in-bucket and
+/// the placement source must terminalize it (instead of re-admitting it).
+fn work_gated_on_affine(name: &str, gate: &str, import: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 20);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t.task_depends_on = vec![
+        TaskDep {
+            task_id: gate.into(),
+            phase_id: PhaseId::from("work"),
+            inherit_outputs: false,
+            def_id: None,
+        },
+        TaskDep {
+            task_id: import.into(),
+            phase_id: PhaseId::from("work"),
+            inherit_outputs: false,
+            def_id: None,
+        },
+    ];
+    t
+}
+
 /// An ordinary `Work` upstream (no deps), phase "work" — the non-affine prereq
 /// an affine import is built ON TOP of (the consumer's `build_common_dep`).
 fn work_upstream(name: &str) -> TaskInfo<TestId> {
@@ -2660,6 +2686,335 @@ async fn affine_dep_work_terminalized_when_import_pool_cascade_failed() {
                 0,
                 "no affine-dep work remains queued — the #642 drain-blocker is \
                  cleared (RED at fc1b0ee9: W stayed queued+non-terminal forever)"
+            );
+        })
+        .await;
+}
+
+/// Run one placement wave through the REAL recheck seam
+/// ([`PrimaryCoordinator::react_to_worker_signal_batch`]) with the live
+/// `command_rx`, so the dead-upstream-aware placement path (#650) — placement
+/// returns its doomed set, the recheck caller terminalizes it — runs end-to-end
+/// exactly as the operational loop drives it. A bare `TasksAdded` batch is the
+/// placement trigger.
+async fn run_placement_wave(primary: &mut TestPrimary) {
+    let mut command_rx = primary.command_rx.take();
+    primary
+        .react_to_worker_signal_batch(
+            crate::worker_signal::WorkerSignalBatch {
+                signals: vec![WorkerMgmtSignal::TasksAdded],
+            },
+            &mut command_rx,
+        )
+        .await;
+    primary.command_rx = command_rx;
+    settle_pump().await;
+}
+
+/// DEAD-UPSTREAM-AWARE PLACEMENT (#650) — the REVERSE-ORDER complement to
+/// [`affine_dep_work_terminalized_when_import_pool_cascade_failed`] (#648). The
+/// #648 bridge fires ONCE at the import's terminal seam; a dependent that is not
+/// yet ready-in-bucket at that instant is MISSED by the bridge (its
+/// `claim_affine_work_for_fail` → `take_first_match` returns `None` for a blocked
+/// item — "the 28 residue"). When the dependent LATER becomes ready, the
+/// placement source ran on EVERY `TasksAdded` and — pre-fix — re-ADMITTED it as
+/// if the import were live (it never consulted `failed_tasks`), stranding a
+/// non-terminal affine-dep work that holds the phase open forever.
+///
+/// Topology: ordinary Work upstream U → affine import I (non-affine edge on U) →
+/// affine-dep Work W (affine edge on I) PLUS a non-affine gate G that holds W
+/// BLOCKED. ORDER (vs the #648 test): FIRST fail U (the cascade pool-fails I into
+/// `failed_tasks`, cells all NotDone; the bridge runs but W is blocked-on-G so it
+/// is MISSED). THEN complete G so W becomes ready-in-bucket and trigger a
+/// placement wave.
+///
+/// RED at 37c19235 (W re-admitted, stranded non-terminal + placed-but-unqueued);
+/// GREEN after the placement source partitions the doomed candidate out via the
+/// EXACT #648 predicate and terminalizes it through the shared claim+batch path.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_placed_after_import_globally_failed_is_terminalized_not_stranded() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = work_upstream("build_common_dep");
+            let upstream_hash = compute_task_hash(&upstream);
+            let import = affine_import_dep("import_common_dep", "build_common_dep");
+            let import_hash = compute_task_hash(&import);
+            // G: a plain Work task (no deps) that gates W until it completes.
+            let gate = work_upstream("gate_dep");
+            let gate_hash = compute_task_hash(&gate);
+            // W: affine-dep work, BLOCKED on the non-affine gate G until G is Done.
+            let build = work_gated_on_affine("cross_arch_build", "gate_dep", "import_common_dep");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) = primary_two_secondaries_with(vec![
+                upstream.clone(),
+                import,
+                gate.clone(),
+                build,
+            ]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id for the import");
+
+            // W is BLOCKED on the non-affine gate G → NOT a ready bucket item yet
+            // (so the bridge will miss it). G IS ready.
+            assert!(
+                !primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == build_hash),
+                "W must be BLOCKED on its non-affine gate (not a ready bucket item) \
+                 at the time the import is globally-failed — so the #648 bridge \
+                 misses it"
+            );
+
+            // ── FAIL the upstream FIRST: the cascade pool-fails the import into
+            // `failed_tasks` (cells all NotDone); the #648 bridge runs but W is
+            // blocked-on-G, so its claim returns None and W is MISSED. ──
+            let mut command_rx = primary.command_rx.take();
+            primary
+                .apply_fail_permanent(
+                    upstream_hash.clone(),
+                    dynrunner_core::ErrorType::NonRecoverable,
+                    "build_common_dep failed non-recoverably".into(),
+                    &mut command_rx,
+                )
+                .await
+                .expect("the upstream hash is known");
+            primary.command_rx = command_rx;
+            settle_pump().await;
+
+            assert!(
+                primary.failed_tasks.contains_key(&import_hash),
+                "the cascade must pool-fail the affine import into failed_tasks"
+            );
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    SecondaryCell::NotDone,
+                    "the pool-cascade import flips NO bitvector cell on {sec}"
+                );
+            }
+            // The bridge MISSED W (it was blocked): W is non-terminal and was
+            // never placed (the strand the placement source must now catch).
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "W must still be NON-terminal after the upstream fails (the bridge \
+                 missed it — W was blocked on its gate)"
+            );
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "W was never placed yet (still blocked) — the bridge could not \
+                 claim it"
+            );
+
+            // ── Now complete the gate G so W becomes ready-in-bucket, then run a
+            // placement wave (the real recheck seam, with the live command_rx). ──
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            // Find + complete G on whichever secondary it dispatched to.
+            let mut gate_slot: Option<(String, u32)> = None;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_task_id, sec, worker, h) in assignments(rx) {
+                    if h == gate_hash {
+                        gate_slot = Some((sec, worker));
+                    }
+                }
+            }
+            let (gate_sec, gate_worker) =
+                gate_slot.expect("the non-affine gate G dispatched to a worker");
+            primary
+                .handle_task_complete(
+                    task_complete(&gate_sec, gate_worker, &gate_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+
+            // W is now ready-in-bucket (its gate is Done; its affine import is
+            // excluded from its global blocking set).
+            assert!(
+                primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == build_hash),
+                "W must be a READY bucket item once its non-affine gate completes"
+            );
+
+            // ── THE PLACEMENT WAVE: pre-fix this re-admits W blindly. ──
+            run_placement_wave(&mut primary).await;
+
+            // GREEN: W is TERMINALIZED by the placement source (it partitioned W
+            // as doomed — its import is in `failed_tasks` — and routed it to the
+            // shared batch terminalization instead of placing it). It is terminal,
+            // out of its bucket, and NEVER recorded-or-left placed-but-unqueued.
+            // RED at 37c19235: W was re-admitted (placed), non-terminal, and
+            // placed-but-unqueued == 1.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "W must be TERMINALIZED by the dead-upstream-aware placement \
+                 source (RED at 37c19235: re-admitted + stranded non-terminal)"
+            );
+            assert_eq!(
+                primary
+                    .pool()
+                    .iter()
+                    .filter(|t| compute_task_hash(t) == build_hash)
+                    .count(),
+                0,
+                "the terminalized work must be removed from its bucket"
+            );
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "a doomed work must NEVER be recorded placed (RED at 37c19235: \
+                 placement re-admitted it)"
+            );
+            assert_eq!(
+                primary.affine_scheduler_placed_but_unqueued_for_test(),
+                0,
+                "no placed-but-unqueued strand may remain (RED at 37c19235: \
+                 count == 1, the residue that holds the phase open)"
+            );
+            // No affine-dep work remains queued — the #642 drain-blocker is clear.
+            assert_eq!(
+                primary
+                    .pool()
+                    .iter()
+                    .filter(|t| primary.pool().has_affine_dep(t))
+                    .count(),
+                0,
+                "no affine-dep work remains queued — the phase can drain"
+            );
+        })
+        .await;
+}
+
+/// CHURN-BOUND regression (#650 — the 3570-churn guard): with an affine import
+/// globally-failed AND a dependent the #648 bridge MISSED (blocked-on-its-gate at
+/// fail-time, then made ready), running MANY placement waves must NOT grow the
+/// placed-but-unqueued count. Pre-fix each wave re-admitted the doomed work
+/// (re-recording it placed — and, with no per-secondary pop, it sat in NO queue,
+/// so the strand count grew once per wave: 2 → 3570). Post-fix the placement
+/// source partitions the doomed work out + terminalizes it ONCE, so the count
+/// stays pinned at 0 across every wave (the first wave terminalizes it; the rest
+/// are no-ops — W is terminal, never re-derived).
+///
+/// Topology mirrors [`affine_dep_work_placed_after_import_globally_failed_is_terminalized_not_stranded`]
+/// (a gated W the bridge misses), then drives the wave loop instead of asserting
+/// a single wave — so it directly bounds the re-admit-per-wave growth.
+#[tokio::test(flavor = "current_thread")]
+async fn placement_waves_with_dead_import_do_not_grow_placed_but_unqueued() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upstream = work_upstream("build_common_dep");
+            let upstream_hash = compute_task_hash(&upstream);
+            let import = affine_import_dep("import_common_dep", "build_common_dep");
+            let import_hash = compute_task_hash(&import);
+            let gate = work_upstream("gate_dep");
+            let gate_hash = compute_task_hash(&gate);
+            // W: affine-dep work BLOCKED on the non-affine gate G — so the #648
+            // bridge MISSES it when the import is globally-failed.
+            let build = work_gated_on_affine("cross_arch_build", "gate_dep", "import_common_dep");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) = primary_two_secondaries_with(vec![
+                upstream.clone(),
+                import,
+                gate.clone(),
+                build,
+            ]);
+            confirm_two(&mut primary).await;
+
+            // Fail the upstream → the import lands in `failed_tasks`; the bridge
+            // runs but W is blocked-on-G, so W is MISSED (not terminalized).
+            let mut command_rx = primary.command_rx.take();
+            primary
+                .apply_fail_permanent(
+                    upstream_hash.clone(),
+                    dynrunner_core::ErrorType::NonRecoverable,
+                    "build_common_dep failed non-recoverably".into(),
+                    &mut command_rx,
+                )
+                .await
+                .expect("the upstream hash is known");
+            primary.command_rx = command_rx;
+            settle_pump().await;
+            assert!(
+                primary.failed_tasks.contains_key(&import_hash),
+                "the cascade must pool-fail the affine import into failed_tasks"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "the bridge must MISS the blocked W (it is still non-terminal)"
+            );
+
+            // Complete the gate G so W becomes a ready-in-bucket WORK task — now a
+            // doomed candidate the placement source must NOT re-admit.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut gate_slot: Option<(String, u32)> = None;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_task_id, sec, worker, h) in assignments(rx) {
+                    if h == gate_hash {
+                        gate_slot = Some((sec, worker));
+                    }
+                }
+            }
+            let (gate_sec, gate_worker) =
+                gate_slot.expect("the non-affine gate G dispatched to a worker");
+            primary
+                .handle_task_complete(
+                    task_complete(&gate_sec, gate_worker, &gate_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+            assert!(
+                primary
+                    .pool()
+                    .iter()
+                    .any(|t| compute_task_hash(t) == build_hash),
+                "W must be a READY bucket item (doomed candidate) before the waves"
+            );
+
+            // Drive MANY placement waves. The FIRST partitions W out + terminalizes
+            // it; EVERY wave must keep the strand count at 0. Pre-fix each wave
+            // re-admitted W (placed_work grows; no pop ⇒ placed-but-unqueued grows
+            // monotonically — the 3570-churn).
+            for wave in 0..16 {
+                run_placement_wave(&mut primary).await;
+                assert_eq!(
+                    primary.affine_scheduler_placed_but_unqueued_for_test(),
+                    0,
+                    "placed-but-unqueued must stay 0 on wave {wave} (RED at \
+                     37c19235: grows monotonically — the 3570-churn)"
+                );
+                assert!(
+                    !primary.affine_work_is_placed_for_test(&build_hash),
+                    "the doomed work must never be (re-)recorded placed on wave \
+                     {wave}"
+                );
+            }
+
+            // W ends terminal and gone from every bucket.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| s.is_terminal()),
+                "W must be terminal after the placement-source terminalization"
             );
         })
         .await;
