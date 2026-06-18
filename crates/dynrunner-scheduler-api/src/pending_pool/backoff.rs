@@ -156,6 +156,16 @@ impl DispatchBackoff {
         let streak = self.streak.entry(task_id.to_string()).or_insert(0);
         *streak = streak.saturating_add(1);
         if *streak == 1 {
+            // A first-free bounce is immediately eligible but carries NO
+            // future stamp, so it never lands in `expiry`/`until`. Without
+            // registering it here the level-net's tail (`next_expiry`) sees
+            // an empty heap + empty `pending_redispatch` and returns `None`,
+            // parking the op-loop backoff arm forever — the task sits queued,
+            // eligible, never re-pushed to an idle worker, holding its phase's
+            // drain gate open. Record it as awaiting re-dispatch so the
+            // bounded re-poll arm fires (cleared on dispatch via `note_taken`,
+            // so no hot-spin).
+            self.pending_redispatch.insert(task_id.to_string());
             return Some(Duration::ZERO);
         }
         // `base * 2^(streak-2)`, saturating at `cap`. The shift count
