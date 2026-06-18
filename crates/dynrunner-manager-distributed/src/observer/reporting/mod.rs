@@ -59,6 +59,7 @@ pub mod format;
 pub mod idle;
 pub mod reporter;
 pub mod stats;
+pub mod status;
 
 #[cfg(test)]
 mod tests;
@@ -75,3 +76,4 @@ pub use reporter::{
     SharedSnapshotSource, TokioClock, run_reporter,
 };
 pub use stats::StatsSnapshot;
+pub use status::{CatchUpTracker, StatusCell, StatusStamps};

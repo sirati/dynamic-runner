@@ -698,6 +698,21 @@ impl LostVisibilityReporter {
         self.last_wake_emit
     }
 
+    /// The instant the CURRENT loss episode began, as a `std::time::Instant`,
+    /// or `None` while visibility is fine / merely DEGRADED (a degraded
+    /// addressing-gap is NOT a connection loss — it rides its own clock and
+    /// must never count toward the sustained-loss status). The periodic
+    /// reporter's folded-status gate (#662) reads this to decide whether the
+    /// connection has been lost long enough (≥ [`WAKE_LOSS_THRESHOLD`]) to
+    /// surface a status line — reusing the SAME loss clock the wake-loss
+    /// policy already maintains rather than a parallel one. Std-typed because
+    /// the reporter's [`super::reporting::Clock`] seam speaks std instants
+    /// (under a paused `tokio::time` both derive from the same virtual clock,
+    /// exactly as [`EndedOutage::down_since`] already relies on).
+    pub fn loss_since_std(&self) -> Option<std::time::Instant> {
+        self.lost_since.map(Instant::into_std)
+    }
+
     /// Whether the reporter currently considers visibility lost. Test/
     /// diagnostic accessor — not part of any exit decision.
     #[cfg(test)]

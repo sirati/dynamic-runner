@@ -817,23 +817,31 @@ async fn observer_recovers_from_snapshot_reply() {
 }
 
 /// #636-followup: a relocated / late-join observer mirroring its whole
-/// InFlight partition over an IN-LOOP bootstrap restore narrates ONE
-/// catch-up SUMMARY line, NOT N per-task "assigned" lines — then a genuine
-/// LIVE assignment narrates individually. This replays the production
+/// InFlight partition over an IN-LOOP bootstrap restore narrates NO per-task
+/// "assigned" lines (the N restored transitions fold silently), then a
+/// genuine LIVE assignment narrates individually. This replays the production
 /// trace shape (a `task_ranges: []` full-ledger bootstrap whose reply
 /// arrives AFTER `narrate_baseline` armed, restored live through the
 /// path-INDEPENDENT merge seam). The fix's RAII catch-up marker stamps the
-/// restore-sourced transitions `CatchUp`; the narration arm folds them and
-/// flushes one summary on the batch's terminal (`done`) package, while the
-/// live broadcast stays `LiveBroadcast` and narrates per-event.
+/// restore-sourced transitions `CatchUp`; the narration arm folds them
+/// (counting, never per-task narrating) on the batch's terminal (`done`)
+/// package, while the live broadcast stays `LiveBroadcast` and narrates
+/// per-event.
+///
+/// #662: the per-flush "observer caught up: N transitions" IMPORTANT line is
+/// SUPPRESSED — under incremental catch-up it spammed the wake stream once
+/// per snapshot-package flush. The fold itself is unchanged (the operator
+/// sees the sustained-catch-up signal as the periodic report's folded status
+/// line instead, gated on ≥5 min behind — covered by the reporting tests).
 ///
 /// Captured across the live `run()` via the always-interest [`TargetCapture`]
 /// (safe to hold across `.await` on a current-thread runtime — unlike the
 /// synchronous-only `capture_important`), on BOTH the per-RUN importance
-/// target (the catch-up summary) and the per-TASK observer-task target (the
-/// individual assign lines), so the test asserts the ROUTING split.
+/// target (which must carry NO catch-up line now) and the per-TASK
+/// observer-task target (the individual assign lines), so the test asserts
+/// the ROUTING split + the suppression.
 #[tokio::test(flavor = "current_thread")]
-async fn relocated_observer_folds_inloop_catch_up_into_one_summary() {
+async fn relocated_observer_folds_inloop_catch_up_silently() {
     use tracing_subscriber::Registry;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -966,7 +974,7 @@ async fn relocated_observer_folds_inloop_catch_up_into_one_summary() {
                 let summaries: Vec<_> = important
                     .events()
                     .into_iter()
-                    .filter(|e| e.event.message.contains("observer caught up"))
+                    .filter(|e| e.event.message.contains("caught up"))
                     .collect();
                 let per_task_assigns: Vec<_> = per_task
                     .events()
@@ -988,29 +996,14 @@ async fn relocated_observer_folds_inloop_catch_up_into_one_summary() {
                 );
 
                 // GREEN assertions: the N InFlight catch-up transitions fold
-                // into EXACTLY ONE summary naming N, and ONLY the single LIVE
-                // assignment narrates individually (NOT the N restored ones).
-                assert_eq!(
-                    summaries.len(),
-                    1,
-                    "exactly one catch-up summary line: important={:?}",
+                // SILENTLY (no per-flush IMPORTANT line — the #662 spam fix),
+                // and ONLY the single LIVE assignment narrates individually
+                // (NOT the N restored ones — the fold is intact).
+                assert!(
+                    summaries.is_empty(),
+                    "the per-flush catch-up line must NOT reach the wake stream \
+                     (the #662 spam fix): important={:?}",
                     important.events()
-                );
-                assert_eq!(
-                    summaries[0].event.fields.get("catch_up_tasks").map(String::as_str),
-                    Some(N.to_string().as_str()),
-                    "the summary names N distinct catch-up tasks: {:?}",
-                    summaries[0]
-                );
-                assert_eq!(
-                    summaries[0]
-                        .event
-                        .fields
-                        .get("catch_up_transitions")
-                        .map(String::as_str),
-                    Some(N.to_string().as_str()),
-                    "the summary names N catch-up transitions: {:?}",
-                    summaries[0]
                 );
                 assert_eq!(
                     per_task_assigns.len(),

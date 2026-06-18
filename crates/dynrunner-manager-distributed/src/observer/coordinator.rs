@@ -93,7 +93,10 @@ use crate::observer::lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
 };
 use crate::observer::reconnect::ReconnectorHandle;
-use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
+use crate::observer::reporting::{
+    CatchUpTracker, SharedSnapshotSource, StatsSnapshot, StatusCell, StatusStamps, TokioClock,
+    run_reporter,
+};
 use crate::observer::run_observer_announcer;
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
 use crate::primary::RunError;
@@ -1362,12 +1365,21 @@ where
                 }
             });
         }
+        // The #662 sustained-degradation status seam: the run loop publishes
+        // its two since-stamps (connection-loss-since + not-caught-up-since)
+        // into this shared cell each iteration; the reporter task reads it at
+        // each on-grid periodic occurrence and folds in a single status line
+        // (force-emitting the report) only when a condition has been
+        // sustained ≥5 min. A clone goes to the reporter; the run loop keeps
+        // `status_cell` for its per-iteration publish.
+        let status_cell = StatusCell::new();
         let reporter_task = tokio::task::spawn_local(run_reporter(
             snapshot_source,
             TokioClock,
             outage_rx,
             force_print_rx,
             self.wake_note.clone(),
+            status_cell.clone(),
             async move {
                 let _ = reporter_cancel_rx.await;
             },
@@ -1471,6 +1483,12 @@ where
             // It shares the wake-note slot so a logged-loss regain parks the
             // reconnection note every wake emitter can host.
             let mut visibility_reporter = LostVisibilityReporter::new(self.wake_note.clone());
+            // #662 not-caught-up since-stamp tracker: fed the observer's
+            // current "behind the cluster?" bit each iteration, it remembers
+            // when the current behind-spell began so the periodic reporter
+            // (reading the published stamp via `status_cell`) can fold in a
+            // status line only once the catch-up has been outstanding ≥5 min.
+            let mut catch_up_tracker = CatchUpTracker::new();
             let mut primary_last_seen = Instant::now();
             let mut transport_closed = false;
             // LAST-RESORT fleet-death presumption (see `fleet_death.rs`):
@@ -1680,6 +1698,23 @@ where
                 if let Some(ended) = outcome.ended_logged_outage {
                     let _ = outage_tx.send(ended);
                 }
+                // #662: publish the observer's sustained-degradation
+                // since-stamps for the periodic reporter to fold into its
+                // next on-grid report. The loss stamp reuses the
+                // lost-visibility reporter's OWN loss clock (a degraded
+                // addressing-gap is not a loss and reads `None`); the
+                // not-caught-up stamp is the catch-up tracker folding this
+                // iteration's "behind the cluster?" bit (the SAME signal the
+                // recovery-pull cadence reads). The reporter applies the
+                // 5-min threshold against its own clock — this only carries
+                // the raw spell-start instants across the publish seam.
+                let now_std = std::time::Instant::now();
+                let not_caught_up_since =
+                    catch_up_tracker.observe(self.is_behind_cluster(), now_std);
+                status_cell.publish(StatusStamps {
+                    connection_lost_since: visibility_reporter.loss_since_std(),
+                    not_caught_up_since,
+                });
                 // LAST-RESORT fleet-death presumption (after the
                 // report-and-retry machinery above has had its turn —
                 // ordering is the rc-B contract). The inputs are the
@@ -3189,19 +3224,30 @@ where
     /// the peer-digest store + the roster intersection; the convergence
     /// detection lives in [`StateDigest::is_behind`] and the
     /// single-flight/selection in [`crate::pull_coordinator`].
-    async fn on_recovery_tick(&mut self) {
-        // Known-peer roster ([`Self::known_peer_roster`]): the live peers
-        // we both KNOW and hold a last-seen digest for (a departed peer's
-        // digest is excluded — we never resurrect a route to a dead peer).
+    /// Whether the observer's CRDT mirror is currently BEHIND the cluster:
+    /// the local digest is behind ANY known LIVE peer's last-seen digest
+    /// (the same `known_peer_roster` ∩ `peer_digests` intersection +
+    /// [`StateDigest::is_behind`] convergence test the recovery tick uses to
+    /// decide whether to pull). A departed peer's digest is excluded — we
+    /// never resurrect a route to a dead peer. ONE owner of the "behind?"
+    /// computation, read by BOTH the recovery-pull cadence (does it need to
+    /// pull?) and the #662 not-caught-up status tracker (has the mirror been
+    /// behind ≥5 min?). `false` when converged with every known peer, or
+    /// when no peer digest is known yet (a fresh observer with no roster is
+    /// not "behind" — it has nothing to be behind OF).
+    fn is_behind_cluster(&self) -> bool {
         let roster: HashSet<String> = self.known_peer_roster();
         let local = self.cluster_state.digest();
-        // Behind ANY known live peer's last-seen digest? (the C9 quiesce
-        // signal: if converged with all of them, nothing to do this tick.)
-        let behind_any = self
-            .peer_digests
+        self.peer_digests
             .iter()
             .filter(|(id, _)| roster.contains(id.as_str()))
-            .any(|(_, (_, d))| local.is_behind(d));
+            .any(|(_, (_, d))| local.is_behind(d))
+    }
+
+    async fn on_recovery_tick(&mut self) {
+        // Behind ANY known live peer's last-seen digest? (the C9 quiesce
+        // signal: if converged with all of them, nothing to do this tick.)
+        let behind_any = self.is_behind_cluster();
         if !behind_any {
             // Converged with every known peer (or none known yet) — quiesce.
             return;
