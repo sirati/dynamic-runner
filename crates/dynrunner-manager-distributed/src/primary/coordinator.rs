@@ -3865,8 +3865,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .task_view(&hash)
                     .is_some_and(|v| v.is_terminal());
                 // CELL-BEARING per-secondary task in-flight on the dead secondary
-                // (#668 + generalization): a task on the shared per-secondary CELL
-                // substrate — `SecondaryAffine` (the import gate) OR
+                // (#668 + generalization). See the ONE invariant set this arm
+                // must satisfy — "cell-bearing terminal/recovery obligations" in
+                // `cluster_state::secondary_cell_state` (the kind-blind cell
+                // owner). This arm discharges obligations 1/2/5 (per-secondary,
+                // ledger+slot dropped above, NO global terminal); obligation 4
+                // (drain the dependents via `reroute_affine_blocked_on`) is the
+                // CALLER's — see the per-caller note below. A task on the shared
+                // per-secondary CELL substrate — `SecondaryAffine` (the import
+                // gate) OR
                 // `SecondaryEagerPrep` (the idle filler), the kind-blind
                 // `has_secondary_cell()` family — is PER-SECONDARY recoverable,
                 // NEVER a global task terminal. Both have `is_reassignable() ==
@@ -3877,34 +3884,45 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `failed_tasks` and (for affine) the affine gate dooms the
                 // import's whole dependent subtree (`Unsatisfiable`).
                 //
-                // The death of a cell-bearing task here is the SAME per-secondary
-                // event the dead-secondary affine reroute already owns: the
-                // caller (`handle_dead_secondary`) runs
-                // `reroute_affine_blocked_on(secondary, None, ..)` right AFTER
-                // this recovery, which drains every dependent blocked on the dead
-                // secondary's cells and re-routes each to a still-eligible live
-                // secondary (or terminalizes only the genuinely-unsatisfiable
-                // ones). So the dependents' re-route is ALREADY handled by that
-                // existing seam — this arm must only (a) emit NO global
-                // `TaskFailed` and (b) leave the in_flight entry + its
-                // per-dispatch type slot dropped consistently, which the loop
-                // head already did (`in_flight.remove` + `release_type_slot`
-                // above). The dead secondary's per-secondary cell is never read
-                // again (the secondary is removed via `PeerRemoved`), and the
-                // reroute re-derives the import on a LIVE secondary's cell, so no
-                // cell reset is owed here — mirroring the reroute path, NOT
-                // inventing a new mechanism. The dead secondary's worker slots
-                // are dropped wholesale by the caller's `evict_secondary_local_caches`.
+                // The death of a cell-bearing task here is a per-secondary event;
+                // the dependents' DRAIN (obligation 4) is the CALLER's, NOT this
+                // arm's — and the two callers use DIFFERENT mechanisms because
+                // the secondary's fate differs:
+                //   * dead-secondary caller (`requeue_dead_secondary`): the
+                //     secondary is EVICTED, so it runs `reroute_affine_blocked_on
+                //     (secondary, None, ..)` right AFTER this recovery. Eviction
+                //     removes the secondary from `affine_placement_secondaries`,
+                //     so the reroute re-derives the dependents onto a LIVE
+                //     secondary; the dead cell is never a candidate again.
+                //   * silent-peer caller (`requeue_silent_held_work_locally`): the
+                //     secondary STAYS rostered, so a reroute would re-derive the
+                //     dependents straight back onto its stale `Queued` cell. That
+                //     caller instead CAPTURES its cell-bearing legs and drives
+                //     `recover_bounced_affine_import` (cell `Queued → NotDone`
+                //     reset + dependent re-derive) BEFORE calling this recovery —
+                //     so a silent-path cell-bearing leg never reaches THIS arm
+                //     (its in_flight entry is already gone). This arm therefore
+                //     sees a cell-bearing leg only on the dead-secondary path.
+                // Either way this arm must only (a) emit NO global `TaskFailed`
+                // and (b) leave the in_flight entry + its per-dispatch type slot
+                // dropped consistently, which the loop head already did
+                // (`in_flight.remove` + `release_type_slot` above). On the
+                // dead-secondary path the secondary's cell is never read again
+                // (removed via `PeerRemoved`) and the caller's reroute re-derives
+                // the import on a LIVE secondary's cell, so no cell reset is owed
+                // here. The dead secondary's worker slots are dropped wholesale by
+                // the caller's `evict_secondary_local_caches`. See "cell-bearing
+                // terminal/recovery obligations" in
+                // `cluster_state::secondary_cell_state` for the full set.
                 //
-                // For AFFINE the dependents re-route via `reroute_affine_blocked_on`
-                // above. For EAGER-PREP there are NO dependents at all (it is a
+                // For EAGER-PREP there are NO dependents at all (it is a
                 // phase-agnostic, queue-less, CELL-DRIVEN idle filler — see
                 // `eager_prep_dispatch` and the `apply_tasks` divert: it never
                 // surfaces for pool growth and nothing declares a dep on its
-                // cell), so `reroute_affine_blocked_on` finds no
-                // `blocked_per_secondary` entry for an eager-prep cell to drain —
-                // the suppress-only behavior is exactly correct: there is nothing
-                // to re-route, only the spurious global terminal to suppress.
+                // cell), so the caller's drain finds no `blocked_per_secondary`
+                // entry for an eager-prep cell — the suppress-only behavior is
+                // exactly correct: nothing to re-route, only the spurious global
+                // terminal to suppress.
                 if entry.task.kind.has_secondary_cell() {
                     tracing::info!(
                         dead_secondary = %secondary_id,
@@ -4746,6 +4764,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             resource_budgets,
             state: SlotState::Idle,
         });
+    }
+
+    /// Test-only seam: mark `secondary_id` as a rostered, Operational
+    /// connection (the `self.secondaries` record the real welcome handshake
+    /// would have written), WITHOUT staging any in-flight task. Lets a test
+    /// that built its fleet through the capacity/mesh-ready confirm path
+    /// (which does not populate `self.secondaries`) exercise the #556 lazy
+    /// silent-peer requeue, whose roster guard reads `self.secondaries`.
+    /// Mirrors the connection typestate chain `register_operational_secondary`
+    /// uses; the in-flight ledger is left to the real dispatch path.
+    #[cfg(test)]
+    pub fn mark_secondary_operational_for_test(&mut self, secondary_id: &str) {
+        let conn = crate::state::SecondaryConnection::new(secondary_id.into())
+            .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+            .receive_cert_exchange(String::new(), None, None, 0, None)
+            .begin_peer_discovery()
+            .peers_ready()
+            .assignments_sent();
+        self.secondaries.insert(
+            secondary_id.into(),
+            crate::state::SecondaryConnectionState::Operational(conn),
+        );
     }
 
     /// Test-only seam: declare `secondary_id` DEAD through the genuine

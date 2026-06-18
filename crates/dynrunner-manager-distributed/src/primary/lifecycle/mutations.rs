@@ -74,6 +74,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // selection (the affine identity is preserved by the kind, not by a
         // special-cased filter here).
         for binary in resumed_for_dispatch {
+            // affine-only intentional (D-3): eager-prep is dep-less — nothing
+            // declares a dep on its cell — so it can never auto-resume as a
+            // Blocked dependent here; `has_secondary_cell()` would be a wrong
+            // generalization on this dependent-side enumeration.
             if binary.kind.is_secondary_affine() {
                 continue;
             }

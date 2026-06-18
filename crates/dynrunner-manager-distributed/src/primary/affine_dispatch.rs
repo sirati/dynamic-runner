@@ -952,6 +952,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// the prompt `TasksAdded`), which stays wholly in the caller — this seam
     /// takes the decided signal.
     ///
+    /// This is a cell-bearing recovery site — see the "cell-bearing
+    /// terminal/recovery obligations" set in
+    /// [`crate::cluster_state::secondary_cell_state`]. The import bounced (never
+    /// terminalized globally — obligation 5 holds trivially), so this seam
+    /// discharges obligation 1 (reset the per-secondary cell, step 1) and
+    /// obligation 4 (re-derive the dependents blocked on the cell, step 2) inline
+    /// rather than delegating the drain to a caller.
+    ///
     /// The three steps, in order:
     ///   1. RESET the cell `Queued → NotDone` (`affine_unqueue_mutation` — the
     ///      `SecondaryCellUnqueued` `01 → 00` reset). Defensive `if let`: the

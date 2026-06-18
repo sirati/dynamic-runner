@@ -1209,9 +1209,64 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if !self.secondaries.contains_key(secondary_id) {
                 continue;
             }
+            // CELL-BEARING affine import legs FIRST — capture-and-divert.
+            // Capture every `SecondaryAffine` import this silent secondary holds
+            // in-flight, then drive the shared bounce-recovery seam for each
+            // BEFORE `recover_inflight_for_dead_secondary` runs. Each leg is a
+            // per-secondary BOUNCE: the holder went silent, so its claimed import
+            // never completed here. `recover_bounced_affine_import` resets the
+            // now-holderless `Queued` cell `→ NotDone`, re-derives its dependents
+            // `StrandedHere`, and frees the holding slot (+ type-slot + ledger
+            // entry) ONCE. Running it BEFORE `recover_inflight` is the single-
+            // handling guarantee: `free_affine_slot_on_terminal` removes the
+            // cell-bearing leg's `in_flight` entry, so `recover_inflight`'s loop
+            // no longer sees it and processes ONLY the non-cell reassignable work
+            // — no double slot-free, no double type-slot release.
+            //
+            // This is NOT `reroute_affine_blocked_on` (the dead-secondary
+            // mirror): a reroute drains the dependents but, because the silent
+            // peer STAYS rostered, its stale `Queued` cell remains a placement
+            // candidate (`affine_placement_secondaries` reads `self.workers`, not
+            // the suspect set) and the next placement pass re-derives the
+            // dependents straight back onto that phantom cell — drain-then-re-
+            // block. Resetting the cell is the only action that clears the strand
+            // at its source; the dispatch-side FSM-suspect gate then keeps the
+            // re-dispatched import off the still-silent holder until it re-proves
+            // itself. `TasksAdded` (the prompt-recovery recheck) is correct: the
+            // FSM-suspect dispatch gate is independent of the backpressure flag,
+            // so it excludes the silent secondary regardless of signal. See
+            // "cell-bearing terminal/recovery obligations" in
+            // `cluster_state::secondary_cell_state` (obligations 1 + 4).
+            let bounced_affine_legs: Vec<(u32, String, crate::cluster_state::SecondaryCellId)> =
+                self.in_flight
+                    .iter()
+                    .filter(|(_, e)| {
+                        e.secondary_id == *secondary_id && e.task.kind.is_secondary_affine()
+                    })
+                    .filter_map(|(hash, e)| {
+                        let worker_id = e.local_worker_id?;
+                        let affine_id = self.cluster_state.affine_id_for_hash(hash)?;
+                        Some((worker_id, hash.clone(), affine_id))
+                    })
+                    .collect();
+            let recovered_any_cell_leg = !bounced_affine_legs.is_empty();
+            for (worker_id, hash, affine_id) in bounced_affine_legs {
+                self.recover_bounced_affine_import(
+                    secondary_id,
+                    worker_id,
+                    &hash,
+                    affine_id,
+                    WorkerMgmtSignal::TasksAdded,
+                )
+                .await;
+            }
+            // Now the NON-cell reassignable work: `recover_inflight` only sees
+            // the legs the bounce recovery above did NOT already divert.
             let requeue_mutations =
                 self.recover_inflight_for_dead_secondary(secondary_id);
-            if requeue_mutations.is_empty() {
+            // A cell-only holder produces no `TaskRequeued`s, but its cell legs
+            // WERE recovered above — so the early-skip must consider both.
+            if requeue_mutations.is_empty() && !recovered_any_cell_leg {
                 continue;
             }
             // Free the silent peer's worker slots LOCALLY (the tasks
@@ -1271,7 +1326,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 target: "dynrunner_consensus",
                 secondary = %secondary_id,
                 requeued = requeue_mutations.len(),
-                "#556 local scheduling-suspect: requeued in-flight tasks; peer stays in roster"
+                recovered_affine_cell_legs = recovered_any_cell_leg,
+                "#556 local scheduling-suspect: requeued in-flight tasks (and bounce-\
+                 recovered any cell-bearing affine import legs); peer stays in roster"
             );
             // Apply + broadcast the requeue mutations only — no
             // `PeerRemoved` is appended here (the peer stays alive in

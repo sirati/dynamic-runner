@@ -4751,6 +4751,108 @@ async fn dead_secondary_affine_import_full_chain_reroutes_dependent() {
         .await;
 }
 
+/// PART A (silent-peer twin, #671): the #556 lazy local requeue
+/// (`requeue_silent_held_work_locally`) for a SILENT-BUT-ROSTERED secondary
+/// holding an in-flight cell-bearing affine import must BOUNCE-recover it —
+/// reset the now-holderless `Queued` cell `→ NotDone` so the import re-derives
+/// on-demand on a live secondary, NOT leave the dependent blocked on a phantom
+/// `Queued`. The dead-secondary `reroute_affine_blocked_on` mirror does NOT work
+/// here: the silent peer STAYS rostered, so its stale `Queued` cell remains a
+/// placement candidate and the next placement pass re-derives the dependent
+/// right back onto it (drain-then-re-block). Resetting the cell clears the
+/// strand at its source.
+///
+/// REVERT-CHECK RED: replace the bounce-recovery in
+/// `requeue_silent_held_work_locally` with `reroute_affine_blocked_on` (or remove
+/// it) and the cell-reset assertion fails — the cell stays `Queued` and the
+/// dependent re-blocks on the silent secondary's phantom cell. (Also RED on
+/// Finding-1: the `is_empty` early-continue, before the bounce ran, skipped the
+/// whole recovery for a cell-only holder.)
+#[tokio::test(flavor = "current_thread")]
+async fn silent_peer_affine_import_bounce_recovers_holderless_cell() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut primary, sec, worker, import_hash, build_hash, affine_id) =
+                stage_inflight_import_with_blocked_dependent().await;
+            let import_type = primary.in_flight[&import_hash].task.type_id.clone();
+            let type_inflight_before = primary.in_flight_per_type_for_test(&import_type);
+
+            // The affine harness confirms secondaries via capacity + mesh-ready,
+            // which does NOT write the `self.secondaries` roster record the real
+            // welcome handshake would; the #556 lazy path's roster guard reads it.
+            // Stamp the Operational connection record the handshake would have.
+            primary.mark_secondary_operational_for_test(&sec);
+            assert!(
+                primary.secondaries.contains_key(&sec),
+                "the silent secondary must stay rostered for the lazy requeue path"
+            );
+
+            // Drive the #556 lazy local requeue for the silent secondary (the
+            // dispatch-altitude scheduling-suspect path), exactly as the
+            // local-suspect sweep would on a silent-but-alive peer.
+            let mut suspects = std::collections::BTreeSet::new();
+            suspects.insert(sec.clone());
+            primary
+                .requeue_silent_held_work_locally(&suspects)
+                .await
+                .expect("silent-peer local requeue");
+            settle_pump().await;
+
+            // The in-flight import leg was dropped exactly ONCE (no phantom
+            // ledger entry, no double-handling between recover_inflight + bounce).
+            assert!(
+                !primary.in_flight.contains_key(&import_hash),
+                "the silent secondary's in-flight import entry is dropped"
+            );
+            // The import is NOT globally doomed (its terminal is per-secondary).
+            assert!(
+                !primary.failed_tasks.contains_key(&import_hash),
+                "the affine import must NOT enter the global failed_tasks gate"
+            );
+            // The holding slot was freed ONCE → Idle.
+            assert!(
+                primary.slot_is_idle_for_test(&sec, worker),
+                "the holding slot must be freed to Idle by the bounce recovery"
+            );
+            // The per-type concurrency slot was released ONCE (not double-released):
+            // the in-flight-per-type counter returns to its pre-dispatch value.
+            assert_eq!(
+                primary.in_flight_per_type_for_test(&import_type),
+                type_inflight_before.saturating_sub(1),
+                "the per-type concurrency slot must be released exactly once"
+            );
+            // THE BUG THIS FIXES (cell-reset is the source-level cure): the
+            // holderless `Queued` cell on the silent secondary is reset to
+            // `NotDone`, so the import re-derives StrandedHere on-demand instead
+            // of the dependent waiting on a phantom Queued.
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                SecondaryCell::NotDone,
+                "the holderless Queued cell must be reset to NotDone by the bounce \
+                 recovery (NOT left Queued, which would re-attract the dependent)"
+            );
+            // And the dependent is NOT left blocked on the silent secondary's
+            // (now-reset) cell — it re-derives (prompt recovery), the proof the
+            // bounce-recovery achieves what reroute did not.
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&sec, &build_hash),
+                "the dependent must NOT remain blocked on the silent secondary's \
+                 reset cell (it re-derives on a live secondary)"
+            );
+            // The dependent stays alive (it re-derives; it is not terminal-failed).
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "the dependent must NOT be terminal-failed — it re-derives; got {:?}",
+                primary.cluster_state_for_test().task_state(&build_hash)
+            );
+        })
+        .await;
+}
+
 /// PART B (defense-in-depth): a failover hydrate of a CRDT that records an
 /// affine import as `TaskState::Failed` must NOT load the import hash into
 /// `failed_tasks` (the global doom-gate the affine readiness check reads), and
