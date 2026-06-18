@@ -521,7 +521,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // no further dispatch will fence on it. Symmetric with the wire-side
         // drops in `handle_task_complete` / `handle_task_failed` so the side-
         // map cannot outlive the task on any settle path.
-        self.drop_supplanted_holder(task_hash);
+        self.drop_local_terminal_residue(task_hash);
 
         // 3. Phase cascade — only when THIS call actually released local
         // residue (otherwise the wire handler already ran it).

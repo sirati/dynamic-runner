@@ -321,7 +321,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `TaskFailed` (NOT `TaskRequeued`) and never seeds a hint, but
         // the symmetric drop keeps the invariant that the side-map is
         // strictly bounded by the in-flight ledger lifecycle.
-        self.drop_supplanted_holder(&task_hash);
+        self.drop_local_terminal_residue(&task_hash);
         let (phase, task_id) = (entry.phase, entry.task.task_id.clone());
         self.settle_setup_terminal(&task_hash, &phase, &task_id, outcome, command_rx)
             .await;

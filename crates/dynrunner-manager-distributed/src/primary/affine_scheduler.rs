@@ -304,10 +304,17 @@ impl AffineScheduler {
     /// 5-min reconcile sweep for the per-secondary blocked map (#652 concern C):
     /// the ORPHAN net for affine-blocked work, the complement of the pool's
     /// `reconcile_blocked`. For each `(secondary, work_hash, pending imports)`,
-    /// the entry is ORPHANED — its unblock event will never come — when EITHER:
+    /// the entry is ORPHANED — its unblock event will never come — when ANY of:
     ///   * its `secondary` is no longer `reachable` (the dead-secondary drain
     ///     should already have caught this; reconcile is the backstop for a
     ///     miss), OR
+    ///   * EVERY pending import already reads `Done` — its `Finished` events have
+    ///     ALL already fired, so `on_cell_finished` should have emptied this
+    ///     entry and re-enqueued the work; an entry still here with an all-`Done`
+    ///     pending set has missed its unblock and NO future `Finished` will
+    ///     re-fire (currently non-occurring on an active primary, where the
+    ///     primary writes every cell-`Done` locally and `on_cell_finished` fires
+    ///     in lockstep — a cheap net-hole defense), OR
     ///   * a pending import has no terminal coming to flip its cell — it is
     ///     neither `Done` (an already-fired `Finished` was lost) nor GENUINELY
     ///     in flight. A `Queued` cell counts as in-flight ONLY when its import is
@@ -344,6 +351,15 @@ impl AffineScheduler {
         let mut orphaned = Vec::new();
         self.blocked_per_secondary.retain(|(sec, work_hash), pending| {
             let unreachable = !reachable(sec);
+            // Every pending import already `Done` — the unblock `Finished`
+            // events have all fired, so this entry should have been emptied +
+            // re-enqueued by `on_cell_finished`; still here ⇒ the unblock was
+            // missed and no future `Finished` re-fires. (Empty set treated as
+            // not-all-done — `block_until_import` never stores an empty set.)
+            let all_done = !pending.is_empty()
+                && pending
+                    .iter()
+                    .all(|aid| matches!(cell_of(sec, *aid), SecondaryCell::Done));
             let no_terminal_coming = pending.iter().any(|aid| match cell_of(sec, *aid) {
                 SecondaryCell::Done => false, // already finished — no terminal needed
                 // `Queued` is "unblock coming" ONLY if a live slot is actually
@@ -353,7 +369,7 @@ impl AffineScheduler {
                 // NotDone / Failed: no terminal coming to flip it `Done`.
                 _ => true,
             });
-            if unreachable || no_terminal_coming {
+            if unreachable || all_done || no_terminal_coming {
                 orphaned.push(work_hash.clone());
                 false // remove the orphan
             } else {
@@ -1346,5 +1362,38 @@ mod tests {
             sched.reconcile_per_secondary_blocked(reachable, cells.of(), import_in_flight);
         assert!(orphans.is_empty(), "an in-flight Queued import is not orphaned");
         assert!(sched.is_blocked_on_import("s1", "in_flight"));
+    }
+
+    #[test]
+    fn reconcile_orphans_block_whose_every_pending_cell_is_done() {
+        // #663 (b) net-hole defense: a blocked entry whose EVERY pending import
+        // already reads `Done` has had all its unblock `Finished` events fire —
+        // `on_cell_finished` should have emptied + re-enqueued it. An entry
+        // still present with an all-`Done` pending set MISSED its unblock and no
+        // future `Finished` will re-fire, so it is ORPHANED (re-routed) rather
+        // than retained as "unblock coming". A MULTI-import entry where only
+        // SOME cells are `Done` is NOT all-done — its remaining not-`Done`
+        // import is still expected to fire, so it stays healthy.
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        // orphan: both pending imports already Done on reachable s1.
+        cells.set("s1", aid(0), SecondaryCell::Done);
+        cells.set("s1", aid(1), SecondaryCell::Done);
+        sched.block_until_import("s1", "all_done_orphan", vec![aid(0), aid(1)]);
+        // healthy: one Done, one still Queued-in-flight — not all done.
+        cells.set("s1", aid(2), SecondaryCell::Done);
+        cells.set("s1", aid(3), SecondaryCell::Queued);
+        sched.block_until_import("s1", "partial_done", vec![aid(2), aid(3)]);
+
+        let reachable = |_: &str| true;
+        let import_in_flight = |s: &str, a: SecondaryCellId| s == "s1" && a == aid(3);
+        let orphans =
+            sched.reconcile_per_secondary_blocked(reachable, cells.of(), import_in_flight);
+        assert_eq!(orphans, vec!["all_done_orphan".to_string()]);
+        assert!(!sched.is_blocked_on_import("s1", "all_done_orphan"));
+        assert!(
+            sched.is_blocked_on_import("s1", "partial_done"),
+            "a partially-Done block still has an import to wait on — kept"
+        );
     }
 }
