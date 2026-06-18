@@ -355,18 +355,85 @@ fn other_transition_narrates_from_to_with_txn() {
     assert!(msg.contains("crdt_txn=e3.v7.a1"), "CRDT txn id: {msg:?}");
 }
 
-/// A CREATE (no prior state) narrates the bare "changed state to {new}"
-/// (no dangling arrow) and still carries the txn id.
+/// A CREATE (no prior state) into a MEANINGFUL first state narrates the
+/// bare "changed state to {new}" (no dangling arrow) and still carries the
+/// txn id. `blocked` (a dependency wait) is such a state — distinct from
+/// the suppressed `pending` seed (see
+/// [`create_into_pending_seed_is_suppressed`]).
 #[test]
 fn other_transition_create_has_no_from_arrow() {
     let events = capture(|| {
         let n = armed();
-        assert!(n.narrate_live(&evt("t1", TaskStateChange::Other { state: "pending" }, None)));
+        assert!(n.narrate_live(&evt("t1", TaskStateChange::Other { state: "blocked" }, None)));
     });
     let msg = &events[0].leveled.event.message;
-    assert!(msg.contains("changed state to pending"), "{msg:?}");
+    assert!(msg.contains("changed state to blocked"), "{msg:?}");
     assert!(!msg.contains("from"), "no from-arrow on a CREATE: {msg:?}");
     assert!(msg.contains("crdt_txn=e0.v0.a0"), "txn id even on a CREATE: {msg:?}");
+}
+
+/// #651 SEED-FLOOD guard (RED→GREEN): a CREATE (no prior state) into the
+/// DEFAULT `pending` state — the initial baseline seed — narrates NOTHING
+/// per task (returns `false`, emits no line). At 120k tasks a relocated
+/// observer mirrors the recompose-seed as 120k LIVE CREATE-into-pending
+/// broadcasts; one operator line each made narration O(tasks-at-seed) (a
+/// multi-hour, 300MB+ replay that wedged the observer behind the seed). The
+/// converged seed is the once-per-run baseline summary's job, not a
+/// per-task line. RED before the guard: this asserted a "changed state to
+/// pending" line; GREEN now: zero lines.
+#[test]
+fn create_into_pending_seed_is_suppressed() {
+    let events = capture(|| {
+        let n = armed();
+        // The seed shape: a CREATE (from = None) into pending.
+        assert!(
+            !n.narrate_live(&evt("seed-1", TaskStateChange::Other { state: "pending" }, None)),
+            "a CREATE-into-pending seed must narrate nothing per task",
+        );
+        // A WHOLE seed batch is O(1) narration (zero lines) — this stands
+        // in for the 120k-task seed flood the guard collapses.
+        for i in 0..1000 {
+            assert!(!n.narrate_live(&evt(
+                &format!("seed-{i}"),
+                TaskStateChange::Other { state: "pending" },
+                None,
+            )));
+        }
+    });
+    assert_eq!(
+        events.len(),
+        0,
+        "the seed batch narrates ZERO per-task lines, not one-per-task: {} lines",
+        events.len(),
+    );
+}
+
+/// #651 boundary: a RE-entry into pending (a known prior state — a requeue
+/// / cascade resume) is a GENUINE transition and STILL narrates per-task.
+/// Only the initial seed (CREATE-into-pending, no prior state) is
+/// suppressed; a task that legitimately returns to pending from a known
+/// state is the operator's interest.
+#[test]
+fn reentry_into_pending_still_narrates() {
+    let events = capture(|| {
+        let n = armed();
+        assert!(
+            n.narrate_live(&evt_from(
+                "requeued",
+                TaskStateChange::Other { state: "pending" },
+                None,
+                "failed",
+                TaskTxnId { primary_epoch: 2, seq: 4, attempt: 1 },
+            )),
+            "a transition BACK to pending from a known state is a real change",
+        );
+    });
+    assert_eq!(events.len(), 1, "the re-entry narrates one line: {events:?}");
+    let msg = &events[0].leveled.event.message;
+    assert!(
+        msg.contains("changed state from failed to pending"),
+        "re-entry names the prior state: {msg:?}",
+    );
 }
 
 /// An assignment with a known prior state renders the symmetric
