@@ -884,6 +884,50 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
     }
 
+    /// Recover an affine IMPORT that BOUNCED on `secondary` — it never ran here,
+    /// so its per-secondary state must be reset and the dependents it left
+    /// stranded re-derived. The SINGLE recovery seam for an import bounce, so a
+    /// future bounce variant CANNOT miss any of the three steps: both the
+    /// backpressure-`TaskFailed` arm (`handle_affine_task_failed`) and the
+    /// illegally-assigned-import arm (`handle_illegally_assigned`, #665) funnel
+    /// here. Their only divergence is the `recheck_signal` policy (the
+    /// backpressure arm computes a capacity-aware brake; the illegal arm passes
+    /// the prompt `TasksAdded`), which stays wholly in the caller — this seam
+    /// takes the decided signal.
+    ///
+    /// The three steps, in order:
+    ///   1. RESET the cell `Queued → NotDone` (`affine_unqueue_mutation` — the
+    ///      `SecondaryCellUnqueued` `01 → 00` reset). Defensive `if let`: the
+    ///      caller has already gated on `affine_id_for_hash`, so it is `Some`.
+    ///   2. RE-DERIVE the dependents blocked on this cell here
+    ///      (`reenqueue_affine_unblocked_on_cell`) with the caller's
+    ///      `recheck_signal`, so the work re-pops `StrandedHere` and re-runs the
+    ///      import on-demand rather than waiting forever on a `Queued`-with-no-holder
+    ///      cell (the `InFlightHere` strand).
+    ///   3. FREE the holding slot for THIS per-secondary run, addressed by the
+    ///      terminal's OWN `(secondary, worker_id)` — slot-direct, NOT the shared
+    ///      hash-keyed `free_slot_on_terminal`. The import runs the same hash on
+    ///      multiple secondaries concurrently; the hash-keyed ledger holds only
+    ///      one holder, so the shared path would free the WRONG secondary's slot
+    ///      and orphan this worker's slot `Assigned` forever. No `pool.requeue`
+    ///      and no `TaskRequeued`: the import is never a pool item — it re-derives
+    ///      on-demand off the reset cell.
+    pub(crate) async fn recover_bounced_affine_import(
+        &mut self,
+        secondary_id: &str,
+        worker_id: u32,
+        task_hash: &str,
+        affine_id: SecondaryCellId,
+        recheck_signal: crate::worker_signal::WorkerMgmtSignal,
+    ) {
+        if let Some(m) = self.affine_unqueue_mutation(secondary_id, task_hash) {
+            self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+        }
+        self.reenqueue_affine_unblocked_on_cell(secondary_id, affine_id, recheck_signal)
+            .await;
+        self.free_affine_slot_on_terminal(secondary_id, worker_id, task_hash);
+    }
+
     /// Cell-`Finished` unblock (#652 concern B): an affine import's cell just
     /// flipped `Done` on `secondary`. Re-enqueue every work that was blocked on
     /// that import here onto `secondary`'s queue so it re-pops + re-gates (the

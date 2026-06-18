@@ -558,20 +558,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let is_backpressure = is_backpressure_shaped(error_message);
 
         if is_backpressure {
-            // BACKPRESSURE BOUNCE: the import never ran here. Reset the cell
-            // `Queued → NotDone` so the dependent re-derives the import via the
-            // `StrandedHere` gate, rather than waiting forever on a `Queued`
-            // (`InFlightHere`) cell whose terminal already left as this bounce.
-            // `affine_unqueue_mutation` is `None` only for a hash with no
-            // affine-id — but the caller already gated on `affine_id_for_hash`,
-            // so it is `Some` here; the `if let` is defensive. NO `Failed`
-            // flip, NO `fast_fail` (the import is recoverable), and NO
-            // `drop_local_terminal_residue` (symmetric with the work-pool
-            // backpressure arm: the hash re-enters, so the next on-demand
-            // dispatch must still be fenced).
-            if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &task_hash) {
-                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
-            }
+            // BACKPRESSURE BOUNCE: the import never ran here. The shared
+            // import-bounce recovery (#666) resets the cell `Queued → NotDone`,
+            // re-derives the dependents blocked on it here (so they re-pop
+            // `StrandedHere` rather than wait forever on a `Queued`-with-no-holder
+            // cell whose terminal already left as this bounce), and frees the
+            // slot slot-direct. NO `Failed` flip, NO `fast_fail` (the import is
+            // recoverable), and NO `drop_local_terminal_residue` (symmetric with
+            // the work-pool backpressure arm: the hash re-enters, so the next
+            // on-demand dispatch must still be fenced).
+            //
             // CAPACITY-BOUNCE BRAKE (#656 M2, the affine sibling of the general
             // arm's capacity gate at :248 + :362): an import refused with the
             // GENUINE CAPACITY shape ("No idle worker available" — every worker
@@ -583,13 +579,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // flag event-clears on the next real capacity event (the #652
             // `TaskComplete` + capacity-growth clears) — no new clear needed.
             // BUT the flag alone is defeated by a bypass=TRUE `TasksAdded`
-            // recheck, so the re-enqueue below must emit the bypass=FALSE
+            // recheck, so the re-enqueue must emit the bypass=FALSE
             // `TasksReadyBackpressureAware` for THIS shape — exactly mirroring
             // the general arm. ONLY the capacity shape: the other backpressure
             // shapes (pipe-broken / preempt / reconciliation / stale-gen) are
             // NOT capacity-exhausted and must recover PROMPTLY (gating them hung
             // phase_ordering in the general fix — same risk here), so they keep
-            // the bypass=TRUE `TasksAdded` and never set the flag.
+            // the bypass=TRUE `TasksAdded` and never set the flag. The brake is
+            // caller-owned policy: it decides the `recheck_signal` the shared
+            // seam then carries (cell-state-independent, so it runs before the
+            // recovery without changing observable order).
             let is_capacity_bounce = error_message == "No idle worker available";
             let recheck_signal = if is_capacity_bounce {
                 let backoff_ms = 500;
@@ -601,18 +600,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             } else {
                 WorkerMgmtSignal::TasksAdded
             };
-            // PER-SECONDARY UNBLOCK on bounce (#652 concern B): a work blocked
-            // on this import here is waiting on a cell that just went `Queued →
-            // NotDone` (the import never ran). Re-enqueue it so it re-pops
-            // `StrandedHere` and re-derives the import on-demand — otherwise it
-            // would wait forever on a cell no terminal will ever flip `Done`
-            // (the bounce already consumed the only in-flight run). Reuses the
-            // cell-finished re-enqueue seam (it re-appends + re-gates uniformly).
-            // The recheck signal is shape-aware (capacity → bp-aware/braked,
-            // else → prompt `TasksAdded`).
+            // `affine_id_for_hash` is `Some` here (the dispatcher gated this
+            // function on it at :154); the `if let` is defensive.
             if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&task_hash) {
-                self.reenqueue_affine_unblocked_on_cell(
+                self.recover_bounced_affine_import(
                     &secondary_id,
+                    worker_id,
+                    &task_hash,
                     affine_id,
                     recheck_signal,
                 )
@@ -693,16 +687,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 "affine import FAILED on secondary (bitvector Failed, non-sticky); \
                  phase-neutral — dependents re-route via re-placement"
             );
+            // WORKER SLOT (genuine-terminal branch): free the holding slot for
+            // THIS per-secondary run, addressed by the terminal's OWN (secondary,
+            // worker) — slot-direct, NOT the shared hash-keyed
+            // `free_slot_on_terminal`. The import runs the same hash on multiple
+            // secondaries concurrently; the hash-keyed ledger holds only one
+            // holder, so the shared path would free the wrong secondary's slot and
+            // orphan this worker's slot Assigned forever. No phase cascade. (The
+            // backpressure branch frees through the shared #666 recovery seam.)
+            self.free_affine_slot_on_terminal(&secondary_id, worker_id, &task_hash);
         }
-
-        // WORKER SLOT (both branches): free the holding slot for THIS
-        // per-secondary run, addressed by the terminal's OWN (secondary, worker)
-        // — slot-direct, NOT the shared hash-keyed `free_slot_on_terminal`. The
-        // import runs the same hash on multiple secondaries concurrently; the
-        // hash-keyed ledger holds only one holder, so the shared path would free
-        // the wrong secondary's slot and orphan this worker's slot Assigned
-        // forever. No phase cascade.
-        self.free_affine_slot_on_terminal(&secondary_id, worker_id, &task_hash);
 
         // The freed worker is re-evaluated by the dispatch recheck; on a
         // backpressure reset the dependent re-pops `StrandedHere` and re-runs

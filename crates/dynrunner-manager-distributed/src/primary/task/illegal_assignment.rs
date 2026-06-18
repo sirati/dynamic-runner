@@ -157,27 +157,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // backpressure arm and the on-demand `Refused` recovery use, with no
             // backpressure-flag brake.
             //
-            // `affine_unqueue_mutation` is `Some` here (gated on `affine_id_for_hash`
-            // just above); the `if let` is defensive, mirroring failed.rs:572.
-            if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &assigned.hash) {
-                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
-            }
-            self.reenqueue_affine_unblocked_on_cell(
+            // The shared import-bounce recovery seam (#666): reset the cell
+            // `Queued → NotDone`, re-derive the blocked dependents, and free the
+            // slot slot-direct. The bounce carries NO capacity signal (it is a
+            // roster/occupancy divergence, not "every worker busy"), so the
+            // recheck is the PROMPT `TasksAdded` — no backpressure-flag brake.
+            self.recover_bounced_affine_import(
                 &secondary_id,
+                worker_id,
+                &assigned.hash,
                 affine_id,
                 WorkerMgmtSignal::TasksAdded,
             )
             .await;
-            // Free the holding slot for THIS per-secondary run, addressed by the
-            // terminal's OWN `(secondary, worker_id)` — slot-direct, NOT the shared
-            // hash-keyed `free_slot_on_terminal`. The import runs the same hash on
-            // multiple secondaries concurrently; the hash-keyed ledger holds only
-            // one holder, so the shared path would free the WRONG secondary's slot
-            // and orphan this worker's slot `Assigned` forever (the exact reason
-            // failed.rs:705 uses `free_affine_slot_on_terminal`). No `pool.requeue`
-            // and no `TaskRequeued`: the import is never a pool item — it re-derives
-            // on-demand off the reset cell.
-            self.free_affine_slot_on_terminal(&secondary_id, worker_id, &assigned.hash);
         } else if let Some(entry) =
             self.free_slot_on_terminal(&secondary_id, worker_id, &assigned.hash)
         {
