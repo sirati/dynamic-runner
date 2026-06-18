@@ -305,18 +305,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // Naming the count here turns a silent strand into a
                             // one-line greppable signal: a non-zero
                             // `affine_dep_strand_candidates` while workers park
-                            // pins THIS layer immediately. Upper bound (a
-                            // momentarily popped-but-not-redispatched unit
-                            // counts), so it is diagnostic only.
-                            let affine_dep_strand_candidates =
-                                self.affine_scheduler.placed_but_unqueued_count();
-                            // The actual stranded work hashes (bounded), so the
-                            // signal is greppable to the OFFENDING units in one
-                            // line — not just a count. The count above carries
-                            // the full magnitude when it exceeds the cap.
-                            let affine_dep_strand_hashes = self
-                                .affine_scheduler
-                                .placed_but_unqueued_hashes(AFFINE_STRAND_HASH_LOG_LIMIT);
+                            // pins THIS layer immediately. The coordinator seam
+                            // applies the in-flight (ledger) exclusion — together
+                            // with the scheduler's queue + blocked-on-import
+                            // exclusions — so a popped-not-terminal,
+                            // blocked-on-import, or completed unit no longer
+                            // over-reports as a strand; what remains is the
+                            // genuinely-unassignable set. Count + bounded hash
+                            // sample come from the SAME filtered set.
+                            let (affine_dep_strand_candidates, affine_dep_strand_hashes) =
+                                self.affine_dep_strand_count_and_hashes(
+                                    AFFINE_STRAND_HASH_LOG_LIMIT,
+                                );
                             tracing::debug!(
                                 parked_workers = parked,
                                 suppressed_re_requests = suppressed,
