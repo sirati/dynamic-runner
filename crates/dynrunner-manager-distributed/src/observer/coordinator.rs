@@ -2146,9 +2146,27 @@ where
         //    `dynrunner-transport-quic::peer::mod::1086`). `run_aborted` is
         //    a CRDT-replicated terminal too (the primary's deliberate fatal
         //    verdict), so EITHER terminal releases arm 3.
+        //    MID-TRANSFER HOLD (symmetry with arm 2): if the observed
+        //    terminal is a `run_complete` that landed on a snapshot stream's
+        //    HEAD and the transport then closed mid-stream with a stale-HIGH
+        //    `peer_count`, exiting here would report the complete run off a
+        //    half-merged mirror (partial per-task narration). Hold the exit
+        //    while an inbound stream is still being applied — same guard arm 2
+        //    uses; the stream's `done` (or its responder stalling past the
+        //    idle TTL) releases it. A `run_aborted` terminal is the operator/
+        //    fatal verdict where leaving promptly beats complete stats, so it
+        //    is NOT held — but `mid_transfer` is only ever true when a stream
+        //    is live, which a clean `run_complete` HEAD opens, so this gate
+        //    does not delay the abort tail.
         let observed_terminal =
             self.cluster_state.run_complete() || self.cluster_state.run_aborted().is_some();
-        if transport_closed && self.client.peer_count() > 0 && observed_terminal {
+        if transport_closed
+            && self.client.peer_count() > 0
+            && observed_terminal
+            && !self
+                .inbound_snapshots
+                .mid_transfer(crate::snapshot_stream::STREAM_IDLE_TTL)
+        {
             return Some(ObserverTerminal::Done);
         }
         None
