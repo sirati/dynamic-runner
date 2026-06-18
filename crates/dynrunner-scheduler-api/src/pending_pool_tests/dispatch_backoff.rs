@@ -58,6 +58,67 @@ fn first_requeue_is_free_second_is_hidden_until_backoff_expires() {
     );
 }
 
+/// Root regression — the first-free bounce strand. Production sequence
+/// (kissfft eval, run_20260617, matrix_eval queued=1 stuck for the whole
+/// phase): a worker first-bind "mesh leg unconfirmed" reinject raised
+/// TaskFailed, which drove `pool.requeue` into `note_requeued` at streak 1
+/// (delay_ms=0, the free first bounce). The bounced task is immediately
+/// eligible but carries NO future stamp, so pre-fix
+/// `next_dispatch_backoff_expiry` saw an empty expiry heap plus an empty
+/// pending_redispatch and returned `None`, parking the op-loop backoff arm on
+/// `pending()` forever (task_backoff arm count 0,0,0). The task sat queued,
+/// eligible, NEVER re-pushed to an idle worker, holding its phase's drain gate
+/// (queued>0) open indefinitely. The fix arms the bounded re-poll level-net on
+/// the free first bounce so the arm fires, emits TasksAdded, and
+/// dispatch_to_idle_workers re-pushes it.
+///
+/// Crucially this exercises `next_dispatch_backoff_expiry` for the FIRST
+/// bounce with NO intervening `pop_for_worker` (which would clear the level
+/// via `note_taken`) — the exact case the existing
+/// `first_requeue_is_free_second_is_hidden_until_backoff_expires` masked by
+/// popping the free item directly.
+#[test]
+fn first_free_bounce_arms_the_redispatch_level_net() {
+    let mut p = pool_with(&["P"], &[]);
+    p.set_dispatch_backoff_params(BASE, CAP);
+    p.extend([t("P", "T", "", 10)]).expect("valid extend");
+
+    // Dispatch then bounce on the FIRST attempt (streak 1, delay_ms=0).
+    let item = p.pop_for_worker(1).expect("fresh item dispatches");
+    p.requeue(item);
+
+    // The bounced task is queued and immediately eligible — but it must NOT
+    // strand. The level-net must surface a wake so the op-loop re-dispatches
+    // it. (RED at c2d71e01: returned None → the task stranded forever.)
+    let now = std::time::Instant::now();
+    let due = p
+        .next_dispatch_backoff_expiry()
+        .expect("a first-free bounce must arm a re-dispatch wake, not strand");
+    // The wake is a BOUNDED re-poll (no future backoff window on a free
+    // bounce), so it lands within ~one re-poll interval — not now-raw (no
+    // hot-spin), not the full backoff cap.
+    assert!(
+        due > now - Duration::from_millis(1),
+        "the wake must not be in the past (no hot-spin)"
+    );
+    assert!(
+        due <= now + p.dispatch_repoll_interval() + Duration::from_millis(20),
+        "the wake is a bounded re-poll, not a strict backoff window"
+    );
+
+    // The recheck the wake triggers actually dispatches the eligible task
+    // (a free bounce stays immediately poppable). Once taken, the level
+    // clears — the arm parks instead of hot-spinning.
+    let taken = p
+        .pop_for_worker(1)
+        .expect("the first-free bounce is immediately re-dispatchable");
+    let _ = taken;
+    assert!(
+        p.next_dispatch_backoff_expiry().is_none(),
+        "a re-dispatched first-free bounce must end the re-poll level (no hot-spin)"
+    );
+}
+
 #[test]
 fn reinject_shares_the_same_streak() {
     let mut p = pool_with(&["P"], &[]);
@@ -90,16 +151,26 @@ fn backoff_doubles_per_requeue_and_saturates_at_cap() {
     p.set_dispatch_backoff_params(BASE, CAP);
     p.extend([t("P", "T", "", 10)]).expect("valid extend");
 
-    // Streaks 1..=6 give 0/30/60/120/240/240ms. The free first
-    // re-entry exposes NO wake; from streak 2 the strictly-future
-    // expiry stamp tracks the doubling ladder.
+    // Streaks 1..=6 give 0/30/60/120/240/240ms. The free first re-entry
+    // carries no FUTURE stamp but IS immediately eligible-but-undispatched,
+    // so it arms a BOUNDED re-poll wake (the level-net that re-pushes it to
+    // an idle worker — without it the eligible task strands, holding its
+    // phase drain gate open). From streak 2 the strictly-future expiry stamp
+    // tracks the doubling ladder. Taking the item clears the re-poll level.
     let mut item = p.pop_for_worker(1).expect("fresh item");
     p.requeue(item);
+    let free_repoll = p
+        .next_dispatch_backoff_expiry()
+        .expect("the free first re-entry must arm a re-poll wake, not strand");
     assert!(
-        p.next_dispatch_backoff_expiry().is_none(),
-        "the free first re-entry must not park a wake"
+        free_repoll <= std::time::Instant::now() + p.dispatch_repoll_interval() + Duration::from_millis(20),
+        "the free first re-entry's wake is a BOUNDED re-poll, not a backoff window"
     );
     item = p.pop_for_worker(1).expect("free first re-entry");
+    assert!(
+        p.next_dispatch_backoff_expiry().is_none(),
+        "taking the free first re-entry clears its re-poll level"
+    );
 
     let mut expected = vec![30u64, 60, 120, 240, 240];
     expected.reverse();
@@ -171,16 +242,25 @@ fn terminal_clears_the_streak() {
 
     // Terminal success: the streak resets. A FRESH lifecycle of the
     // same task id (reinject after terminal) starts back at the free
-    // first re-entry, not at streak 3.
+    // first re-entry, not at streak 3 — so its wake is a BOUNDED re-poll
+    // (the immediately-eligible-but-undispatched level-net), NOT a
+    // strictly-future backoff window from a carried-over streak.
     p.on_item_finished(&phase, Some(&id));
     p.reinject(item);
+    let repoll = p
+        .next_dispatch_backoff_expiry()
+        .expect("post-terminal free re-entry arms a re-poll, not a strand");
     assert!(
-        p.next_dispatch_backoff_expiry().is_none(),
-        "post-terminal streak must restart at the free first re-entry"
+        repoll <= std::time::Instant::now() + p.dispatch_repoll_interval() + Duration::from_millis(20),
+        "post-terminal streak must restart at the free first re-entry (bounded re-poll, not a backoff window)"
     );
     assert!(
         p.pop_for_worker(1).is_some(),
         "the post-terminal reinject is immediately dispatchable"
+    );
+    assert!(
+        p.next_dispatch_backoff_expiry().is_none(),
+        "taking it clears the re-poll level"
     );
 }
 
