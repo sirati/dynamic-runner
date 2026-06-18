@@ -267,7 +267,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     started_phases.insert(def.phase_id.clone());
                     phases_with_terminal.insert(def.phase_id.clone());
                     soft_failed_seed.push((def.task_id.clone(), def.phase_id.clone()));
-                    failed_tasks.insert(hash.clone(), kind.clone());
+                    // #668 defense-in-depth: an affine import's terminal is
+                    // PER-SECONDARY (the bitvector cell), never the global
+                    // `failed_tasks` gate — that gate is what the affine
+                    // readiness check reads to DOOM every dependent as
+                    // `Unsatisfiable`, which is exactly the bug. A
+                    // `SecondaryAffine` hash must never enter it (Part A stops
+                    // the root that flips an affine CRDT `Failed` on death; this
+                    // guard makes the projection unconditionally affine-safe for
+                    // any other path that ever lands an affine `Failed`).
+                    if !def.kind.is_secondary_affine() {
+                        failed_tasks.insert(hash.clone(), kind.clone());
+                    }
                 }
                 // The ONLY dispatch-observed terminal that satisfies
                 // dependents' deps: a completed prereq produced its
@@ -467,7 +478,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     started_phases.insert(entry.phase_id.clone());
                     phases_with_terminal.insert(entry.phase_id.clone());
                     soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
-                    failed_tasks.insert(hash.clone(), kind.clone());
+                    // #668 defense-in-depth (settled twin of the fat `Failed`
+                    // arm): an affine import's terminal is PER-SECONDARY, never
+                    // the global `failed_tasks` doom-gate. A `SecondaryAffine`
+                    // token never reaches a settle-eligible terminal in practice
+                    // (it is a gate, never executed by the primary — see
+                    // `SettledEntry::category`), so the carried count category is
+                    // the affine discriminant here; the guard keeps the
+                    // projection affine-safe for totality regardless.
+                    if entry.category
+                        != dynrunner_core::TaskCountCategory::SecondaryAffine
+                    {
+                        failed_tasks.insert(hash.clone(), kind.clone());
+                    }
                 }
                 SettledClass::InvalidTask => {
                     started_phases.insert(entry.phase_id.clone());

@@ -513,6 +513,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.completed_tasks.insert(task_hash.to_string());
         } else if let Some(kind) = failed_kind.clone()
             && !self.completed_tasks.contains(task_hash)
+            // #668 defense-in-depth: an affine import's terminal is
+            // PER-SECONDARY (the bitvector cell), never the global
+            // `failed_tasks` doom-gate the affine readiness check reads to fail
+            // every dependent `Unsatisfiable`. A `SecondaryAffine` hash must
+            // never enter `failed_tasks` on ANY path — the settle mirror
+            // included — so the projection stays affine-safe even if some other
+            // path ever flips an affine CRDT `Failed`.
+            && !self.cluster_state.is_secondary_affine_hash(task_hash)
         {
             self.failed_tasks.insert(task_hash.to_string(), kind);
         }

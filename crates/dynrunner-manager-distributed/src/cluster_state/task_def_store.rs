@@ -802,6 +802,17 @@ impl<I> TaskDefStore<I> {
         self.hash_to_id.get(hash).copied()
     }
 
+    /// The [`TaskKind`] of the def bound to content `hash` (`hash → id → def
+    /// → kind`), or `None` when the hash is not (yet) interned in this store.
+    /// The hash-keyed twin of [`Self::kind_for_cell_id`] — the same single
+    /// `resolve`-via-def authority, keyed by content hash rather than cell-id,
+    /// for the call sites that classify a terminal BY HASH (the `failed_tasks`
+    /// affine-exclusion gate) and have no def in hand.
+    pub(crate) fn kind_for_hash(&self, hash: &str) -> Option<TaskKind> {
+        let def_id = self.hash_to_id.get(hash)?;
+        self.resolve(*def_id).map(|def| def.kind)
+    }
+
     /// The def id for a `(phase_id, task_id)` IDENTITY, if a def with that
     /// identity has been interned — the public read of the L5 reverse-index,
     /// used by the originator's dep-stamp pass to resolve a dep already in a

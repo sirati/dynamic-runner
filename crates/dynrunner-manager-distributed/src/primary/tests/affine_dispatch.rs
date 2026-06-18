@@ -4402,3 +4402,249 @@ async fn affine_pull_multidep_dispatches_base_before_delta_on_idle_secondary() {
         })
         .await;
 }
+
+// ── #668: dead-secondary affine-import discrimination ──────────────────────
+//
+// An affine IMPORT in-flight on a secondary that DIES must be treated
+// PER-SECONDARY (its terminal is the bitvector cell), NEVER as a global task
+// terminal. The dead-secondary recovery's `is_reassignable()` dichotomy had no
+// affine arm, so a `SecondaryAffine` import (is_reassignable == false) fell into
+// the non-reassignable `else` and emitted a GLOBAL `ClusterMutation::TaskFailed`
+// — a spurious doom that lies dormant until a failover hydrate loads the CRDT
+// `Failed` into `failed_tasks` and the affine readiness gate dooms the import's
+// whole dependent subtree (`Unsatisfiable`).
+
+/// Stage a GENUINELY in-flight affine import on one secondary, with its
+/// dependent build blocked `InFlightHere` on that secondary's claimed cell —
+/// the exact pre-death state the dead-secondary recovery must discriminate.
+/// Returns `(primary, dead_secondary, worker, import_hash, build_hash, affine_id)`.
+/// The dependent never dispatches (its import is not yet `Done`).
+async fn stage_inflight_import_with_blocked_dependent() -> (
+    TestPrimary,
+    String,
+    u32,
+    String,
+    String,
+    crate::cluster_state::SecondaryCellId,
+) {
+    let import = affine_import("import");
+    let import_hash = compute_task_hash(&import);
+    let build = work_dep("build", "import");
+    let build_hash = compute_task_hash(&build);
+
+    let (mut primary, mut ends, mut wm_rx, _mesh) =
+        primary_two_secondaries_with(vec![import, build]);
+    confirm_two(&mut primary).await;
+
+    let affine_id = primary
+        .cluster_state_for_test()
+        .affine_id_for_hash(&import_hash)
+        .expect("registered affine-id");
+
+    drain_rechecks(&mut primary, &mut wm_rx).await;
+    let mut import_dispatch: Option<(String, u32)> = None;
+    for (_id, rx, _tx) in ends.iter_mut() {
+        for (_, sec, worker, h) in assignments(rx) {
+            assert_ne!(h, build_hash, "build must not dispatch before import Done");
+            if h == import_hash {
+                import_dispatch = Some((sec.clone(), worker));
+            }
+        }
+    }
+    let (sec, worker) =
+        import_dispatch.expect("the on-demand import dispatched (StrandedHere)");
+    // The on-demand dispatch claimed the cell `Queued` and seeded the in-flight
+    // ledger + holding slot for the import on this secondary.
+    assert_eq!(
+        primary.cluster_state_for_test().affine_state(&sec, affine_id),
+        SecondaryCell::Queued,
+        "on-demand dispatch claims the cell Queued"
+    );
+    assert!(
+        primary.in_flight.contains_key(&import_hash),
+        "the in-flight ledger holds the import after dispatch"
+    );
+    assert_eq!(
+        primary.in_flight[&import_hash].secondary_id, sec,
+        "the ledger entry points at the dispatching secondary"
+    );
+    assert!(
+        primary.affine_is_blocked_on_import_for_test(&sec, &build_hash),
+        "the dependent build is blocked InFlightHere on the import's cell"
+    );
+    (primary, sec, worker, import_hash, build_hash, affine_id)
+}
+
+/// PART A (root): the dead-secondary recovery returns NO global `TaskFailed` for
+/// an in-flight affine import — its death is per-secondary, not a global
+/// terminal.
+///
+/// RED pre-fix: `recover_inflight_for_dead_secondary` had no `is_secondary_affine`
+/// arm, so the import (is_reassignable == false) fell into the non-reassignable
+/// `else` and the returned mutation set carried a
+/// `ClusterMutation::TaskFailed { hash: import }`.
+#[tokio::test(flavor = "current_thread")]
+async fn dead_secondary_affine_import_emits_no_global_task_failed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut primary, sec, _worker, import_hash, _build_hash, _affine_id) =
+                stage_inflight_import_with_blocked_dependent().await;
+
+            let mutations = primary.recover_inflight_for_dead_secondary(&sec);
+
+            // No global terminal for the affine import — its terminal is the
+            // per-secondary cell, never `failed_tasks`/CRDT `Failed`.
+            assert!(
+                !mutations.iter().any(|m| matches!(
+                    m,
+                    ClusterMutation::TaskFailed { hash, .. } if *hash == import_hash
+                )),
+                "an in-flight affine import on a dead secondary must NOT emit a \
+                 global TaskFailed (its terminal is per-secondary); got {mutations:?}"
+            );
+            // The in-flight ledger entry is dropped consistently (its per-dispatch
+            // type slot was released at the loop head), so no phantom import lingers.
+            assert!(
+                !primary.in_flight.contains_key(&import_hash),
+                "the dead secondary's in-flight import entry is dropped"
+            );
+        })
+        .await;
+}
+
+/// PART A (full chain): the dead-secondary recovery routed through the genuine
+/// member-removal primitive (`requeue_dead_secondary`) leaves the affine
+/// import's CRDT state NON-`Failed` and re-routes the dependent to a LIVE
+/// secondary (re-derived for re-placement), never doomed.
+///
+/// RED pre-fix: the spurious global `TaskFailed` applied CRDT `TaskState =
+/// Failed` for the import, which (latently) dooms every dependent on the next
+/// failover hydrate.
+#[tokio::test(flavor = "current_thread")]
+async fn dead_secondary_affine_import_full_chain_reroutes_dependent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut primary, sec, _worker, import_hash, build_hash, _affine_id) =
+                stage_inflight_import_with_blocked_dependent().await;
+
+            // Drive the FULL dead-secondary path (recover + affine reroute +
+            // PeerRemoved broadcast), exactly as the heartbeat monitor would on a
+            // keepalive miss.
+            primary
+                .requeue_dead_secondary_for_test(&sec)
+                .await
+                .expect("dead-secondary recovery");
+            settle_pump().await;
+
+            // The import's CRDT state was NOT flipped to `Failed` — no global
+            // terminal was authored for it.
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&import_hash)
+                    .is_none_or(|s| !matches!(
+                        s,
+                        crate::cluster_state::TaskState::Failed { .. }
+                    )),
+                "the affine import must NOT be flipped to CRDT Failed on a \
+                 dead-secondary death; got {:?}",
+                primary.cluster_state_for_test().task_state(&import_hash)
+            );
+            // The import is NOT in the global doom-gate.
+            assert!(
+                !primary.failed_tasks.contains_key(&import_hash),
+                "the affine import must NOT enter the global failed_tasks gate"
+            );
+            // The dependent is alive (not terminal-failed) and was drained from
+            // the dead secondary's per-secondary blocked map so it can re-route to
+            // a live secondary (its placement-dedup was cleared for re-derivation).
+            assert!(
+                !primary.affine_is_blocked_on_import_for_test(&sec, &build_hash),
+                "the dependent must be drained from the dead secondary's blocked map"
+            );
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "the dependent must NOT be terminal-failed — it re-routes to a \
+                 live secondary; got {:?}",
+                primary.cluster_state_for_test().task_state(&build_hash)
+            );
+        })
+        .await;
+}
+
+/// PART B (defense-in-depth): a failover hydrate of a CRDT that records an
+/// affine import as `TaskState::Failed` must NOT load the import hash into
+/// `failed_tasks` (the global doom-gate the affine readiness check reads), and
+/// the dependent must NOT hydrate terminal-failed.
+///
+/// This pins the LATENT failover blast directly: the affine readiness gate's
+/// FIRST check is `failed_tasks.contains_key(import_hash)` → `Unsatisfiable` for
+/// every dependent. Excluding affine hashes at the hydrate `failed_tasks`
+/// population site closes that cascade independently of the root fix.
+///
+/// RED pre-fix: the fat `Failed` arm inserted EVERY `Failed` hash (affine
+/// included) into `failed_tasks`.
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_excludes_failed_affine_import_from_failed_tasks() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            // Build a CRDT in the exact post-latent-bug shape: the affine import
+            // recorded `TaskState::Failed` (as the spurious dead-secondary global
+            // terminal would have left it), its dependent still Pending/Blocked.
+            let (mut primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::TaskFailed {
+                    hash: import_hash.clone(),
+                    kind: dynrunner_core::ErrorType::NonRecoverable,
+                    error: "spurious dead-secondary global terminal".into(),
+                    version: Default::default(),
+                    attempt: Default::default(),
+                });
+            }
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&import_hash),
+                    Some(crate::cluster_state::TaskState::Failed { .. })
+                ),
+                "fixture: the affine import is CRDT Failed before hydrate"
+            );
+
+            // Re-hydrate (the promoted-primary failover projection rebuild).
+            primary
+                .hydrate_from_cluster_state()
+                .expect("hydrate the failed-affine-import graph");
+
+            // The affine import hash must NOT be in the global doom-gate — its
+            // terminal is per-secondary, never `failed_tasks` (which the affine
+            // readiness check reads to fail every dependent `Unsatisfiable`).
+            assert!(
+                !primary.failed_tasks.contains_key(&import_hash),
+                "hydrate must EXCLUDE a failed affine import from failed_tasks \
+                 (RED pre-fix: the fat Failed arm inserted it, dooming dependents)"
+            );
+            // The dependent must NOT hydrate terminal-failed (no spurious
+            // Unsatisfiable cascade off the affine doom-gate).
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "the dependent must NOT be terminal-failed on hydrate; got {:?}",
+                primary.cluster_state_for_test().task_state(&build_hash)
+            );
+        })
+        .await;
+}
