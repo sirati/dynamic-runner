@@ -532,6 +532,60 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.beacon_target.publish_set(addrs);
     }
 
+    /// Evict ONE member from every primary-local roster cache — the SOLE
+    /// per-secondary local-cache teardown, shared by the keepalive-death
+    /// reaper ([`Self::requeue_dead_secondary`], after it has requeued the
+    /// member's in-flight work) and the clean-departure reap (the wire-
+    /// receive `PeerRemoved { SelfDeparture }` handler in
+    /// `primary::task::mutation`). It restores the invariant that
+    /// `self.secondaries` lists only members still in the cluster — the
+    /// dial-driving `peer_roster()` reads off it, so an evicted member is
+    /// dropped from the next `PeerInfo` and the transport's
+    /// `forget_departed` path ends its redial loop.
+    ///
+    /// LOCAL CACHES ONLY: it does NOT recover in-flight work, originate any
+    /// `PeerRemoved`, or broadcast — those belong to the death reaper (a
+    /// clean departure already converged the membership ledger via the
+    /// leaving node's own self-authored `PeerRemoved`, and drained its work
+    /// before announcing, so there is nothing to requeue or re-author).
+    pub(super) fn evict_secondary_local_caches(&mut self, secondary_id: &str) {
+        // Snapshot the member's worker global ids before the retain drops
+        // them, so the pool-side affinity release below can address them.
+        let dead_global_ids: Vec<u32> = self
+            .workers
+            .iter()
+            .filter(|w| w.secondary_id == secondary_id)
+            .map(|w| w.worker_id)
+            .collect();
+        // Drop every worker hosted by the gone secondary — its host is
+        // gone. The slot state is discarded with the worker.
+        self.workers.retain(|w| w.secondary_id != secondary_id);
+        // Now clear pool-side affinity for those workers so any bucket
+        // they pinned is free for survivors.
+        for wid in dead_global_ids {
+            self.pool_mut().release_worker(wid);
+        }
+        // #494 bring-up reservation: if a formation-window reservation is
+        // still open and this member held a share it never drained, fold
+        // it onto the surviving fleet round-robin (the member is already
+        // retained out of `self.workers` above, so the survivor order
+        // excludes it). A no-op once the window has closed.
+        self.redistribute_reservation_for_dead_member(secondary_id);
+
+        self.secondaries.remove(secondary_id);
+        self.secondary_keepalives.remove(secondary_id);
+        // The secondary is gone; drop any staged-WARN state, the
+        // judged-silence mark, and the keepalive proof so a re-welcomed
+        // id (respawn reusing the slot) starts a fresh streak with the
+        // setup exemption re-earned.
+        self.silence_warn_stage.remove(secondary_id);
+        self.silence_judged_marks.remove(secondary_id);
+        self.keepalive_proven.remove(secondary_id);
+        // The incarnation is gone; drop its re-serve-backoff expiry so a
+        // respawn reusing the id re-serves immediately. See `reserve_backoff`.
+        self.reserve_backoff.remove(secondary_id);
+    }
+
     /// Take in-flight tasks back, drop the secondary from the routable set,
     /// originate a `ClusterMutation::PeerRemoved` carrying `cause` (the
     /// primary is the sole authoritative author of `PeerRemoved` — every
@@ -556,17 +610,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             "secondary missed keepalives; requeueing in-flight tasks"
         );
 
-        // Snapshot the dead workers' global ids first; we need them to
-        // call `pool.release_worker` AFTER requeue (release_worker
-        // clears the affinity record, requeue uses it for routing —
-        // and even if `requeue` doesn't read it, it's the documented
-        // ordering in the brief).
-        let dead_global_ids: Vec<u32> = self
-            .workers
-            .iter()
-            .filter(|w| w.secondary_id == secondary_id)
-            .map(|w| w.worker_id)
-            .collect();
         // Recover EVERY in-flight task targeting the dead secondary
         // through the single hash-keyed ledger: requeue each (front of
         // its bucket, phase in-flight counter decremented, type slot
@@ -598,36 +641,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
         let requeued = requeue_mutations.len();
-        // Drop every worker hosted by the dead secondary — its host is
-        // gone. The slot state is discarded with the worker; the task
-        // it held (if any) was already requeued via the ledger above.
-        self.workers.retain(|w| w.secondary_id != secondary_id);
-        // Now clear pool-side affinity for the dead workers so any
-        // bucket they pinned is free for survivors.
-        for wid in dead_global_ids {
-            self.pool_mut().release_worker(wid);
-        }
-        // #494 bring-up reservation: this is the GENUINE member-removal
-        // path, the one redistribute trigger. If a formation-window
-        // reservation is still open and this dead member held a share it
-        // never drained, fold it onto the surviving fleet round-robin (the
-        // dead member is already retained out of `self.workers` above, so
-        // the survivor order excludes it). A no-op once the window has
-        // closed — a steady-state death just requeues, no redistribute.
-        self.redistribute_reservation_for_dead_member(&secondary_id);
-
-        self.secondaries.remove(&secondary_id);
-        self.secondary_keepalives.remove(&secondary_id);
-        // The secondary is gone; drop any staged-WARN state, the
-        // judged-silence mark, and the keepalive proof so a re-welcomed
-        // id (respawn reusing the slot) starts a fresh streak with the
-        // setup exemption re-earned.
-        self.silence_warn_stage.remove(&secondary_id);
-        self.silence_judged_marks.remove(&secondary_id);
-        self.keepalive_proven.remove(&secondary_id);
-        // The incarnation is gone; drop its re-serve-backoff expiry so a
-        // respawn reusing the id re-serves immediately. See `reserve_backoff`.
-        self.reserve_backoff.remove(&secondary_id);
+        // Drop the dead member from every primary-local roster cache —
+        // the same eviction a clean DEPARTURE performs, shared so the two
+        // paths can never drift. Runs AFTER requeue: `release_worker`
+        // clears the affinity record the recovery above used for routing.
+        self.evict_secondary_local_caches(&secondary_id);
 
         // Authoritative origination, one batch: the dead secondary's
         // in-flight tasks transition `InFlight → Pending` in the CRDT

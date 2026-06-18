@@ -1,6 +1,6 @@
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, PeerId,
+    ClusterMutation, Destination, DistributedMessage, PeerId, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -731,11 +731,42 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Collected during the apply loop, settled after it (the
             // settle's cascade takes `&mut self`).
             let mut applied_terminal_hashes: Vec<String> = Vec::new();
+            // Clean-departure reap surface (wire-receive twin of the
+            // keepalive-death reaper): a peer that leaves the mesh
+            // gracefully broadcasts its OWN `PeerRemoved { SelfDeparture }`,
+            // which `apply_peer_removed` converges into the membership
+            // ledger (Departed tombstone, peer kept Alive) — but that apply
+            // does NOT touch the primary-local roster caches (`self.
+            // secondaries` / `secondary_keepalives` / ...), and the
+            // keepalive sweep deliberately skips a departed member, so the
+            // local-cache reaper (`requeue_dead_secondary`) never fires for
+            // it. Left uncaught, `peer_roster()` keeps re-listing the
+            // departed peer in every `PeerInfo`, so the transport never
+            // sees it drop and redials the dead address forever. Collect
+            // each id whose `SelfDeparture` GENUINELY applied (a re-delivery
+            // NoOps and is skipped), then evict it from the local caches
+            // after the loop. Snapshot-during-apply / act-post-loop, the
+            // same shape as the terminal-ingest surface above.
+            let mut departed_self_ids: Vec<String> = Vec::new();
             for m in mutations {
                 let is_capacity = matches!(m, ClusterMutation::SecondaryCapacity { .. });
                 let terminal_hash = match &m {
                     ClusterMutation::TaskCompleted { hash, .. }
                     | ClusterMutation::TaskFailed { hash, .. } => Some(hash.clone()),
+                    _ => None,
+                };
+                // A gracefully-departing peer's own self-authored removal.
+                // ONLY `SelfDeparture` is observed from the wire here: every
+                // other `PeerRemoved` cause is primary-authored (and the
+                // author already reaped its local caches via
+                // `requeue_dead_secondary`), and the primary's own
+                // `RosterReemit` is for a peer it has already evicted.
+                let departed_self_id = match &m {
+                    ClusterMutation::PeerRemoved {
+                        id,
+                        cause: RemovalCause::SelfDeparture(_),
+                        ..
+                    } => Some(id.clone()),
                     _ => None,
                 };
                 let outcome =
@@ -748,6 +779,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     if let Some(hash) = terminal_hash {
                         applied_terminal_hashes.push(hash);
                     }
+                    if let Some(id) = departed_self_id {
+                        departed_self_ids.push(id);
+                    }
                 }
             }
             // Settle each genuinely-applied terminal against the local
@@ -758,6 +792,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             for hash in applied_terminal_hashes {
                 self.settle_local_state_on_crdt_terminal(&hash, command_rx)
                     .await;
+            }
+            // Reap the local roster caches of every peer whose graceful
+            // `SelfDeparture` just applied. Re-check `is_member_departed`
+            // at reap time: a re-admission at a HIGHER generation (a
+            // `PeerJoined` later in THIS batch, or one this node had
+            // already converged) supersedes the tombstone, and that
+            // re-admitted peer must STAY in the roster — so it is not
+            // reaped. Skip this node's own id defensively (the co-resident-
+            // primary case is excluded at the leaving node's drain gate, so
+            // the primary never authors a `SelfDeparture` for its own node,
+            // but a stray self-removal must never evict the primary itself).
+            for id in departed_self_ids {
+                if id == self.config.node_id {
+                    continue;
+                }
+                if !self.cluster_state.is_member_departed(&id) {
+                    continue;
+                }
+                tracing::info!(
+                    secondary = %id,
+                    "peer departed gracefully (SelfDeparture); evicting it \
+                     from the local roster caches so it drops out of the \
+                     next PeerInfo and the transport stops redialing it"
+                );
+                self.evict_secondary_local_caches(&id);
             }
             // Pool-coherence after a ledger-growing apply. Two
             // mutually-exclusive surfaces, both gated on this node still

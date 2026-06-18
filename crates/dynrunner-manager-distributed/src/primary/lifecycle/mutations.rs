@@ -575,11 +575,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// existing lattice does all the reconciliation.
     pub(crate) async fn rebroadcast_full_roster(&mut self) {
         // Collect the AUTHORITATIVE departure view (the `capabilities`
-        // 2P-set's Departed tombstones — NOT `self.secondaries`, which has
-        // already dropped them) before the `self.secondaries` borrow below.
-        // A reconnecting node that missed a `PeerRemoved` learns the
-        // departure from this re-emit (the LIVENESS catch-up); capability
-        // correctness already rides the snapshot-healable 2P-set + digest.
+        // 2P-set's Departed tombstones) before the `self.secondaries`
+        // borrow below. This is the SOLE source of departed ids here:
+        // `self.secondaries` has already dropped them (a graceful
+        // `SelfDeparture` is reaped from the local caches by the wire-
+        // receive handler in `primary::task::mutation`; a keepalive death
+        // by `requeue_dead_secondary`), so the per-secondary `PeerJoined`
+        // re-emit below NEVER re-admits a departed id, and the explicit
+        // `PeerRemoved` re-emit appended after covers the liveness catch-up
+        // for a reconnecting node that missed the original removal.
+        // Capability correctness already rides the snapshot-healable 2P-set
+        // + digest.
         let departed_ids: Vec<String> = self
             .cluster_state
             .departed_capability_ids()
