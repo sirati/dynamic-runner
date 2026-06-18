@@ -185,8 +185,20 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     exit_status.as_ref(),
                     kernel_oom_recent,
                 );
+                // A disconnect means the worker process DIED without sending
+                // a clean wire error, so its last stdout/stderr is the only
+                // evidence of WHY. Splice the captured tail onto the
+                // synthesised failure text BEFORE `record_result` files it
+                // into `failed_tasks` (and before `restart_worker` below
+                // replaces the slot, so the dead process's capture file is
+                // still on disk). The factory owns the file location; we only
+                // ask + splice.
                 let result = TaskResult {
                     error_type: Some(reclassified_type),
+                    error_message: Some(crate::worker_stdio_tail::append_stdio_tail(
+                        result.error_message.clone().unwrap_or_default(),
+                        factory.worker_stdio_tail(worker_id),
+                    )),
                     ..result
                 };
 
@@ -289,6 +301,23 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         if worker.has_initial_assignment && !worker.opportunistic {
             self.total_assigned_resources.sub(&estimated_resources);
         }
+
+        // On the raise-failure path, splice the worker process's
+        // stdout/stderr tail onto the failure text so the consumer can see
+        // WHY the task raised (traceback / native fault / bare print) — not
+        // just the wire `error_message`. The factory owns the capture-file
+        // location; we only ask + splice. Successful results are untouched.
+        let result = if result.success {
+            result
+        } else {
+            TaskResult {
+                error_message: Some(crate::worker_stdio_tail::append_stdio_tail(
+                    result.error_message.clone().unwrap_or_default(),
+                    factory.worker_stdio_tail(worker_id),
+                )),
+                ..result
+            }
+        };
 
         self.record_result(&result, binary.as_ref());
 

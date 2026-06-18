@@ -244,6 +244,33 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
     /// end-of-run; the rest inherit this no-op.
     #[allow(async_fn_in_trait)]
     async fn cleanup(&mut self) {}
+
+    /// Return a bounded tail of the worker subprocess's captured
+    /// stdout/stderr, or `None` when this factory does not capture worker
+    /// stdio (the in-process channel test factories, the callback factory).
+    ///
+    /// Single concern: the factory is the ONLY component that knows WHERE a
+    /// worker's stdout/stderr was captured (which file, or nowhere), so it
+    /// is the only one that can produce the tail. The caller (a failure-
+    /// report site that has just observed a task raise or a worker
+    /// disconnect) asks for the tail by `worker_id` and splices it onto the
+    /// failure's `error_message` via
+    /// [`crate::worker_stdio_tail::append_stdio_tail`] — it never learns the
+    /// capture path, the file layout, or the read bound. This is the gap a
+    /// disconnect leaves: the dead process sent no clean wire error, so its
+    /// last stdout/stderr (an interpreter traceback, a native fault, a bare
+    /// `print`, an `exit(1)` diagnostic) is the only evidence of WHY it
+    /// died — and it otherwise sits unread in the capture file.
+    ///
+    /// Best-effort by contract: a factory that captures stdio reads the
+    /// LAST [`crate::worker_stdio_tail::DEFAULT_STDIO_TAIL_BYTES`] of its
+    /// capture file (bounded so a failure storm cannot bloat the replicated
+    /// failure record); any open/read failure or empty file yields `None`.
+    /// Default: `None` (no capture), so factories that own no stdio file
+    /// inherit it with no per-impl boilerplate.
+    fn worker_stdio_tail(&self, _worker_id: WorkerId) -> Option<String> {
+        None
+    }
 }
 
 /// The local manager: owns workers, scheduler, and the 5-phase pipeline.
