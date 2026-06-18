@@ -363,6 +363,16 @@ impl<I: Identifier> PendingPool<I> {
         self.dispatch_backoff.next_expiry(std::time::Instant::now())
     }
 
+    /// The bounded level-trigger re-poll cadence (default
+    /// [`super::backoff::DISPATCH_REPOLL_INTERVAL`], overridable via
+    /// [`Self::set_dispatch_repoll_interval`]). The manager's phase-drain
+    /// re-surface level-trigger reuses this so its wake interval is the SAME
+    /// bounded cadence the per-task dispatch backoff arm uses (and honours a
+    /// test's millisecond override on the one shared knob).
+    pub fn dispatch_repoll_interval(&self) -> std::time::Duration {
+        self.dispatch_backoff.re_poll_interval()
+    }
+
     /// Pre-seed `completed_tasks` with task ids the cluster has
     /// already finished. Used by the failover-resume path: when a
     /// promoted secondary rebuilds its `PendingPool` from the

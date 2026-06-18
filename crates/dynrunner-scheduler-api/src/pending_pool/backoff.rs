@@ -127,6 +127,15 @@ impl DispatchBackoff {
         self.re_poll_interval = interval;
     }
 
+    /// The bounded level-trigger re-poll cadence (default
+    /// [`DISPATCH_REPOLL_INTERVAL`], overridable via
+    /// [`Self::set_re_poll_interval`]). Read by the phase-drain re-surface
+    /// level-trigger so it reuses the same bounded interval the dispatch
+    /// backoff arm uses (and honours a test's millisecond override).
+    pub(super) fn re_poll_interval(&self) -> Duration {
+        self.re_poll_interval
+    }
+
     /// A task re-entered the queue after a bounced/failed attempt:
     /// bump its streak and stamp its next-eligible instant. Tasks
     /// without an identity (empty `task_id`) cannot be tracked and

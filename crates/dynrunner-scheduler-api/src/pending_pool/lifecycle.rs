@@ -705,6 +705,18 @@ impl<I: Identifier> PendingPool<I> {
         std::mem::take(&mut self.drained_pending)
     }
 
+    /// Whether any phase is currently queued on `drained_pending` awaiting the
+    /// manager's drain-edge cascade — a NON-destructive peek (unlike
+    /// [`Self::poll_drain_transitions`], which takes the queue). The manager's
+    /// bounded re-surface drive uses this to decide whether
+    /// [`Self::drain_empty_active_phases`] /
+    /// [`Self::resurface_drained_pending`] produced a phase to re-enter the
+    /// cascade for, WITHOUT consuming the queue the cascade's own
+    /// `poll_drain_transitions` must then read.
+    pub fn has_drained_pending(&self) -> bool {
+        !self.drained_pending.is_empty()
+    }
+
     /// Phases that own a retry-pending (`soft_failed`) root AND have no
     /// LIVE WORK OF THEIR OWN — `queued_count == 0` and `in_flight == 0` —
     /// REGARDLESS of any foreign-phase-blocked dependents that
@@ -759,6 +771,93 @@ impl<I: Identifier> PendingPool<I> {
         phases.sort();
         phases.dedup();
         phases
+    }
+
+    /// Phases that SHOULD have reached the manager's drain edge but are
+    /// stranded short of it — the structural fact a level-triggered
+    /// re-evaluation needs to re-service. Two strands:
+    ///
+    ///   * `Active` / `Draining` AND all-clear: `queued_count == 0`,
+    ///     `in_flight == 0`, no LIVE blocked work (`live_blocked_count == 0`),
+    ///     every predecessor `Done`, and no live affine import
+    ///     (`!phase_has_live_affine_prereq`). This is EXACTLY
+    ///     `maybe_transition_drain`'s `Drained` condition: a phase in this
+    ///     shape ought to be `Drained` and on `drained_pending`, but its last
+    ///     mutating event may have evaluated `maybe_transition_drain` at an
+    ///     instant when one of those counters was momentarily unsettled, and
+    ///     `maybe_transition_drain` only re-runs on a pool mutation — once the
+    ///     event stream stops nothing re-checks it.
+    ///   * `Drained` but not yet `Done`: the transition fired and the phase
+    ///     was consumed off `drained_pending` by `poll_drain_transitions`, but
+    ///     the manager's drained-phase cascade did not complete its
+    ///     `mark_phase_done` (a flipped-then-consumed race). The
+    ///     `!matches!(Active | Draining)` early-return in
+    ///     `maybe_transition_drain` means `drain_empty_active_phases` will
+    ///     never re-surface it, so it is reported here for the manager to
+    ///     re-push.
+    ///
+    /// Reports the STRUCTURAL fact only — RE-EVALUATING the SAME gates the
+    /// ordinary drain path uses, RELAXING none (an affine-only phase whose
+    /// import has not run still reads `phase_has_live_affine_prereq == true`
+    /// and is NOT returned; a phase with live blocked work or unfinished
+    /// predecessors is NOT returned). The drain-edge twin of
+    /// [`Self::phases_pending_soft_finalize`]: that surfaces a soft-root
+    /// deadlock the ordinary poll cannot break, this surfaces a drain edge the
+    /// ordinary poll lost track of. Drives the manager's bounded re-surface
+    /// (and its level-trigger arm): empty ⇒ the arm disarms (no hot-spin).
+    pub fn phases_stuck_drainable(&self) -> Vec<PhaseId> {
+        let mut phases: Vec<PhaseId> = self
+            .phase_state
+            .iter()
+            .filter(|(phase_id, state)| match state {
+                PhaseState::Active | PhaseState::Draining => {
+                    self.queued_count(phase_id) == 0
+                        && self.in_flight(phase_id) == 0
+                        && self.live_blocked_count(phase_id) == 0
+                        && self.predecessors_done(phase_id)
+                        && !self.phase_has_live_affine_prereq(phase_id)
+                }
+                // Flipped-then-consumed: drained but the manager's cascade
+                // did not finish marking it done.
+                PhaseState::Drained => true,
+                // `Blocked` still awaits its predecessor edges; `Done` is
+                // finished. Neither is stranded short of a drain edge.
+                PhaseState::Blocked | PhaseState::Done => false,
+            })
+            .map(|(phase_id, _)| phase_id.clone())
+            .collect();
+        phases.sort();
+        phases.dedup();
+        phases
+    }
+
+    /// Re-push every phase currently in state `Drained` (the transition
+    /// fired) that is not yet `Done` and is not already queued on
+    /// `drained_pending` — the flipped-then-consumed defence the manager's
+    /// bounded re-surface drive invokes. A `Drained` phase consumed off
+    /// `drained_pending` by [`Self::poll_drain_transitions`] whose
+    /// `mark_phase_done` never completed cannot be re-surfaced by
+    /// [`Self::drain_empty_active_phases`] (`maybe_transition_drain`
+    /// early-returns for a non-`Active`/`Draining` phase), so the pool — the
+    /// sole owner of `drained_pending` — re-queues it here. Idempotent: a
+    /// phase still on `drained_pending` is not duplicated, an `Active` /
+    /// `Draining` / `Done` phase is untouched (the former two re-surface via
+    /// `drain_empty_active_phases`, the latter is finished). Returns whether
+    /// any phase was re-pushed.
+    pub fn resurface_drained_pending(&mut self) -> bool {
+        let to_repush: Vec<PhaseId> = self
+            .phase_state
+            .iter()
+            .filter(|(phase_id, state)| {
+                matches!(state, PhaseState::Drained) && !self.drained_pending.contains(phase_id)
+            })
+            .map(|(phase_id, _)| phase_id.clone())
+            .collect();
+        let surfaced = !to_repush.is_empty();
+        for phase_id in to_repush {
+            self.drained_pending.push(phase_id);
+        }
+        surfaced
     }
 
     /// Drop every `SecondaryAffine` ledger-token item still sitting in

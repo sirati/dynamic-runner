@@ -609,3 +609,139 @@ fn same_phase_work_plus_affine_drains_on_work_completion() {
         "same-phase work+affine drains on the work's completion (unchanged)"
     );
 }
+
+/// PHASE-DRAIN LEVEL-NET (a): a phase driven genuinely all-clear (terminal
+/// work, no live affine, predecessors done) whose drain SURFACE was lost — the
+/// `Drained` transition fired and was consumed off `drained_pending` by
+/// `poll_drain_transitions` WITHOUT the manager's cascade completing
+/// `mark_phase_done`. The ordinary machinery cannot re-surface it (the next
+/// event-driven `poll_drain_transitions` returns empty; `maybe_transition_drain`
+/// early-returns for an already-`Drained` phase). `phases_stuck_drainable` must
+/// report it, and `resurface_drained_pending` must re-queue it so the manager's
+/// ordinary drain-edge block runs unchanged.
+///
+/// Pre-fix: stranded forever (no event re-runs the check, the phase never
+/// reaches `Done`, its dependents never activate — the matrix_eval freeze).
+#[test]
+fn stuck_drained_phase_resurfaces_after_lost_surface() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
+    let item = p.pop_for_worker(1).unwrap();
+    p.on_item_finished(&phase("P"), Some(&item.task_id));
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Drained));
+
+    // Simulate the LOST surface: the manager's `poll_drain_transitions`
+    // consumed the phase off `drained_pending` (mem::take) but its cascade did
+    // not reach `mark_phase_done` (a flipped-then-consumed race) — the phase
+    // is `Drained`-but-not-`Done`, no longer queued, with no event to revive it.
+    let consumed = p.poll_drain_transitions();
+    assert_eq!(consumed, vec![phase("P")]);
+    assert!(!p.has_drained_pending(), "surface consumed, none queued");
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Drained));
+
+    // The level-net query reports the stranded phase (Drained-but-not-Done).
+    assert_eq!(
+        p.phases_stuck_drainable(),
+        vec![phase("P")],
+        "a Drained-but-not-Done phase with a lost surface is stuck-drainable"
+    );
+
+    // The drain-edge re-surface (the empty-active re-run cannot reach a
+    // non-Active/Draining phase, so the re-push is the operative half here)
+    // re-queues it for the manager's ordinary cascade.
+    p.drain_empty_active_phases();
+    assert!(
+        p.resurface_drained_pending(),
+        "the stranded Drained phase is re-pushed onto drained_pending"
+    );
+    assert_eq!(
+        p.poll_drain_transitions(),
+        vec![phase("P")],
+        "the re-pushed phase is now observable by the manager's drain-edge block"
+    );
+}
+
+/// PHASE-DRAIN LEVEL-NET (b): the never-flipped transient. A phase left
+/// `Active` (or `Draining`) and all-clear — its last `maybe_transition_drain`
+/// ran at an instant a counter was momentarily unsettled, so it never flipped
+/// `Drained` and was never pushed onto `drained_pending`. Nothing re-runs the
+/// check once the event stream stops. `phases_stuck_drainable` reports it, and
+/// `drain_empty_active_phases` re-flips it.
+#[test]
+fn stuck_active_all_clear_phase_resurfaces() {
+    // A zero-dep phase seeds `Active` and, with no items ever committed, is
+    // (0,0,0) all-clear immediately — but `maybe_transition_drain` only runs
+    // on a pool mutation, so without an explicit `drain_empty_active_phases`
+    // call nothing flips it. This is the never-flipped transient: an Active
+    // all-clear phase with no event to surface it.
+    let mut p = pool_with(&["P"], &[]);
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
+    assert_eq!(p.queued_count(&phase("P")), 0);
+    assert_eq!(p.in_flight(&phase("P")), 0);
+    assert!(!p.has_drained_pending(), "never flipped → nothing queued");
+
+    assert_eq!(
+        p.phases_stuck_drainable(),
+        vec![phase("P")],
+        "an Active all-clear phase that never flipped is stuck-drainable"
+    );
+    p.drain_empty_active_phases();
+    assert_eq!(
+        p.phase_state(&phase("P")),
+        Some(PhaseState::Drained),
+        "drain_empty_active_phases re-flips the never-flipped phase"
+    );
+    assert!(
+        p.has_drained_pending(),
+        "the re-flipped phase is queued for the manager's drain-edge block"
+    );
+}
+
+/// PHASE-DRAIN LEVEL-NET (d) / #617: the re-surface query RE-EVALUATES the
+/// same gates, RELAXING none — an affine-only phase whose import has NOT run
+/// reads `phase_has_live_affine_prereq == true` and must NOT be reported as
+/// stuck-drainable (surfacing it would false-drain a phase with live work).
+/// After the import terminals it becomes genuinely drainable and IS reported.
+#[test]
+fn affine_only_phase_not_stuck_drainable_until_import_terminals() {
+    use dynrunner_core::{PhaseId, TaskDep, TaskInfo, TaskKind};
+
+    let mut import: TaskInfo<()> = t("import", "T", "", 1);
+    import.task_id = "import-id".to_string();
+    import.kind = TaskKind::SecondaryAffine;
+
+    let mut build: TaskInfo<()> = t("build", "T", "", 1);
+    build.task_id = "build-id".to_string();
+    build.kind = TaskKind::Work;
+    build.task_depends_on = vec![TaskDep {
+        task_id: "import-id".to_string(),
+        phase_id: PhaseId::from("import"),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+
+    let mut p = pool_with(&["import", "build"], &[("build", &["import"])]);
+    p.mark_affine_prereqs(["import-id".to_string()]);
+    p.extend([import, build]).expect("valid extend");
+
+    // The import phase reads (0,0,0) on the raw counters but holds a LIVE
+    // affine import → the level-net query must NOT surface it (#617: no
+    // premature drain). The build phase is Blocked (its dep is not Done).
+    assert!(
+        !p.phases_stuck_drainable().contains(&phase("import")),
+        "an affine-only phase with a live import is NOT stuck-drainable (#617)"
+    );
+
+    // After the import's first per-secondary terminal, the phase is genuinely
+    // all-clear and IS reported as stuck-drainable (so the level-net surfaces
+    // it should its ordinary drain event be missed).
+    p.note_affine_terminal(&phase("import"), "import-id");
+    // `note_affine_terminal` re-runs the transition, so the phase is already
+    // Drained-and-queued here; consume the surface to model a lost-surface
+    // race and confirm the query still reports it.
+    let _ = p.poll_drain_transitions();
+    assert!(
+        p.phases_stuck_drainable().contains(&phase("import")),
+        "once the import terminals the phase is genuinely stuck-drainable"
+    );
+}
