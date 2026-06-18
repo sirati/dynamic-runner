@@ -86,6 +86,30 @@ enum AffineGateOutcome {
     Unsatisfiable,
 }
 
+/// The outcome of [`PrimaryCoordinator::dispatch_affine_unit`], reported to the
+/// CALLER so the caller — not the shared dispatch seam — owns recovery. The
+/// dispatch seam knows only "did this assignment commit / was it skipped /
+/// was it refused"; WHERE the unit came from (a per-secondary queue pop vs an
+/// inline on-demand import) is the caller's knowledge, and recovery differs by
+/// origin, so the seam must NOT itself re-queue.
+enum AffineDispatchOutcome {
+    /// The assignment committed (the worker is now holding it).
+    Committed,
+    /// The dispatch was REFUSED (`CommitRefused` — target worker not idle — or
+    /// `SendFailed`): the unit did NOT land. The unit is RETURNED so the caller
+    /// recovers at its origin — a queue-pop caller re-pushes it to its queue
+    /// front; the on-demand-import caller (where the unit was synthesized inline,
+    /// never queued) resets its cell + re-derives the dependent instead, so no
+    /// ungated bare import is left on the queue.
+    Refused(QueuedUnit),
+    /// The unit was handled WITHOUT a fresh dispatch and needs NO caller
+    /// recovery: a run-once-guard skip (the import is already `Done` here, or a
+    /// sibling slot already holds it — the multi-worker base race), a stale work
+    /// claim no longer in a dispatchable bucket, or an unsatisfiable dependent
+    /// already terminal-failed. In every case the unit must NOT be re-queued.
+    SkippedNoRecovery,
+}
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Placement trigger: queue every WORK task whose non-affine deps are
     /// satisfied AND whose affine prereqs are now all ready onto a
@@ -292,7 +316,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let Some(unit) = self.affine_scheduler.pop_next(&secondary) else {
             return false;
         };
-        self.dispatch_affine_unit(worker_idx, &secondary, unit).await
+        self.dispatch_affine_unit_from_queue(worker_idx, &secondary, unit)
+            .await
+    }
+
+    /// Dispatch a unit that CAME FROM `secondary`'s per-secondary queue (a pop or
+    /// a steal), owning the QUEUE-origin recovery: on a `Refused` outcome the unit
+    /// is re-pushed to the queue FRONT (the exact pre-#660 behavior — retried
+    /// before any other queued unit, preserving order). Returns `true` iff the
+    /// dispatch COMMITTED (the caller skips its global path for this worker this
+    /// tick); `false` for a refused/skipped unit (the worker falls through to the
+    /// unchanged global dispatch). The on-demand-import caller does NOT use this —
+    /// its unit was synthesized inline (never queued), so it owns a DIFFERENT
+    /// recovery (cell-reset + re-derive), never a bare requeue.
+    async fn dispatch_affine_unit_from_queue(
+        &mut self,
+        worker_idx: usize,
+        secondary: &str,
+        unit: QueuedUnit,
+    ) -> bool {
+        match self.dispatch_affine_unit(worker_idx, secondary, unit).await {
+            AffineDispatchOutcome::Committed => true,
+            AffineDispatchOutcome::Refused(unit) => {
+                self.affine_scheduler.requeue_front(secondary, unit);
+                false
+            }
+            AffineDispatchOutcome::SkippedNoRecovery => false,
+        }
     }
 
     /// Idle-steal for the idle worker at `worker_idx`: the caller's
@@ -341,22 +391,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let Some(unit) = self.affine_scheduler.pop_next(&secondary) else {
             return false;
         };
-        self.dispatch_affine_unit(worker_idx, &secondary, unit).await
+        self.dispatch_affine_unit_from_queue(worker_idx, &secondary, unit)
+            .await
     }
 
     /// Reconstruct a popped [`QueuedUnit`]'s worker-dispatchable `TaskInfo` by
     /// hash and dispatch it through the shared
-    /// [`PrimaryCoordinator::dispatch_one_assignment`] seam. On a non-committed
-    /// outcome the unit's binary came from the per-secondary queue (NOT the
-    /// pool), so it is re-pushed to the FRONT of `secondary`'s queue
-    /// ([`super::affine_scheduler::AffineScheduler::requeue_front`]) to be
-    /// retried before any other queued unit. Returns `true` iff committed.
+    /// [`PrimaryCoordinator::dispatch_one_assignment`] seam. REPORTS the outcome
+    /// to the caller as an [`AffineDispatchOutcome`] and does NOT itself re-queue:
+    /// on a `Refused` dispatch the `unit` is RETURNED so the caller recovers at
+    /// its origin (a queue-pop caller re-pushes it to the queue front via
+    /// [`super::affine_scheduler::AffineScheduler::requeue_front`]; the on-demand
+    /// import caller — whose unit was synthesized inline and never queued — resets
+    /// its cell + re-derives the dependent instead, so no ungated bare import is
+    /// left on the queue for an idle-steal to dispatch base-unordered). A
+    /// run-once-guard skip / stale claim / unsatisfiable terminal returns
+    /// `SkippedNoRecovery` (the unit must NOT be re-queued).
     async fn dispatch_affine_unit(
         &mut self,
         worker_idx: usize,
         secondary: &str,
         unit: QueuedUnit,
-    ) -> bool {
+    ) -> AffineDispatchOutcome {
         let (hash, is_work, affine_unit_id) = match &unit {
             QueuedUnit::Affine { hash, affine_id } => (hash.clone(), false, Some(*affine_id)),
             QueuedUnit::Work { hash } => (hash.clone(), true, None),
@@ -364,8 +420,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let Some(task) = self.cluster_state.task_info_for_hash(&hash) else {
             // Not in the fat ledger (settled / gone): the unit is stale. Drop
             // it (HINT property — a fresh placement re-derives a still-needed
-            // prereq) and fall through to the global path.
-            return false;
+            // prereq) and fall through to the global path. No recovery.
+            return AffineDispatchOutcome::SkippedNoRecovery;
         };
         let phase = task.phase_id.clone();
 
@@ -417,7 +473,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     let pending = self.not_done_cells_on(secondary, &placement);
                     self.affine_scheduler
                         .block_until_import(secondary, &hash, pending);
-                    return false;
+                    return AffineDispatchOutcome::SkippedNoRecovery;
                 }
                 AffineGateOutcome::StrandedHere => {
                     // Lazy-import model (c) under #652 concern B: the work was
@@ -436,11 +492,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         .block_until_import(secondary, &hash, pending);
                     self.dispatch_affine_import_on_demand(worker_idx, secondary, &placement)
                         .await;
-                    return false;
+                    return AffineDispatchOutcome::SkippedNoRecovery;
                 }
                 AffineGateOutcome::Reroute(target) => {
                     self.affine_replace_and_nudge(&target, &placement).await;
-                    return false;
+                    return AffineDispatchOutcome::SkippedNoRecovery;
                 }
                 AffineGateOutcome::Unsatisfiable => {
                     // The import failed on every eligible secondary — the work
@@ -452,7 +508,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // — the dispatch-decoupling law: emit a command, never drive
                     // the cascade inline). The popped orphan is discarded.
                     self.fail_unsatisfiable_affine_work(&hash, &phase);
-                    return false;
+                    return AffineDispatchOutcome::SkippedNoRecovery;
                 }
             }
         }
@@ -488,7 +544,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.cluster_state.affine_state(secondary, aid) == SecondaryCell::Done
             });
             if cell_done || self.secondary_has_slot_holding_hash(secondary, &hash) {
-                return false;
+                // Already run / in flight here (a sibling slot holds it). No
+                // dispatch, no recovery — and crucially NOT `Refused`: the import
+                // DID land (here or already), so the on-demand caller must not
+                // reset its cell.
+                return AffineDispatchOutcome::SkippedNoRecovery;
             }
         }
 
@@ -512,8 +572,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // The work item is not in a dispatchable bucket (already taken /
                 // its phase not Active) — the per-secondary queue claim is
                 // stale. Drop the unit and fall through to the global path
-                // (HINT property — a fresh placement re-derives it).
-                return false;
+                // (HINT property — a fresh placement re-derives it). No recovery.
+                return AffineDispatchOutcome::SkippedNoRecovery;
             }
             self.pool_mut().mark_in_flight(&phase);
         }
@@ -523,17 +583,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .dispatch_one_assignment(worker_idx, std::sync::Arc::new(task), estimated)
             .await
         {
-            DispatchOutcome::Committed => true,
+            DispatchOutcome::Committed => AffineDispatchOutcome::Committed,
             DispatchOutcome::CommitRefused(binary) | DispatchOutcome::SendFailed(binary) => {
-                // Re-push the unit to the FRONT of S's queue so it is retried.
-                // For a WORK unit, also undo the pool take + in_flight bump
-                // (requeue restores the bucket item AND decrements in_flight),
-                // keeping the phase accounting balanced.
+                // REFUSED — the unit did NOT land. Undo the seam's OWN pool
+                // accounting for a WORK unit (the take + in_flight bump it just
+                // did), keeping the phase balanced regardless of how the caller
+                // recovers. Then RETURN the unit so the CALLER recovers at its
+                // origin — a queue-pop caller re-pushes it to the queue front; the
+                // on-demand-import caller resets its cell + re-derives instead
+                // (no ungated bare import left on the queue). The seam itself NO
+                // LONGER `requeue_front`s: WHERE the unit belongs is the caller's
+                // knowledge, not the seam's.
                 if is_work {
                     self.pool_mut().requeue(binary);
                 }
-                self.affine_scheduler.requeue_front(secondary, unit);
-                false
+                AffineDispatchOutcome::Refused(unit)
             }
         }
     }
@@ -985,8 +1049,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `Box::pin` the recursive dispatch: `dispatch_affine_unit` (work arm) →
         // here → `dispatch_affine_unit` (import arm) is a cycle the async state
         // machine must box. The import arm never re-enters this helper (it is not
-        // a work unit), so the recursion is depth-1.
-        Box::pin(self.dispatch_affine_unit(
+        // a work unit), so the recursion is depth-1. This caller OWNS the import's
+        // non-commit recovery — the unit was synthesized INLINE (never queued), so
+        // it must NOT be left on a queue as a bare, ungated import; `Refused`
+        // routes to a cell-reset + re-derive instead, NOT a `requeue_front`.
+        let outcome = Box::pin(self.dispatch_affine_unit(
             worker_idx,
             secondary,
             QueuedUnit::Affine {
@@ -995,6 +1062,50 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             },
         ))
         .await;
+
+        if let AffineDispatchOutcome::Refused(_unit) = outcome {
+            // NON-COMMITTED on-demand import (`CommitRefused` — target worker not
+            // idle — or `SendFailed`): the import did NOT land. We set the cell
+            // `Queued` above, so it now sits `Queued`-with-no-holder: the dependent
+            // work is `InFlightHere`-blocked on a cell no terminal will ever flip
+            // `Done` (the only run was refused). Recovery would otherwise wait for
+            // an idle worker to re-pop a bare requeued import (STARVED whenever the
+            // global pool has ready non-affine work) or the 5-min reconcile to
+            // orphan it. We are the SINGLE owner of this recovery (the seam no
+            // longer `requeue_front`s — `Refused` returned the unit, and we
+            // DELIBERATELY drop it rather than re-queue: a bare on-demand import on
+            // the queue is ungated and idle-steal-eligible, so it would dispatch
+            // base-UNORDERED on another secondary). Instead, mirror the
+            // backpressure-bounce arm (`handle_affine_task_failed`): reset the cell
+            // `Queued → NotDone` and re-derive the blocked dependents NOW. On its
+            // next pop the dependent reads `StrandedHere` and re-kicks the import
+            // WITH base-ordering (the dependent's list-order), so a refused
+            // on-demand import re-enters placement continuously AND base-ordered,
+            // instead of leaving a phantom `Queued` cell for the reconcile.
+            //
+            // This is the RECOVERABLE refusal twin of the backpressure bounce (NOT
+            // a genuine terminal `Failed`), so it uses the cell-finished re-enqueue
+            // seam (re-derive on-demand), never the `Failed`/dead-secondary
+            // re-route. A `Committed` / `SkippedNoRecovery` outcome means the
+            // import LANDED (held a slot here, already `Done`, or held by a sibling
+            // dispatch — the multi-worker base race) and the cell is left intact:
+            // resetting it would un-track a genuinely in-flight import.
+            self.apply_and_broadcast_cluster_mutations(vec![
+                ClusterMutation::SecondaryCellUnqueued {
+                    secondary: secondary.to_string(),
+                    cell_id: aid.0,
+                    generation: 0,
+                },
+            ])
+            .await;
+            self.reenqueue_affine_unblocked_on_cell(
+                secondary,
+                aid,
+                crate::worker_signal::WorkerMgmtSignal::TasksAdded,
+            )
+            .await;
+            return;
+        }
 
         // Re-nudge so a sibling idle worker re-pops the work (held `InFlightHere`
         // until the import's terminal flips the cell `Done`).
