@@ -84,6 +84,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
+    /// Test-only view of the dial-driving roster `peer_roster()` builds —
+    /// the SOLE `PeerInfo` candidate set. Lets the reap regression assert
+    /// directly on what the transport is told to dial.
+    #[cfg(test)]
+    pub(crate) fn peer_roster_for_test(&self) -> Vec<PeerConnectionInfo> {
+        self.peer_roster()
+    }
+
     /// Build the wire `PeerInfo` frame over `peers` — the ONE frame
     /// construction, shared by the fleet broadcast
     /// ([`Self::broadcast_peer_roster`]) and the directed per-member
