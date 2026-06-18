@@ -102,7 +102,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Pre-start fence A side-map drop (#530a): a completion is a
             // terminal — the fence is over for this hash. Symmetric with
             // the in-flight ledger drop in `free_slot_on_terminal` below.
-            self.drop_supplanted_holder(task_hash);
+            self.drop_local_terminal_residue(task_hash);
             // Genuine progress (#497): a real terminal clears the per-task
             // reconciliation-loss requeue counter so a hash that completes
             // after one or two lost cycles is never poisoned by the cap.
@@ -413,7 +413,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         // A healthy completion proves the secondary live — clear its backoff.
         self.backpressured_secondaries.remove(&secondary_id);
-        self.drop_supplanted_holder(&task_hash);
+        self.drop_local_terminal_residue(&task_hash);
 
         // (2) WORKER SLOT: free the holding slot for THIS per-secondary run,
         // addressed by the terminal's OWN (secondary, worker). NOT the shared

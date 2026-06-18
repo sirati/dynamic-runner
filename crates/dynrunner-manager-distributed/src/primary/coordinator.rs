@@ -3601,16 +3601,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Vec) can never leave this pointing at the wrong worker or out of
     /// bounds. The inbound wire `worker_id` is retained for diagnostics;
     /// the ledger entry is the authoritative holder record.
-    /// Drop the pre-start fence A side-map entry for `task_hash`, if any.
-    /// Called from every terminal-settlement site symmetric with the
-    /// in-flight ledger drops (`free_slot_on_terminal`'s `in_flight.remove`,
-    /// the setup-terminal `in_flight.remove`, the `finalize_phase_soft_failures`
-    /// cascade) so a hint never outlives the task it fences. A no-op for a
-    /// hash with no recorded hint (the common case: a hash that was never a
-    /// dead-secondary-requeue redirect). Not part of the requeue path — a
-    /// requeue is precisely when the hint must SURVIVE for the next dispatch.
-    pub(super) fn drop_supplanted_holder(&mut self, task_hash: &str) {
+    /// Drop EVERY node-local, non-replicated per-task scheduling hint for a
+    /// hash that just reached terminal — the single terminal seam each
+    /// terminal-settlement site calls (symmetric with the in-flight ledger
+    /// drops: `free_slot_on_terminal`'s `in_flight.remove`, the setup-terminal
+    /// `in_flight.remove`, the `finalize_phase_soft_failures` cascade), so no
+    /// local per-task residue outlives the task. Each drop is its own
+    /// single-concern primitive; this composes them so a terminal never has to
+    /// know which hints exist:
+    ///   * the pre-start fence A side-map (`supplanted_holders`) — a
+    ///     dead-secondary-requeue redirect hint that must not outlive the task;
+    ///   * the affine placement-dedup guard (`placed_work`) — the affine-dep
+    ///     work task's once-per-task placement gate. A terminal work task must
+    ///     never be re-placed, and (the #663 strand-diagnostic bug) a lingering
+    ///     `placed_work` entry for a completed/failed task shows as a FALSE
+    ///     placed-but-unqueued strand AND leaks unboundedly at scale. The clear
+    ///     is idempotent and task-agnostic: `unrecord_placed_work` is a
+    ///     `HashSet` remove, a no-op for a hash that was never affine-placed.
+    ///
+    /// Both are no-ops for a hash that recorded neither (the common case). NOT
+    /// part of the requeue path — a requeue is precisely when these hints must
+    /// SURVIVE for the next dispatch (the requeue clears `placed_work` itself
+    /// via `requeue_affine_aware`, the affine twin of the bounce reset).
+    pub(super) fn drop_local_terminal_residue(&mut self, task_hash: &str) {
         self.supplanted_holders.remove(task_hash);
+        self.affine_scheduler.unrecord_placed_work(task_hash);
     }
 
     pub(super) fn free_slot_on_terminal(
@@ -4456,18 +4471,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// (ledger) exclusion HERE, because the coordinator — not the scheduler —
     /// owns the in-flight ledger: a placed work hash the ledger still holds was
     /// popped-not-terminal (in flight on a worker), legitimately absent from the
-    /// queue, NOT stranded. Completed/failed work is already gone from
-    /// `placed_work` (the scheduler unrecords on terminal), so a hash that
-    /// survives both filters is a placed work with no queue unit, not blocked on
-    /// an import, and not in flight — the actual permanently-unassignable trap.
-    /// The count and the bounded hash list are computed from the SAME filtered
-    /// set so they can never disagree.
+    /// queue, NOT stranded.
+    ///
+    /// TWO coordinator-side exclusions, both reading state the coordinator owns
+    /// (the scheduler carries no ledger/accounting knowledge):
+    ///   * IN-FLIGHT (`in_flight`) — popped-not-terminal, see above.
+    ///   * TERMINAL (`completed_tasks` ∪ `failed_tasks`) — a completed/failed
+    ///     work hash is `drop_local_terminal_residue`'d out of `placed_work` on
+    ///     every terminal path, but this is the belt-and-suspenders guard
+    ///     against a clear-race: a terminal task is NOT in flight (#663), so the
+    ///     in-flight filter alone would let a momentarily-lingering terminal
+    ///     hash show as a FALSE strand. Excluding terminals here means the
+    ///     diagnostic NEVER names a completed/failed task even under a race.
+    ///
+    /// A hash that survives BOTH filters is a placed work with no queue unit,
+    /// not blocked on an import, not in flight, and not terminal — the actual
+    /// permanently-unassignable trap. The count and the bounded hash list are
+    /// computed from the SAME filtered set so they can never disagree.
     pub(super) fn affine_dep_strand_count_and_hashes(&self, limit: usize) -> (usize, Vec<String>) {
         let mut stranded: Vec<String> = self
             .affine_scheduler
             .placed_but_unqueued_hashes_all()
             .into_iter()
-            .filter(|hash| !self.in_flight.contains_key(hash))
+            .filter(|hash| {
+                !self.in_flight.contains_key(hash)
+                    && !self.completed_tasks.contains(hash)
+                    && !self.failed_tasks.contains_key(hash)
+            })
             .collect();
         let count = stranded.len();
         // Deterministic, bounded sample (stable across log lines for grep).
