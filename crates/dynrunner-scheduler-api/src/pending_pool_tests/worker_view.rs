@@ -50,7 +50,7 @@ fn take_selected_commits_chosen_index() {
         .position(|t| t.affinity_id.as_ref().unwrap().as_str() == "beta")
         .expect("beta visible");
     let selection = view.select(beta_idx);
-    let item = p.take_selected(selection);
+    let item = p.take_selected(selection).expect("ready item dispatches (D.1)");
     assert_eq!(item.affinity_id.as_ref().unwrap().as_str(), "beta");
     // Worker 1 is now pinned to beta; subsequent pop stays in beta until
     // it drains.
@@ -78,7 +78,7 @@ fn take_selected_returns_the_same_arc_the_pool_held() {
     let bucket_arc: Arc<TaskInfo<_>> = p.buckets[&key].items[0].clone();
     let view = p.view_for_worker(1, None);
     let selection = view.select(0);
-    let taken = p.take_selected(selection);
+    let taken = p.take_selected(selection).expect("ready item dispatches (D.1)");
     assert!(
         Arc::ptr_eq(&bucket_arc, &taken),
         "take_selected must return the SAME Arc allocation the bucket held \
@@ -162,7 +162,7 @@ fn take_selected_removes_chosen_item_and_records_affinity() {
     assert_eq!(view.as_slice()[0].size, 1);
     assert_eq!(view.as_slice()[1].size, 2);
     let selection = view.select(1);
-    let taken = p.take_selected(selection);
+    let taken = p.take_selected(selection).expect("ready item dispatches (D.1)");
     assert_eq!(taken.size, 2);
     assert_eq!(taken.affinity_id.as_ref().unwrap().as_str(), "beta");
     // Worker 1 is now pinned to beta. Next view starts with the alpha
@@ -234,7 +234,7 @@ fn sort_by_key_preserves_locator_pairing() {
         // fresh sorted view between takes.
         let target = view.as_slice()[0].size;
         let selection = view.select(0);
-        let taken = p.take_selected(selection);
+        let taken = p.take_selected(selection).expect("ready item dispatches (D.1)");
         assert_eq!(taken.size, target);
     }
 
@@ -252,7 +252,7 @@ fn sort_by_key_preserves_locator_pairing() {
         assert_eq!(sizes, expected, "view should be size-descending");
         let target = view.as_slice()[2].size;
         let selection = view.select(2);
-        let taken = p.take_selected(selection);
+        let taken = p.take_selected(selection).expect("ready item dispatches (D.1)");
         assert_eq!(taken.size, target);
     }
 
@@ -272,7 +272,7 @@ fn sort_by_key_preserves_locator_pairing() {
             let expected_path = view.as_slice()[0].path.clone();
             let expected_size = view.as_slice()[0].size;
             let selection = view.select(0);
-            let taken = p.take_selected(selection);
+            let taken = p.take_selected(selection).expect("ready item dispatches (D.1)");
             assert_eq!(taken.path, expected_path);
             assert_eq!(taken.size, expected_size);
         }
@@ -315,7 +315,7 @@ fn sequential_views_with_takes_observe_pin_evolution() {
         let view = p.view_for_worker(worker, None);
         assert!(!view.is_empty(), "worker {worker} must see candidates");
         let selection = view.select(0);
-        taken.push(p.take_selected(selection).size);
+        taken.push(p.take_selected(selection).expect("ready item dispatches (D.1)").size);
     }
     assert_eq!(
         taken,
@@ -474,4 +474,75 @@ fn view_construction_clones_no_candidates() {
         0,
         "take_selected moves the item out of the bucket without cloning"
     );
+}
+
+/// #652 D.1 — idempotent pop-time re-check: a NOT-READY item pushed to a
+/// bucket head (the shape the 5-min reconcile arm, concern C, produces via
+/// [`PendingPool::push_to_queue_head`]) is RE-BLOCKED on pop, never dispatched.
+///
+/// This pins the invariant the reconcile arm relies on: reconcile can move a
+/// possibly-not-ready dependent to the general-queue head WITHOUT first
+/// re-deriving its readiness, because the consume-point gate restores the
+/// "bucketed ⇒ ready" invariant — a not-ready item is evicted + re-routed
+/// through `commit_item` (so it re-registers as `blocked`), and the worker gets
+/// no dispatch this slot. Covers BOTH consume entry points (`pop_for_worker`
+/// and the view-path `take_selected`).
+#[test]
+fn d1_not_ready_pushed_to_head_is_reblocked_on_pop_not_dispatched() {
+    use dynrunner_core::TaskDep;
+    use std::sync::Arc;
+
+    // A task whose prereq "dep" has NOT completed → not ready.
+    let mut blocked_item = t("P", "T", "alpha", 5);
+    blocked_item.task_id = "blocked".into();
+    blocked_item.task_depends_on = vec![TaskDep {
+        task_id: "dep".into(),
+        phase_id: phase("P"),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+
+    // pop_for_worker entry point.
+    {
+        let mut p = pool_with(&["P"], &[]);
+        // Reconcile shape: move the not-ready item straight to its bucket head.
+        p.push_to_queue_head(Arc::new(blocked_item.clone()));
+        // The pop-time gate re-derives readiness, finds the unmet "dep", evicts
+        // + re-blocks the item, and returns nothing for this worker.
+        assert!(
+            p.pop_for_worker(1).is_none(),
+            "a not-ready reconcile-pushed item must NOT be dispatched by pop_for_worker"
+        );
+        // It is now BLOCKED (re-routed through commit_item), not in any bucket.
+        assert!(
+            p.blocked.contains_key("blocked"),
+            "the not-ready item must be re-registered as blocked"
+        );
+        assert_eq!(p.in_flight(&phase("P")), 0, "no in-flight bump for a re-blocked item");
+        // Resolving the dep unblocks it into a bucket → now dispatchable.
+        p.on_item_finished(&phase("P"), Some("dep"));
+        assert!(
+            p.pop_for_worker(1).is_some(),
+            "once its dep completes, the formerly-blocked item dispatches"
+        );
+    }
+
+    // view_for_worker + take_selected entry point.
+    {
+        let mut p = pool_with(&["P"], &[]);
+        p.push_to_queue_head(Arc::new(blocked_item.clone()));
+        // The view is built from the bucket, so it offers the not-ready item;
+        // take_selected re-checks at the consume point and re-blocks it.
+        let view = p.view_for_worker(1, None);
+        assert_eq!(view.len(), 1, "the bucketed item is visible to the view");
+        let selection = view.select(0);
+        assert!(
+            p.take_selected(selection).is_none(),
+            "a not-ready reconcile-pushed item must NOT be dispatched by take_selected"
+        );
+        assert!(
+            p.blocked.contains_key("blocked"),
+            "take_selected must re-block the not-ready item"
+        );
+    }
 }

@@ -172,7 +172,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // Owned consumption ticket — the view's last use,
                 // releasing the pool borrow for the take below.
                 let selection = view.select(binary_index);
-                let binary = self.pool_mut().take_selected(selection);
+                // Pop-time readiness re-check (#652 D.1): a not-ready item
+                // selected from the view is re-blocked and yields `None`; skip
+                // this worker (steady-state cold-roster path never offers a
+                // not-ready item, so this is always `Some` here).
+                let Some(binary) = self.pool_mut().take_selected(selection) else {
+                    continue;
+                };
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();

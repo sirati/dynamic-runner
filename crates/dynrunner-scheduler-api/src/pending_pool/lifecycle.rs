@@ -582,6 +582,38 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
+    /// Push `item` to the FRONT of its `(phase, type, affinity)` bucket
+    /// WITHOUT touching the in-flight counter — the move primitive for the
+    /// 5-min reconcile arm (#652 concern C).
+    ///
+    /// Distinct from [`Self::requeue`]: requeue is the inverse of a DISPATCH
+    /// (the item WAS in flight, so it decrements the in-flight count). A
+    /// reconcile-moved item was NEVER in flight (it sat blocked / queued
+    /// waiting on an orphaned dep), so there is no in-flight count to undo —
+    /// decrementing here would corrupt a sibling's slot. The item is pushed to
+    /// the HEAD so the reconcile-surfaced work is re-evaluated before the rest of
+    /// its bucket; the [`Self::take_at_if_ready`] pop-time guard (#652 D.1) then
+    /// re-routes it (dispatch if its deps are in fact met, else re-block).
+    ///
+    /// Like `requeue`, a `Draining` phase is flipped back to `Active` so the
+    /// re-surfaced item is dispatchable.
+    pub fn push_to_queue_head(&mut self, item: Arc<TaskInfo<I>>) {
+        let phase_id = item.phase_id.clone();
+        let key = (
+            item.phase_id.clone(),
+            item.type_id.clone(),
+            affinity_key(&item),
+        );
+        self.buckets
+            .entry(key)
+            .or_insert_with(Bucket::new)
+            .items
+            .push_front(item);
+        if self.phase_state.get(&phase_id) == Some(&PhaseState::Draining) {
+            self.phase_state.insert(phase_id, PhaseState::Active);
+        }
+    }
+
     /// Re-inject an item whose previous attempt has already been
     /// finalised via `on_item_finished` (so it is no longer counted as
     /// in-flight). Pushes to the BACK of its bucket and, if the phase

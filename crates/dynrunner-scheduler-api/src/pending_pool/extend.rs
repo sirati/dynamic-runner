@@ -254,23 +254,11 @@ impl<I: Identifier> PendingPool<I> {
             return;
         }
 
-        // Compute unresolved prereqs (ones not yet in `completed_tasks`).
-        // AFFINE deps are EXCLUDED: a `TaskKind::SecondaryAffine` prereq's
-        // readiness is per-secondary (the bitvector + the per-secondary queue
-        // order), NOT a global terminal — so it must never block its dependent
-        // work task in this global pool (the work task is ready on its
-        // NON-affine deps, and is routed per-secondary by the affine
-        // scheduler). The set is empty on a run with no affine task, so a
-        // non-affine work task's blocking set is unchanged (baseline-preserved).
-        let unresolved: HashSet<String> = item
-            .task_depends_on
-            .iter()
-            .map(|d| d.task_id.clone())
-            .filter(|id| {
-                !self.completed_tasks.contains(id.as_str())
-                    && !self.affine_prereq_ids.contains(id.as_str())
-            })
-            .collect();
+        // Compute unresolved prereqs (the SINGLE dep-resolution authority —
+        // see [`Self::unresolved_deps`]). AFFINE deps are excluded; the set is
+        // empty on a run with no affine task, so a non-affine work task's
+        // blocking set is unchanged (baseline-preserved).
+        let unresolved: HashSet<String> = self.unresolved_deps(&item);
 
         let task_id = item.task_id.clone();
         let phase_id = item.phase_id.clone();
@@ -294,6 +282,38 @@ impl<I: Identifier> PendingPool<I> {
         self.task_deps.insert(task_id.clone(), unresolved);
         *self.blocked_per_phase.entry(phase_id).or_insert(0) += 1;
         self.blocked.insert(task_id, item);
+    }
+
+    /// The SINGLE dep-resolution primitive: `item`'s `task_depends_on` entries
+    /// that are NOT yet satisfied — i.e. not in `completed_tasks` and not an
+    /// affine prereq. An empty result means the item is READY (every non-affine
+    /// dep completed).
+    ///
+    /// AFFINE deps are EXCLUDED: a `TaskKind::SecondaryAffine` prereq's
+    /// readiness is per-secondary (the bitvector + the per-secondary queue
+    /// order), NOT a global terminal — so it must never block its dependent
+    /// work task in this global pool (the work task is ready on its NON-affine
+    /// deps, and is routed per-secondary by the affine scheduler). The
+    /// `affine_prereq_ids` set is empty on a run with no affine task, so a
+    /// non-affine work task's blocking set is unchanged (baseline-preserved).
+    ///
+    /// `pub(super)` so BOTH the ingest router ([`Self::commit_item`]) AND the
+    /// pop-time idempotent re-check ([`Self::commit_item_if_ready_else_reblock`]
+    /// in `dispatch.rs`) read readiness through ONE owner — never a
+    /// re-implemented dep walk. The pop-time guard exists because the 5-min
+    /// reconcile arm (#652 concern C) pushes a possibly-not-ready item to a
+    /// bucket head, violating the old "bucketed ⇒ ready" invariant; the guard
+    /// restores it by re-blocking a not-ready item the moment dispatch selects
+    /// it.
+    pub(super) fn unresolved_deps(&self, item: &TaskInfo<I>) -> HashSet<String> {
+        item.task_depends_on
+            .iter()
+            .map(|d| d.task_id.clone())
+            .filter(|id| {
+                !self.completed_tasks.contains(id.as_str())
+                    && !self.affine_prereq_ids.contains(id.as_str())
+            })
+            .collect()
     }
 
     /// Return the union of every task_id the pool currently knows

@@ -199,28 +199,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // Owned consumption ticket — the view's last use,
                         // releasing the pool borrow for the take below.
                         let selection = view.select(binary_index);
-                        let binary = self.pool_mut().take_selected(selection);
-                        // The single-task dispatch transaction (commit →
-                        // gather → build → send → originate, with the
-                        // in-flight-bookkeeping triple + rollback) lives in
-                        // `dispatch_one_assignment`, shared with the pool-fed
-                        // + affine-fed sites so the wire shape + leak-safe
-                        // rollback are identical regardless of which path
-                        // fires. A non-committed outcome hands the binary
-                        // back: this is the POOL-fed source, so it requeues to
-                        // the pool and returns (the requester re-polls on its
-                        // backoff tick — the slot is open again).
-                        match self
-                            .dispatch_one_assignment(idx, binary, estimated_usage.clone())
-                            .await
-                        {
-                            DispatchOutcome::Committed => {
-                                assigned = true;
-                            }
-                            DispatchOutcome::CommitRefused(binary)
-                            | DispatchOutcome::SendFailed(binary) => {
-                                self.pool_mut().requeue(binary);
-                                return Ok(());
+                        // Pop-time readiness re-check (#652 D.1): a not-ready
+                        // item selected from the view is re-blocked and yields
+                        // `None`; fall through to the "no local assignment"
+                        // drop below (the requester re-polls; nothing strands).
+                        // On the steady-state path the view never offers a
+                        // not-ready item, so this is always `Some`.
+                        if let Some(binary) = self.pool_mut().take_selected(selection) {
+                            // The single-task dispatch transaction (commit →
+                            // gather → build → send → originate, with the
+                            // in-flight-bookkeeping triple + rollback) lives in
+                            // `dispatch_one_assignment`, shared with the pool-fed
+                            // + affine-fed sites so the wire shape + leak-safe
+                            // rollback are identical regardless of which path
+                            // fires. A non-committed outcome hands the binary
+                            // back: this is the POOL-fed source, so it requeues to
+                            // the pool and returns (the requester re-polls on its
+                            // backoff tick — the slot is open again).
+                            match self
+                                .dispatch_one_assignment(idx, binary, estimated_usage.clone())
+                                .await
+                            {
+                                DispatchOutcome::Committed => {
+                                    assigned = true;
+                                }
+                                DispatchOutcome::CommitRefused(binary)
+                                | DispatchOutcome::SendFailed(binary) => {
+                                    self.pool_mut().requeue(binary);
+                                    return Ok(());
+                                }
                             }
                         }
                     }

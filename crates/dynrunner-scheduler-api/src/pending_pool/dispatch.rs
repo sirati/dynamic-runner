@@ -51,7 +51,13 @@ impl<I: Identifier> PendingPool<I> {
         // transitions.
         let bucket = self.buckets.get(&key)?;
         let index = self.first_eligible_index(bucket)?;
-        Some(self.take_at(&key, index, worker_id))
+        // Idempotent pop-time re-check (#652 D.1): a reconcile-pushed
+        // (concern C) item at a bucket head may NOT actually be ready, so the
+        // old "bucketed ⇒ ready" invariant no longer holds at the consume
+        // point. `take_at_if_ready` re-blocks a not-ready item (re-routing it
+        // through `commit_item`) and returns `None`; the worker simply gets no
+        // dispatch this slot (a later dep-completion re-surfaces the item).
+        self.take_at_if_ready(&key, index, worker_id)
     }
 
     /// Affinity-ordered view of items currently eligible for `worker_id`.
@@ -233,7 +239,7 @@ impl<I: Identifier> PendingPool<I> {
     /// since the view was constructed — callers are required to consume
     /// the selection before any other pool mutation. See
     /// [`view_for_worker`].
-    pub fn take_selected(&mut self, selection: ViewSelection) -> Arc<TaskInfo<I>> {
+    pub fn take_selected(&mut self, selection: ViewSelection) -> Option<Arc<TaskInfo<I>>> {
         let ViewSelection {
             bucket_key,
             item_idx,
@@ -251,10 +257,64 @@ impl<I: Identifier> PendingPool<I> {
             "ViewSelection locator points past end of bucket; pool was \
              mutated between view construction and take_selected"
         );
-        self.take_at(&bucket_key, item_idx, worker_id)
+        // Idempotent pop-time re-check (#652 D.1): see `take_at_if_ready`. A
+        // reconcile-pushed (concern C) not-ready item selected from the view is
+        // re-blocked rather than dispatched, so `None` here means "the view's
+        // chosen item turned out not-ready; skip this slot". The view itself
+        // never sees a reconcile-pushed item as not-ready (the view is built
+        // from the same buckets), so on the steady-state path this is always
+        // `Some` — byte-identical to the pre-#652 behaviour.
+        self.take_at_if_ready(&bucket_key, item_idx, worker_id)
     }
 
     // ---- internals shared by pop_for_worker and take_selected ----
+
+    /// Idempotent pop-time readiness gate (#652 D.1) — the shared consume-point
+    /// guard for BOTH [`Self::pop_for_worker`] and [`Self::take_selected`].
+    ///
+    /// The 5-min reconcile arm (concern C) pushes a possibly-not-ready item to
+    /// a bucket HEAD ([`Self::push_to_queue_head`]), which breaks the old
+    /// "every bucketed item is dep-ready" invariant the take paths trusted. This
+    /// gate restores it at the consume point: it re-derives the item's
+    /// readiness through the SINGLE [`Self::unresolved_deps`] authority (the
+    /// SAME computation [`Self::commit_item`] uses at ingest — zero duplicated
+    /// dep logic), and:
+    ///
+    ///   * READY (no unresolved dep) → delegate to the pure-write [`Self::take_at`]
+    ///     and return the item (the steady-state path: every non-reconcile item
+    ///     is ready, so this is the common case and is byte-identical to the
+    ///     pre-#652 direct `take_at`).
+    ///   * NOT READY → REMOVE the item from its bucket and route it back through
+    ///     `commit_item`, which re-registers it as `blocked` (rebuilding its
+    ///     `dependents_of` / `task_deps` / `blocked_per_phase` edges identically
+    ///     to ingest); return `None`. The item leaves the dispatchable bucket and
+    ///     waits for its final dep's completion to re-surface it (the affine twin
+    ///     is the per-secondary readiness gate, D.2). No in-flight bump (the item
+    ///     never dispatched), so the accounting stays balanced.
+    fn take_at_if_ready(
+        &mut self,
+        key: &BucketKey,
+        index: usize,
+        worker_id: WorkerId,
+    ) -> Option<Arc<TaskInfo<I>>> {
+        // Re-derive readiness on the item still sitting in its bucket. A bucket
+        // / index that no longer resolves (a concurrent mutation) yields `None`
+        // — the caller treats it as "no dispatch this slot".
+        let item = self.buckets.get(key)?.items.get(index)?.clone();
+        if self.unresolved_deps(&item).is_empty() {
+            // Ready: pure-write take (unchanged accounting).
+            return Some(self.take_at(key, index, worker_id));
+        }
+        // Not ready (a reconcile-pushed item whose deps are not yet met):
+        // evict it from the bucket and re-block it through the single edge
+        // builder. NOTE: removing the item shifts later indices, but the
+        // caller dispatches at most one item per call, so no stale index is
+        // reused after this.
+        let bucket = self.buckets.get_mut(key)?;
+        let evicted = bucket.items.remove(index)?;
+        self.commit_item(evicted);
+        None
+    }
 
     /// Remove the item at `index` of bucket `key`, run the same
     /// affinity / in-flight bookkeeping as `take_from_bucket`, and
