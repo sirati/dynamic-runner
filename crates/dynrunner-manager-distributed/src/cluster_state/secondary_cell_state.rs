@@ -45,6 +45,19 @@
 //!   supersedes. This is why the steal's `01 → 00` reset CONVERGES: its
 //!   generation is `> ` the Queued's generation, so the LWW join keeps the
 //!   reset.
+//! * SINGLE-ORIGINATOR INVARIANT (load-bearing — do not break): the monotone
+//!   stamp is sound ONLY because the PRIMARY is the SOLE originator of every
+//!   cell mutation — all four cell writes (Queued / NotDone-reset / Done /
+//!   Failed) originate in primary code and pass through the one broadcast choke
+//!   that stamps the generation. Secondaries and the snapshot/anti-entropy
+//!   restore path only RECEIVE + merge cells; they NEVER originate one with an
+//!   independently-sourced generation. If a future change ever lets a secondary
+//!   (or any non-primary path) ORIGINATE a cell write, two writers would mint
+//!   colliding/independent stamps and the gen-LWW total order would no longer be
+//!   causally correct (a stale write could out-stamp a live one) — that change
+//!   MUST route the new origination through the same monotone choke (or replace
+//!   the lattice). The cell-ordering correctness of the affine bounce-recovery
+//!   reset depends on this.
 //! * FAILOVER: the bitvector is REPLICATED (snapshot + digest + restore), so a
 //!   promoted primary INHERITS every cell + its generation; resuming the gen
 //!   counter past `max(observed generation)` keeps the LWW total order intact
@@ -57,8 +70,9 @@
 //! affine build). This is the recommended default the owner left open
 //! (design Q1). It is a PURE consequence of LWW-on-generation: nothing special-
 //! cases `Failed`. Should the owner later decide `Failed` IS sticky, the change
-//! is localized to [`SecondaryCellBits::merge_cell`] / [`Self::set_cell`]
-//! (clamp a `Failed` cell against an incoming non-`Done`), NOT a wire change.
+//! WOULD BE localized to [`SecondaryCellBits::merge_cell`] / [`Self::set_cell`]
+//! — adding a clamp of a `Failed` cell against an incoming non-`Done` (NO such
+//! clamp exists now; this is purely WHERE it would go), NOT a wire change.
 
 use std::collections::HashMap;
 
