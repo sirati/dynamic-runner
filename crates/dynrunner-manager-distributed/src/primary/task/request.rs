@@ -284,13 +284,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                                 .iter()
                                 .filter(|w| w.held_task().is_none())
                                 .count();
+                            // Affine-dep-work STRAND signature (the deepest
+                            // unassignable-trap layer): a work task withheld
+                            // from the global view by `has_affine_dep` but
+                            // recorded PLACED yet sitting in no affine queue is
+                            // permanently unassignable until its `placed_work`
+                            // guard clears (which the requeue-recovery now does).
+                            // Naming the count here turns a silent strand into a
+                            // one-line greppable signal: a non-zero
+                            // `affine_dep_strand_candidates` while workers park
+                            // pins THIS layer immediately. Upper bound (a
+                            // momentarily popped-but-not-redispatched unit
+                            // counts), so it is diagnostic only.
+                            let affine_dep_strand_candidates =
+                                self.affine_scheduler.placed_but_unqueued_count();
                             tracing::debug!(
                                 parked_workers = parked,
                                 suppressed_re_requests = suppressed,
+                                affine_dep_strand_candidates,
                                 "idle workers parked awaiting work; \
                                  unassignable re-requests suppressed in the \
                                  last {:?} — each worker is assigned by the \
-                                 dispatch push as soon as work fits",
+                                 dispatch push as soon as work fits \
+                                 (affine_dep_strand_candidates names work hashes \
+                                 placed but absent from every affine queue)",
                                 UNASSIGNABLE_PARK_WARN_INTERVAL
                             );
                         }

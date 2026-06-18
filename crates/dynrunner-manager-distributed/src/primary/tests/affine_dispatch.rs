@@ -1132,6 +1132,229 @@ async fn affine_backpressure_recovery_emits_unqueued_never_task_requeued() {
         .await;
 }
 
+/// Drive the on-demand import to COMPLETION on every secondary that dispatches
+/// it, then return the `(secondary, worker, build_hash)` of the dependent WORK
+/// task once IT dispatches (its cell now `Done`). Used by the affine-dep-WORK
+/// requeue-recovery tests below, which must bounce the WORK task (not the
+/// import) after it has committed to a worker. Bounded so a regression that
+/// never dispatches the build surfaces as a failed expect, not a hang.
+#[allow(clippy::type_complexity)]
+async fn drive_until_work_dispatches(
+    primary: &mut TestPrimary,
+    ends: &mut [(
+        String,
+        tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    )],
+    wm_rx: &mut tokio_mpsc::UnboundedReceiver<WorkerMgmtSignal>,
+    import_hash: &str,
+    build_hash: &str,
+) -> (String, u32) {
+    for _round in 0..12 {
+        drain_rechecks(primary, wm_rx).await;
+        let mut round: Vec<(String, String, u32, String)> = Vec::new();
+        for (_id, rx, _tx) in ends.iter_mut() {
+            round.extend(assignments(rx));
+        }
+        if round.is_empty() {
+            continue;
+        }
+        for (_, sec, worker, h) in &round {
+            if h == import_hash {
+                // Complete the import on its secondary → cell Done, so the
+                // dependent build can then dispatch there.
+                primary
+                    .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                    .await;
+                settle_pump().await;
+            } else if h == build_hash {
+                // The build committed to a worker — this is what the recovery
+                // tests bounce.
+                return (sec.clone(), *worker);
+            }
+        }
+    }
+    panic!("the dependent build never dispatched within the round budget");
+}
+
+/// AFFINE-DEP-WORK REQUEUE RECOVERY (the #646 twin for affine-DEPENDENT WORK):
+/// a backpressure-bounced affine-dep WORK task must be RE-DERIVED onto a
+/// secondary's affine queue and re-dispatched — NOT stranded.
+///
+/// RED at 751b7377: the backpressure arm `pool.requeue`'d the work binary
+/// (correct — the pool item is its ready-state) but left the affine scheduler's
+/// `placed_work` guard SET. The work is withheld from the global worker view by
+/// `has_affine_dep`, so it can never dispatch globally; and `placed_work` blocks
+/// `place_dependency_satisfied_affine_tasks` from re-deriving its per-secondary
+/// queue unit. Result: hidden in the global pool, absent from every affine
+/// queue, blocked from re-placement — permanently unassignable.
+///
+/// GREEN: `requeue_affine_aware` clears `placed_work` on the bounce, so the
+/// SAME same-tick `TasksAdded` recheck re-runs the placement pass (re-derives +
+/// re-queues the unit onto a rank-selected secondary) and `try_affine_pop`
+/// re-dispatches it. The fix is JUST the guard-clear — no pool-routing change.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_backpressure_bounce_recovers_to_affine_queue_not_stranded() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            // Drive the import to Done on its secondary, then let the dependent
+            // build dispatch (cell Done). Capture where the build committed.
+            let (sec, worker) = drive_until_work_dispatches(
+                &mut primary,
+                &mut ends,
+                &mut wm_rx,
+                &import_hash,
+                &build_hash,
+            )
+            .await;
+
+            // Pre-bounce invariants: the build is committed (slot Assigned), and
+            // its placement-dedup guard is SET (it was placed). It is the lone
+            // pool item too (its ready-state).
+            assert!(
+                primary.secondary_has_slot_holding_hash(&sec, &build_hash),
+                "the build slot must be Assigned on {sec} before the bounce"
+            );
+            assert!(
+                primary.affine_work_is_placed_for_test(&build_hash),
+                "the build's placement-dedup guard must be SET (it was placed)"
+            );
+
+            // ── THE BOUNCE: a backpressure-shaped TaskFailed for the WORK task. ──
+            primary
+                .handle_task_failed(
+                    task_failed_backpressure(&sec, worker, &build_hash),
+                    &mut None,
+                )
+                .await;
+            settle_pump().await;
+
+            // GREEN (the fix): the placement-dedup guard was CLEARED by the
+            // affine-aware requeue. RED at 751b7377: it stayed SET — the strand.
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "the bounce must UNRECORD the affine-dep work's placement guard \
+                 so the placement pass re-derives its queue unit (RED at \
+                 751b7377: the guard stayed set → permanently unassignable)"
+            );
+            // The strand-diagnostic count (placed-but-in-no-queue) the
+            // unassignable-park line reports is 0 right after the bounce: the
+            // guard was cleared, so the work is no longer placed-but-unqueued.
+            // RED at 751b7377: the guard stayed set while the queue unit was gone
+            // → count 1 (the strand signature this diagnostic names).
+            assert_eq!(
+                primary.affine_scheduler_placed_but_unqueued_for_test(),
+                0,
+                "post-bounce the affine-dep work is not placed-but-unqueued \
+                 (guard cleared); RED at 751b7377 it was the strand (count 1)"
+            );
+
+            // The build slot was freed by the terminal-free; the work is back in
+            // the pool (its ready-state), hidden from the global view by
+            // has_affine_dep — exactly the steady state the affine channel feeds
+            // off. It is NOT terminal-failed (a bounce is recoverable).
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "a backpressure bounce must NOT terminal-fail the affine-dep work"
+            );
+
+            // The SAME same-tick TasksAdded the bounce emitted re-derives the
+            // unit + re-dispatches it. RED at 751b7377: no re-derivation (guard
+            // set) → no affine-queue entry → no dispatch → stranded forever.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut build_redispatched = false;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, _sec, _worker, h) in assignments(rx) {
+                    if h == build_hash {
+                        build_redispatched = true;
+                    }
+                }
+            }
+            assert!(
+                build_redispatched,
+                "the affine-dep work must be RE-DISPATCHED after the bounce \
+                 cleared its placement guard (StrandedHere re-derivation) — not \
+                 wedged hidden-in-pool / absent-from-every-affine-queue forever"
+            );
+        })
+        .await;
+}
+
+/// AFFINE-DEP-WORK DEAD-SECONDARY RECOVERY (the mid-run-leg-drop variant of the
+/// same recovery): when the holder of a committed affine-dep WORK task DIES,
+/// `recover_inflight_for_dead_secondary` requeues it — and must clear the
+/// `placed_work` guard, or the requeued work is stranded exactly as in the
+/// backpressure case (hidden from the global view, blocked from re-placement).
+///
+/// RED at 751b7377: the dead-secondary requeue called the bare `pool.requeue`,
+/// leaving the guard set → strand. GREEN: it now routes through
+/// `requeue_affine_aware`, clearing the guard so the work re-derives.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_dep_work_dead_secondary_recovery_clears_placement_guard() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            let (sec, _worker) = drive_until_work_dispatches(
+                &mut primary,
+                &mut ends,
+                &mut wm_rx,
+                &import_hash,
+                &build_hash,
+            )
+            .await;
+
+            // The build is in flight on `sec` and its placement guard is set.
+            assert!(
+                primary.affine_work_is_placed_for_test(&build_hash),
+                "the build's placement-dedup guard must be SET before the holder dies"
+            );
+
+            // ── THE HOLDER DIES: recover its in-flight work (the dead-secondary
+            // requeue path). This is the unit directly under test. ──
+            let muts = primary.recover_inflight_for_dead_secondary(&sec);
+            // The work was requeued (InFlight → Pending), proving it took the
+            // reassignable WORK arm (not the veto / setup-fail arms).
+            assert!(
+                muts.iter().any(|m| matches!(
+                    m,
+                    ClusterMutation::TaskRequeued { hash, .. } if *hash == build_hash
+                )),
+                "the dead holder's affine-dep work must be requeued (TaskRequeued)"
+            );
+
+            // GREEN (the fix): the placement-dedup guard was CLEARED by the
+            // affine-aware requeue. RED at 751b7377: it stayed SET — the strand.
+            assert!(
+                !primary.affine_work_is_placed_for_test(&build_hash),
+                "the dead-secondary requeue must UNRECORD the affine-dep work's \
+                 placement guard (RED at 751b7377: stayed set → stranded)"
+            );
+        })
+        .await;
+}
+
 /// RELOCATION-REBUILD under lazy import (c): the rebuild re-derives ONLY the
 /// dependent WORK units — it never reconstructs an import unit on the queue,
 /// regardless of the inherited `Queued` cell. The import is a DEPENDENCY derived

@@ -293,7 +293,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // the binary at the front of its bucket). No
                 // `release_type_slot` here — the helper already did it.
                 if let Some(binary) = recovered_binary {
-                    self.pool_mut().requeue(binary);
+                    // Affine-aware requeue (the SINGLE recovery seam): a plain
+                    // `pool.requeue` of an affine-DEPENDENT work task would
+                    // strand it — hidden from the global view by
+                    // `has_affine_dep`, absent from every affine queue, and
+                    // blocked from re-placement by the scheduler's `placed_work`
+                    // dedup. `requeue_affine_aware` clears that guard (the #646
+                    // twin for affine-dep work) so the same-tick `TasksAdded`
+                    // recheck re-derives + re-queues its per-secondary unit; a
+                    // non-affine-dep task takes the unchanged `pool.requeue`.
+                    self.requeue_affine_aware(binary);
                     // Originate the replicated `InFlight → Pending`
                     // transition in lockstep with the local pool requeue —
                     // the SAME `TaskRequeued` origination every other

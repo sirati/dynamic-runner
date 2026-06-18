@@ -148,11 +148,40 @@ impl AffineScheduler {
         self.placed_work.remove(work_hash);
     }
 
+    /// Whether `work_hash` is currently recorded in the placement-dedup guard —
+    /// the read seam the requeue-recovery test asserts against (the guard is SET
+    /// after placement, CLEARED by `requeue_affine_aware`).
+    #[cfg(test)]
+    pub(crate) fn is_work_placed(&self, work_hash: &str) -> bool {
+        self.placed_work.contains(work_hash)
+    }
+
     /// This secondary's current queue length (0 for an unseen secondary) — the
     /// queue-rank input + the "is the per-secondary queue empty?" idle-steal
     /// precondition.
     pub(crate) fn queue_len(&self, secondary: &str) -> usize {
         self.queues.get(secondary).map_or(0, Vec::len)
+    }
+
+    /// DIAGNOSTIC: how many work hashes are recorded PLACED (`placed_work`) yet
+    /// sit in NO secondary's queue as a `Work` unit — the affine-dep-work STRAND
+    /// signature. A correctly-placed work hash is queued somewhere (or in flight
+    /// after a pop); a hash that is `placed_work`-marked but appears in no queue
+    /// AND is not in flight is exactly the trap this requeue-recovery fixes (the
+    /// dedup guard blocks re-placement while the unit is gone). Pop-then-dispatch
+    /// briefly drains a queued unit, so this count is an UPPER BOUND on the
+    /// genuinely-stranded set — it is operator diagnostic only (greppable on the
+    /// unassignable-park line), never a control input. Owned here because both
+    /// `placed_work` and `queues` are this module's private state.
+    pub(crate) fn placed_but_unqueued_count(&self) -> usize {
+        self.placed_work
+            .iter()
+            .filter(|hash| {
+                !self.queues.values().flatten().any(|unit| {
+                    matches!(unit, QueuedUnit::Work { hash: h } if h == *hash)
+                })
+            })
+            .count()
     }
 
     /// The whole current queue for a secondary (empty slice for an unseen one)
@@ -572,6 +601,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             cell_id: affine_id.0,
             generation: 0,
         })
+    }
+
+    /// Re-queue a recovered work `binary` into the pending pool, affine-aware:
+    /// the SINGLE requeue seam every requeue-of-recovered-work path uses (the
+    /// backpressure-bounce arm and the dead-secondary recovery), so the
+    /// affine-dependent-work recovery is owned in ONE place and the two call
+    /// sites read no affine internals.
+    ///
+    /// The recovery this owns (the #646 twin for affine-DEPENDENT WORK): an
+    /// affine-dep work task is withheld from the GLOBAL worker view by
+    /// `has_affine_dep` and dispatches ONLY through the per-secondary affine
+    /// queue, gated once-per-task by the affine scheduler's `placed_work`
+    /// dedup. A plain `pool.requeue` returns the binary to its bucket (correct
+    /// — the pool item is its ready-state and the placement candidate
+    /// `place_dependency_satisfied_affine_tasks` iterates), but leaves
+    /// `placed_work` STILL recorded, so the next placement pass SKIPS
+    /// re-deriving its queue unit: the task is hidden in the global pool, absent
+    /// from every affine queue, and `placed_work` blocks re-placement —
+    /// permanently unassignable. Clearing `placed_work` here (the affine twin of
+    /// the import bounce's `Queued → NotDone` cell reset) lets the SAME
+    /// same-tick `TasksAdded` recheck re-run `place_dependency_satisfied_affine_tasks`
+    /// → re-derive + re-queue the unit onto a rank-selected live-route secondary
+    /// → `try_affine_pop` dispatch it. No pool-routing change: the binary stays
+    /// a pool item exactly as before; only the local, non-replicated placement
+    /// guard is cleared (so the fix is failover-safe by construction — a
+    /// promoted primary rebuilds `placed_work` with the queues). A
+    /// non-affine-dep work task takes the unchanged `pool.requeue`.
+    pub(crate) fn requeue_affine_aware(&mut self, binary: std::sync::Arc<TaskInfo<I>>) {
+        if self.pool().has_affine_dep(&binary) {
+            let work_hash = compute_task_hash(&binary);
+            self.affine_scheduler.unrecord_placed_work(&work_hash);
+        }
+        self.pool_mut().requeue(binary);
     }
 }
 

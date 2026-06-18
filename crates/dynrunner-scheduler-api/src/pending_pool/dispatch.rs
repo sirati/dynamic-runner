@@ -440,7 +440,14 @@ impl<I: Identifier> PendingPool<I> {
     /// the work, in order, on the chosen secondary). The `affine_prereq_ids`
     /// set is empty on a run with no affine task, so this is `false` for every
     /// task and the view is byte-identical to the pre-affine behaviour.
-    fn has_affine_dep(&self, item: &TaskInfo<I>) -> bool {
+    ///
+    /// `pub` for the SECOND consumer of this exact predicate: the primary's
+    /// requeue-recovery seam (`requeue_affine_aware`) must, on requeue of an
+    /// affine-DEPENDENT work task, clear the affine scheduler's placement-dedup
+    /// guard so the per-secondary queue unit re-derives — and it discriminates
+    /// "affine-dep work" by reading THIS predicate, never a re-implemented copy
+    /// (the pool is the sole owner of `affine_prereq_ids`).
+    pub fn has_affine_dep(&self, item: &TaskInfo<I>) -> bool {
         if self.affine_prereq_ids.is_empty() {
             return false;
         }
