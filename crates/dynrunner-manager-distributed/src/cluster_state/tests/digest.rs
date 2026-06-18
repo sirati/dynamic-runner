@@ -585,3 +585,62 @@ fn digest_memo_hit_skips_the_fold() {
         "a mutation must invalidate so the next read re-folds"
     );
 }
+
+/// #653 dirty signal: `state_generation` advances on EVERY folded-field
+/// mutation seam and is STABLE across pure reads. This is the load-bearing
+/// invariant the observer's projection gate relies on — a consumer that
+/// stashes the generation and finds it unchanged KNOWS no replicated
+/// mutation landed, so it can skip an O(ledger) re-projection.
+#[test]
+fn state_generation_advances_on_mutation_and_is_stable_on_reads() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+
+    // Pure reads (counts / digest / outcome_counts) must NOT advance it —
+    // otherwise the gate would re-project forever.
+    let g0 = s.state_generation();
+    let _ = s.counts();
+    let _ = s.digest();
+    let _ = s.outcome_counts();
+    let _ = s.state_generation();
+    assert_eq!(
+        s.state_generation(),
+        g0,
+        "pure reads must not advance the change generation"
+    );
+
+    // Each mutating apply advances it (strictly increasing), so a burst of N
+    // mutations yields N distinct generations a consumer can coalesce on.
+    let mut prev = s.state_generation();
+    for i in 0..8 {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: format!("t{i}"),
+            task: mk_task(&format!("t{i}")),
+            def_id: None,
+        });
+        let now = s.state_generation();
+        assert!(
+            now > prev,
+            "mutation #{i} must advance the generation ({prev} -> {now})"
+        );
+        prev = now;
+    }
+
+    // A restore (the snapshot heal seam) is a folded-field mutation too — it
+    // advances the generation so a behind observer's just-restored mirror is
+    // re-projected.
+    let donor = {
+        let mut d = ClusterState::<RunnerIdentifier>::new();
+        d.apply(ClusterMutation::TaskAdded {
+            hash: "donor".into(),
+            task: mk_task("donor"),
+            def_id: None,
+        });
+        d.snapshot()
+    };
+    let before_restore = s.state_generation();
+    s.restore(donor);
+    assert!(
+        s.state_generation() > before_restore,
+        "restore must advance the change generation"
+    );
+}

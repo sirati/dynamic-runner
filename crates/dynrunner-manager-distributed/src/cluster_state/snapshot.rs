@@ -687,6 +687,11 @@ impl<I: Identifier> ClusterState<I> {
             // their own and never cross the wire.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // node-local: the change cadence is a pure derivation of the
+            // mutation seam (NOT a folded/replicated field), so it carries no
+            // signal of its own and never crosses the wire. Bound for the
+            // exhaustive guard.
+            state_generation: _state_generation,
             // node-local: the range-fold memo is a pure derivation of the
             // replicated `tasks` + `settled` (it IS the range fold of this
             // snapshot's content), so it carries no signal of its own and

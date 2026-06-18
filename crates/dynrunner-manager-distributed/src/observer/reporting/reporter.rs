@@ -77,13 +77,30 @@ pub trait CrdtSnapshotSource: Send {
 #[derive(Clone)]
 pub struct SharedSnapshotSource {
     cell: std::sync::Arc<std::sync::Mutex<StatsSnapshot>>,
+    /// Test-only count of `publish` calls (the live-feed REBUILD count).
+    /// The #653 dirty-gate / rate-limit test asserts that ingesting N
+    /// inbound mutations drives FAR fewer than N rebuilds; counting at the
+    /// publish seam is the cheapest non-intrusive probe of that. `Arc`-shared
+    /// so a `clone()` (the coordinator clones the source for its publisher
+    /// handle) observes the same counter. Compiled out of production.
+    #[cfg(test)]
+    publish_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SharedSnapshotSource {
     pub fn new(initial: StatsSnapshot) -> Self {
         Self {
             cell: std::sync::Arc::new(std::sync::Mutex::new(initial)),
+            #[cfg(test)]
+            publish_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Test-only: the number of `publish` calls observed so far (the
+    /// live-feed rebuild count). See the `publish_count` field doc.
+    #[cfg(test)]
+    pub fn publish_count(&self) -> usize {
+        self.publish_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Publish a fresh CRDT projection for the reporter to read on its
@@ -95,6 +112,9 @@ impl SharedSnapshotSource {
     /// `StatsSnapshot::from_cluster_state(...)` projection on each loop
     /// iteration (see the publish site in `observer/coordinator.rs`).
     pub fn publish(&self, snapshot: StatsSnapshot) {
+        #[cfg(test)]
+        self.publish_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.cell.lock().unwrap_or_else(|p| p.into_inner());
         *guard = snapshot;
     }
