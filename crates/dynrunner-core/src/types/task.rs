@@ -113,6 +113,25 @@ pub enum TaskCountCategory {
     SecondaryEagerPrep,
 }
 
+impl TaskCountCategory {
+    /// Whether this category names a CELL-BEARING per-secondary kind — the
+    /// category-level twin of [`TaskKind::has_secondary_cell`], for the call
+    /// sites that classify a settled terminal BY ITS CARRIED COUNT CATEGORY
+    /// (e.g. the hydrate settled-`FailedFinal` global-`failed_tasks` exclusion)
+    /// and have only the category in hand, not the kind. `true` for both
+    /// [`Self::SecondaryAffine`] and [`Self::SecondaryEagerPrep`] — a
+    /// cell-bearing task's terminal is per-secondary (the bitvector cell),
+    /// never a global doom. The single owner of the category→cell-bearing
+    /// mapping, kept 1:1 with [`TaskKind::has_secondary_cell`] (both partition
+    /// on the same kind family via [`TaskKind::count_category`]).
+    pub fn has_secondary_cell(self) -> bool {
+        matches!(
+            self,
+            TaskCountCategory::SecondaryAffine | TaskCountCategory::SecondaryEagerPrep
+        )
+    }
+}
+
 impl TaskKind {
     /// Whether a task of this kind may be dispatched to a WORKER. Only
     /// `Work` is worker-assignable; a `Setup` task is executed in-process

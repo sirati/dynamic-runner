@@ -267,16 +267,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     started_phases.insert(def.phase_id.clone());
                     phases_with_terminal.insert(def.phase_id.clone());
                     soft_failed_seed.push((def.task_id.clone(), def.phase_id.clone()));
-                    // #668 defense-in-depth: an affine import's terminal is
-                    // PER-SECONDARY (the bitvector cell), never the global
-                    // `failed_tasks` gate — that gate is what the affine
-                    // readiness check reads to DOOM every dependent as
-                    // `Unsatisfiable`, which is exactly the bug. A
-                    // `SecondaryAffine` hash must never enter it (Part A stops
-                    // the root that flips an affine CRDT `Failed` on death; this
-                    // guard makes the projection unconditionally affine-safe for
-                    // any other path that ever lands an affine `Failed`).
-                    if !def.kind.is_secondary_affine() {
+                    // #668 defense-in-depth (generalized): a CELL-BEARING
+                    // per-secondary task's terminal is PER-SECONDARY (the
+                    // bitvector cell), never the global `failed_tasks` gate — that
+                    // gate is what the affine readiness check reads to DOOM every
+                    // dependent as `Unsatisfiable`, which is exactly the bug. No
+                    // `has_secondary_cell()` hash may enter it. Eager-prep already
+                    // `continue`s above (so only `SecondaryAffine` can REACH this
+                    // arm — the kind-blind predicate is harmless-but-redundant
+                    // here, kept uniform with the other two guard sites); Part A
+                    // stops the root that flips a cell-bearing CRDT `Failed` on
+                    // death, this guard makes the projection unconditionally
+                    // cell-safe for any other path that ever lands such a `Failed`.
+                    if !def.kind.has_secondary_cell() {
                         failed_tasks.insert(hash.clone(), kind.clone());
                     }
                 }
@@ -478,17 +481,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     started_phases.insert(entry.phase_id.clone());
                     phases_with_terminal.insert(entry.phase_id.clone());
                     soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
-                    // #668 defense-in-depth (settled twin of the fat `Failed`
-                    // arm): an affine import's terminal is PER-SECONDARY, never
-                    // the global `failed_tasks` doom-gate. A `SecondaryAffine`
+                    // #668 defense-in-depth (generalized, settled twin of the fat
+                    // `Failed` arm): a CELL-BEARING per-secondary task's terminal
+                    // is PER-SECONDARY, never the global `failed_tasks` doom-gate.
+                    // Neither a `SecondaryAffine` import NOR a `SecondaryEagerPrep`
+                    // filler may enter it. This site keys on the carried
+                    // `entry.category` (a `TaskCountCategory`, not a kind — the
+                    // settled base does not replay fat bodies), so it reads the
+                    // category-level `has_secondary_cell()` twin. A cell-bearing
                     // token never reaches a settle-eligible terminal in practice
-                    // (it is a gate, never executed by the primary — see
-                    // `SettledEntry::category`), so the carried count category is
-                    // the affine discriminant here; the guard keeps the
-                    // projection affine-safe for totality regardless.
-                    if entry.category
-                        != dynrunner_core::TaskCountCategory::SecondaryAffine
-                    {
+                    // (both are gates/fillers, never executed-and-settled by the
+                    // primary — see `SettledEntry::category`); the guard keeps the
+                    // projection cell-safe for totality regardless.
+                    if !entry.category.has_secondary_cell() {
                         failed_tasks.insert(hash.clone(), kind.clone());
                     }
                 }

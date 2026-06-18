@@ -3864,16 +3864,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .cluster_state
                     .task_view(&hash)
                     .is_some_and(|v| v.is_terminal());
-                // AFFINE import in-flight on the dead secondary (#668): a
-                // `SecondaryAffine` import is PER-SECONDARY recoverable, NEVER a
-                // global task terminal. Its `is_reassignable() == false`, so
-                // without this arm it falls into the non-reassignable `else`
-                // below and emits a GLOBAL `ClusterMutation::TaskFailed` — a
-                // spurious doom that lies dormant until a failover hydrate loads
-                // the CRDT `Failed` into `failed_tasks` and the affine gate dooms
-                // the import's whole dependent subtree (`Unsatisfiable`).
+                // CELL-BEARING per-secondary task in-flight on the dead secondary
+                // (#668 + generalization): a task on the shared per-secondary CELL
+                // substrate — `SecondaryAffine` (the import gate) OR
+                // `SecondaryEagerPrep` (the idle filler), the kind-blind
+                // `has_secondary_cell()` family — is PER-SECONDARY recoverable,
+                // NEVER a global task terminal. Both have `is_reassignable() ==
+                // false`, so without this arm either falls into the
+                // non-reassignable `else` below and emits a GLOBAL
+                // `ClusterMutation::TaskFailed` — a spurious doom that lies dormant
+                // until a failover hydrate loads the CRDT `Failed` into
+                // `failed_tasks` and (for affine) the affine gate dooms the
+                // import's whole dependent subtree (`Unsatisfiable`).
                 //
-                // The death of an affine import here is the SAME per-secondary
+                // The death of a cell-bearing task here is the SAME per-secondary
                 // event the dead-secondary affine reroute already owns: the
                 // caller (`handle_dead_secondary`) runs
                 // `reroute_affine_blocked_on(secondary, None, ..)` right AFTER
@@ -3891,14 +3895,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // cell reset is owed here — mirroring the reroute path, NOT
                 // inventing a new mechanism. The dead secondary's worker slots
                 // are dropped wholesale by the caller's `evict_secondary_local_caches`.
-                if entry.task.kind.is_secondary_affine() {
+                //
+                // For AFFINE the dependents re-route via `reroute_affine_blocked_on`
+                // above. For EAGER-PREP there are NO dependents at all (it is a
+                // phase-agnostic, queue-less, CELL-DRIVEN idle filler — see
+                // `eager_prep_dispatch` and the `apply_tasks` divert: it never
+                // surfaces for pool growth and nothing declares a dep on its
+                // cell), so `reroute_affine_blocked_on` finds no
+                // `blocked_per_secondary` entry for an eager-prep cell to drain —
+                // the suppress-only behavior is exactly correct: there is nothing
+                // to re-route, only the spurious global terminal to suppress.
+                if entry.task.kind.has_secondary_cell() {
                     tracing::info!(
                         dead_secondary = %secondary_id,
                         task_hash = %hash,
                         task_id = %entry.task.task_id,
-                        "dead-secondary recovery: affine import is per-secondary — \
-                         dropping its in-flight entry without a global terminal; \
-                         dependents re-route via the affine dead-secondary drain"
+                        "dead-secondary recovery: cell-bearing per-secondary task \
+                         (affine import / eager-prep) is per-secondary — dropping \
+                         its in-flight entry without a global terminal; affine \
+                         dependents re-route via the affine dead-secondary drain, \
+                         eager-prep has none"
                     );
                     // No requeue, no `TaskFailed`, no cell reset — fall through.
                 } else if entry.task.kind.is_reassignable() && already_terminal {

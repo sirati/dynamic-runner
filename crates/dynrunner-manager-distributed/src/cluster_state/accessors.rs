@@ -125,18 +125,20 @@ impl<I: Identifier> ClusterState<I> {
             .map(|state| self.task_to_info(state))
     }
 
-    /// Whether content `hash` names a [`TaskKind::SecondaryAffine`] import —
-    /// the def-kind authority resolved through the store (`hash → id → def →
-    /// kind`). The single affine-discrimination seam the per-secondary terminal
-    /// sites read so a `SecondaryAffine` import is NEVER recorded in the global
+    /// Whether content `hash` names a CELL-BEARING per-secondary kind — a
+    /// [`TaskKind::SecondaryAffine`] import OR a [`TaskKind::SecondaryEagerPrep`]
+    /// idle filler, the kind-blind [`TaskKind::has_secondary_cell`] family — the
+    /// def-kind authority resolved through the store (`hash → id → def → kind`).
+    /// The single per-secondary-cell discrimination seam the global-terminal
+    /// sites read so a cell-bearing task is NEVER recorded in the global
     /// `failed_tasks` gate (its terminal is per-secondary — the bitvector cell —
     /// not a global doom). `false` for a hash this replica has not interned (a
-    /// non-affine work/setup hash, or one never seen), which is the safe default
-    /// at every consuming guard (a non-affine terminal stays globally tracked).
-    pub(crate) fn is_secondary_affine_hash(&self, hash: &str) -> bool {
+    /// non-cell work/setup hash, or one never seen), which is the safe default
+    /// at every consuming guard (a non-cell terminal stays globally tracked).
+    pub(crate) fn has_secondary_cell_hash(&self, hash: &str) -> bool {
         self.definitions
             .kind_for_hash(hash)
-            .is_some_and(|kind| kind.is_secondary_affine())
+            .is_some_and(|kind| kind.has_secondary_cell())
     }
 
     /// Read-only handle on the `blocked_by` reverse-index (#547) for the
