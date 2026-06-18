@@ -1103,6 +1103,177 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
         .await;
 }
 
+/// #665 (the WIRE twin of the backpressure-bounce wedge above): an ON-DEMAND
+/// affine IMPORT that COMMITS against this primary's model slot
+/// (`dispatch_affine_import_on_demand` → `commit_assignment`) but is then bounced
+/// over the wire as `IllegallyAssignedToNonidleWorker` — the secondary's PHYSICAL
+/// pool had shrunk/respawned (stale roster: out-of-range id / 0-worker pool /
+/// mid-respawn) so the slot was not idle — must be recovered BY the affine
+/// subsystem, identically to the backpressure-`TaskFailed` import bounce: its
+/// per-secondary cell reset `Queued → NotDone`, its slot freed slot-direct, and
+/// the blocked dependent re-derived. NEVER routed into the WORK pool.
+///
+/// Pre-fix: `handle_illegally_assigned` took the generic work-path requeue
+/// (`free_slot_on_terminal` + `requeue_affine_aware`, which `pool.requeue`'d the
+/// import — a `SecondaryAffine` task, `is_worker_assignable() == false`, the work
+/// pool can NEVER re-surface it) and left the cell `Queued`. The dependent work
+/// at the front of the secondary's affine queue then re-popped forever onto
+/// `InFlightHere` (cell == `Queued`) — the strand, the import's terminal having
+/// already left as the swallowed bounce.
+///
+/// Post-fix: the cell goes back to `NotDone`; the next pop reads `StrandedHere`
+/// and re-dispatches the import on-demand on a fresh slot; the import is NEVER in
+/// the work pool. Byte-for-byte the recoverable twin of the backpressure bounce
+/// (`affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool`).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_illegal_bounce_resets_cell_and_redispatches_not_pool() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // Round 1 — the dependent commits + pops `StrandedHere`, dispatching
+            // the import on-demand on exactly one secondary (cell `Queued`, slot
+            // Assigned). Capture where it landed.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_dispatch: Option<(String, u32)> = None;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, sec, worker, h) in assignments(rx) {
+                    assert_ne!(
+                        h, build_hash,
+                        "the build must NOT dispatch before its import is Done"
+                    );
+                    if h == import_hash {
+                        assert!(
+                            import_dispatch.is_none(),
+                            "the import dispatches on exactly ONE secondary (one dependent)"
+                        );
+                        import_dispatch = Some((sec.clone(), worker));
+                    }
+                }
+            }
+            let (sec, worker) =
+                import_dispatch.expect("the on-demand import dispatched (StrandedHere)");
+
+            // The import is in flight on this secondary: cell `Queued`, slot held.
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                SecondaryCell::Queued,
+                "on-demand dispatch claims the cell Queued"
+            );
+            assert!(
+                primary.secondary_has_slot_holding_hash(&sec, &import_hash),
+                "the import slot is Assigned on {sec}"
+            );
+            let import_pool_count_before = primary
+                .pool()
+                .iter()
+                .filter(|t| compute_task_hash(t) == import_hash)
+                .count();
+            assert_eq!(
+                import_pool_count_before, 1,
+                "the affine import is its one ledger token in the pool"
+            );
+
+            // ── THE BOUNCE: an `IllegallyAssignedToNonidleWorker` divergence
+            // report for the on-demand import — the secondary's physical slot was
+            // not idle (stale roster). No incumbent (the degenerate stale-roster
+            // shape: out-of-range id / 0-worker pool / mid-respawn) — the affine
+            // recovery half is independent of the slot-reconcile half. ──
+            primary
+                .handle_illegally_assigned(DistributedMessage::IllegallyAssignedToNonidleWorker {
+                    target: None,
+                    sender_id: sec.clone(),
+                    timestamp: 0.0,
+                    secondary_id: sec.clone(),
+                    worker_id: worker,
+                    assigned: dynrunner_protocol_primary_secondary::AssignedTaskRef {
+                        hash: import_hash.clone(),
+                        task_id: TestId("import".into()),
+                    },
+                    incumbent: None,
+                })
+                .await;
+            settle_pump().await;
+
+            // GREEN: the cell is reset `Queued → NotDone` (NOT Failed, NOT left
+            // Queued), the slot freed slot-direct, and the import is NOT pushed
+            // into the work pool (the pre-fix mis-route's `pool.requeue` copy).
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                SecondaryCell::NotDone,
+                "an illegal-assignment bounce of an on-demand import resets its \
+                 cell Queued → NotDone (RED pre-fix: stayed Queued → the strand)"
+            );
+            assert!(
+                !primary.secondary_has_slot_holding_hash(&sec, &import_hash),
+                "the import slot is freed by the bounce"
+            );
+            assert_eq!(
+                primary
+                    .pool()
+                    .iter()
+                    .filter(|t| compute_task_hash(t) == import_hash)
+                    .count(),
+                import_pool_count_before,
+                "the affine import must NEVER be requeued into the work pool \
+                 (the pre-fix work-path `pool.requeue`'d a SecondaryAffine binary \
+                 that is_worker_assignable == false could never re-surface)"
+            );
+
+            // The dependent build is still pending, not terminal-failed (a bounce
+            // is recoverable, not a genuine import failure).
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "an illegal-assignment bounce must NOT terminal-fail the dependent"
+            );
+
+            // Round 2 — the freed worker re-evaluates; the dependent re-pops
+            // `StrandedHere` (cell == `NotDone`) and re-dispatches the import.
+            // RED pre-fix: the cell stayed `Queued`, so the re-pop hit
+            // `InFlightHere` forever and no fresh import dispatched.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_redispatched = false;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, _sec, _worker, h) in assignments(rx) {
+                    assert_ne!(
+                        h, build_hash,
+                        "the build still must NOT dispatch before its import is Done"
+                    );
+                    if h == import_hash {
+                        import_redispatched = true;
+                    }
+                }
+            }
+            assert!(
+                import_redispatched,
+                "the import must be RE-DISPATCHED on-demand after the bounce reset \
+                 its cell to NotDone (StrandedHere) — not wedged InFlightHere forever"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                SecondaryCell::Queued,
+                "the re-dispatch re-claims the cell Queued"
+            );
+        })
+        .await;
+}
+
 /// #660 (the #659 affine-strand twin): an ON-DEMAND import dispatch whose inner
 /// dispatch does NOT COMMIT (`dispatch_affine_unit` returns `false` — a
 /// `CommitRefused`, the target worker slot is not idle, or a `SendFailed`) must

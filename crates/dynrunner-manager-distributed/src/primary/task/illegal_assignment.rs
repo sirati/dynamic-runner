@@ -43,13 +43,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// Two coupled steps, both idempotent:
     ///
-    /// 1. REQUEUE the assigned (bounced) task. If it is still in the
-    ///    in-flight ledger this primary committed it (optimistically, onto
-    ///    a slot the secondary refused), so free that hold and return the
-    ///    binary to `Pending` (`InFlight → Pending`, broadcast in lockstep
-    ///    — the SAME `TaskRequeued` origination the dead-secondary /
-    ///    backpressure paths emit). A hash already absent from the ledger
-    ///    (a raced terminal / a prior requeue) is a safe no-op.
+    /// 1. RECOVER the assigned (bounced) task, kind-dispatched (the SAME
+    ///    split `handle_task_failed` makes at its head):
+    ///    * An affine IMPORT (`affine_id_for_hash` is `Some`) recovers like
+    ///      `handle_affine_task_failed`'s backpressure arm — reset its
+    ///      per-secondary cell `Queued → NotDone` and re-derive the blocked
+    ///      dependents now (#665). The import is per-secondary and NOT
+    ///      worker-assignable, so it must never take the work-pool requeue
+    ///      (which can never re-surface it and would leave its cell `Queued`
+    ///      — the `InFlightHere` strand); its slot is freed slot-direct via
+    ///      `free_affine_slot_on_terminal`.
+    ///    * Any other task: if it is still in the in-flight ledger this
+    ///      primary committed it (optimistically, onto a slot the secondary
+    ///      refused), so free that hold and return the binary to `Pending`
+    ///      (`InFlight → Pending`, broadcast in lockstep — the SAME
+    ///      `TaskRequeued` origination the dead-secondary / backpressure
+    ///      paths emit). A hash already absent from the ledger (a raced
+    ///      terminal / a prior requeue) is a safe no-op.
     ///
     /// 2. RECONCILE the slot to the incumbent the secondary named, so the
     ///    primary's model agrees with physical reality and STOPS
@@ -118,15 +128,68 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             );
         }
 
-        // (1) REQUEUE the bounced task. `free_slot_on_terminal` resolves the
-        // holder slot from the LEDGER entry (by hash) — independent of the
-        // wire `worker_id` — frees that slot, drops the ledger entry, and
-        // releases the type slot, returning the binary. A hash not in the
-        // ledger yields `None` (already requeued / terminal): safe no-op.
-        if let Some(entry) = self.free_slot_on_terminal(&secondary_id, worker_id, &assigned.hash) {
+        // (1) RECOVER the bounced task — kind-dispatched on whether it is an
+        // affine IMPORT (a `SecondaryAffine` def, identified by `affine_id_for_hash`
+        // resolving its content hash to a bitvector cell) or any other task. The
+        // SAME split `handle_task_failed` makes at its head (failed.rs: route a
+        // backpressure-shaped affine bounce to `handle_affine_task_failed`): an
+        // import is per-secondary, NOT worker-assignable, and tracked by the
+        // per-secondary cell, so it must NEVER take the work-pool requeue (which
+        // can never re-surface it AND leaves its cell `Queued` — the original
+        // `InFlightHere` wedge); it recovers through the affine seams instead.
+        if let Some(affine_id) = self.cluster_state.affine_id_for_hash(&assigned.hash) {
+            // AFFINE-IMPORT BOUNCE (#665): an on-demand import committed against
+            // this primary's model slot (`dispatch_affine_import_on_demand` →
+            // `commit_assignment`) but the secondary's PHYSICAL pool had
+            // shrunk/respawned (stale roster: out-of-range id / 0-worker pool /
+            // mid-respawn), so it bounced `IllegallyAssignedToNonidleWorker`
+            // instead of landing. This is the WIRE twin of a backpressure
+            // `TaskFailed` import bounce — the import never ran here — so it
+            // recovers byte-for-byte like `handle_affine_task_failed`'s
+            // backpressure arm: reset the cell `Queued → NotDone` and re-derive
+            // the blocked dependents NOW (otherwise the cell stays
+            // `Queued`-with-no-holder forever and the dependent work sits
+            // `InFlightHere` in `blocked_per_secondary` forever — the strand).
+            //
+            // The bounce carries NO capacity-exhaustion signal (it is a
+            // roster/occupancy divergence, not "every worker busy"), so the
+            // recheck is the PROMPT `TasksAdded` — the same shape the non-capacity
+            // backpressure arm and the on-demand `Refused` recovery use, with no
+            // backpressure-flag brake.
+            //
+            // `affine_unqueue_mutation` is `Some` here (gated on `affine_id_for_hash`
+            // just above); the `if let` is defensive, mirroring failed.rs:572.
+            if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &assigned.hash) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
+            self.reenqueue_affine_unblocked_on_cell(
+                &secondary_id,
+                affine_id,
+                WorkerMgmtSignal::TasksAdded,
+            )
+            .await;
+            // Free the holding slot for THIS per-secondary run, addressed by the
+            // terminal's OWN `(secondary, worker_id)` — slot-direct, NOT the shared
+            // hash-keyed `free_slot_on_terminal`. The import runs the same hash on
+            // multiple secondaries concurrently; the hash-keyed ledger holds only
+            // one holder, so the shared path would free the WRONG secondary's slot
+            // and orphan this worker's slot `Assigned` forever (the exact reason
+            // failed.rs:705 uses `free_affine_slot_on_terminal`). No `pool.requeue`
+            // and no `TaskRequeued`: the import is never a pool item — it re-derives
+            // on-demand off the reset cell.
+            self.free_affine_slot_on_terminal(&secondary_id, worker_id, &assigned.hash);
+        } else if let Some(entry) =
+            self.free_slot_on_terminal(&secondary_id, worker_id, &assigned.hash)
+        {
+            // NON-IMPORT BOUNCE. `free_slot_on_terminal` resolves the holder slot
+            // from the LEDGER entry (by hash) — independent of the wire
+            // `worker_id` — frees that slot, drops the ledger entry, and releases
+            // the type slot, returning the binary. A hash not in the ledger yields
+            // `None` (already requeued / terminal): safe no-op.
+            //
             // Affine-aware (the SAME recovery seam the dead-secondary and
             // backpressure-failed requeue-of-recovered-work sites use): an
-            // affine-dependent work task must clear the affine scheduler's
+            // affine-dependent WORK task must clear the affine scheduler's
             // `placed_work` dedup on requeue, or it is hidden from the global
             // worker view AND blocked from re-placement — permanently
             // unassignable (and NOT recovered by the reconcile, since a bounced
