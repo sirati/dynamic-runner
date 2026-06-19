@@ -272,12 +272,15 @@ class PublishAllBatchTests(_PublishFixture):
         # Exactly one batch call, zero per-file publish_one calls.
         batch.assert_called_once()
         one.assert_not_called()
-        items, src_root = batch.call_args.args
+        items, src_root, staging = batch.call_args.args
         # Pairs passed through verbatim, in order — no mirroring.
         self.assertEqual(items, [(a, d1), (b, d2)])
         # The process-wide src_root is forwarded once for the native
         # cross-FS staging + under-root validation.
         self.assertEqual(src_root, self.src_root)
+        # The hidden staging dir (`<dst_root>/.publish-tmp`) is forwarded
+        # so cross-FS temps land out of the published content tree.
+        self.assertEqual(staging, self.dst_root / publish_mod.STAGING_SUBDIR)
 
     def test_publish_all_empty_is_noop(self):
         with patch.object(publish_mod, "_native_publish_all") as batch:
@@ -300,6 +303,15 @@ class SweepStaleTmpsTests(_PublishFixture):
 
     def test_dst_root_reads_env(self):
         self.assertEqual(publish_mod.dst_root(), self.dst_root)
+
+    def test_staging_dir_is_hidden_subdir_of_dst_root(self):
+        # The staging dir — where cross-FS publishes stage temps and the
+        # run-start sweep reaps orphans — is `<dst_root>/.publish-tmp`,
+        # out of the published content tree but on the same FS.
+        self.assertEqual(
+            publish_mod.staging_dir(),
+            self.dst_root / publish_mod.STAGING_SUBDIR,
+        )
 
 
 if __name__ == "__main__":

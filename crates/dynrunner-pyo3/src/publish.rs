@@ -33,16 +33,27 @@ fn map_err(e: dynrunner_publish::PublishError) -> PyErr {
 }
 
 #[pyfunction]
-pub(crate) fn publish_one(src: PathBuf, dst: PathBuf, src_root: PathBuf) -> PyResult<()> {
-    dynrunner_publish::publish_one(&src, &dst, &src_root).map_err(map_err)
+pub(crate) fn publish_one(
+    src: PathBuf,
+    dst: PathBuf,
+    src_root: PathBuf,
+    staging_dir: PathBuf,
+) -> PyResult<()> {
+    dynrunner_publish::publish_one(&src, &dst, &src_root, &staging_dir).map_err(map_err)
 }
 
 /// Atomically publish a batch of `(src, dst)` pairs as one staged
-/// transaction. Every `src` must be under `src_root`. See
-/// `dynrunner_publish::publish_all` for the two-phase contract.
+/// transaction. Every `src` must be under `src_root`; cross-FS items
+/// stage into `staging_dir` (a hidden same-FS dir out of the content
+/// tree). See `dynrunner_publish::publish_all` for the two-phase
+/// contract.
 #[pyfunction]
-pub(crate) fn publish_all(items: Vec<(PathBuf, PathBuf)>, src_root: PathBuf) -> PyResult<()> {
-    dynrunner_publish::publish_all(&items, &src_root).map_err(map_err)
+pub(crate) fn publish_all(
+    items: Vec<(PathBuf, PathBuf)>,
+    src_root: PathBuf,
+    staging_dir: PathBuf,
+) -> PyResult<()> {
+    dynrunner_publish::publish_all(&items, &src_root, &staging_dir).map_err(map_err)
 }
 
 /// Reap stale `.publish-tmp` siblings left in `dir` by a hard kill,
@@ -91,6 +102,7 @@ mod tests {
             fs::create_dir_all(&src_root).unwrap();
             fs::create_dir_all(&dst_root).unwrap();
 
+            let staging = dst_root.join(".publish-tmp");
             let mut items: Vec<(PathBuf, PathBuf)> = Vec::new();
             for i in 0..3 {
                 let src = src_root.join(format!("p{i}.bin"));
@@ -98,7 +110,8 @@ mod tests {
                 items.push((src, dst_root.join(format!("out/p{i}.bin"))));
             }
 
-            publish_all(items.clone(), src_root.clone()).expect("publish_all succeeds");
+            publish_all(items.clone(), src_root.clone(), staging)
+                .expect("publish_all succeeds");
 
             for (i, (src, dst)) in items.iter().enumerate() {
                 assert!(dst.exists(), "dst {i} missing after publish_all");
@@ -122,8 +135,9 @@ mod tests {
             let bad_src = outside.join("escape.bin");
             write_file(&bad_src, b"nope");
             let bad_dst = root.path().join("network/escape.bin");
+            let staging = root.path().join("network/.publish-tmp");
 
-            let err = publish_all(vec![(bad_src, bad_dst)], src_root)
+            let err = publish_all(vec![(bad_src, bad_dst)], src_root, staging)
                 .expect_err("src outside root must error");
             assert!(
                 err.is_instance_of::<PublishError>(py),

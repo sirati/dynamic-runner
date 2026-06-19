@@ -10,10 +10,13 @@
 //!
 //! * Same filesystem → `rename(2)` is atomic by definition; one
 //!   syscall, done.
-//! * Different filesystems → copy `src` to a sibling of `dst` in
-//!   `dst`'s parent, `fsync` the data, then `rename(2)` the sibling
-//!   over `dst` (intra-FS, atomic). Finally `fsync` `dst.parent()`
-//!   so the rename itself is durable, and unlink `src`.
+//! * Different filesystems → copy `src` to a temp in `staging_dir` (a
+//!   hidden dir on the SAME filesystem as `dst`, OUTSIDE the published
+//!   content tree), `fsync` the data, then `rename(2)` the temp over
+//!   `dst` (intra-FS, atomic). Finally `fsync` `dst.parent()` so the
+//!   rename itself is durable, and unlink `src`. Staging out of the
+//!   content tree means a crash-orphaned temp never pollutes the
+//!   published tree and a content walker never enumerates it.
 //!
 //! `src_root` is the caller's allow-list root: the publish refuses
 //! to move a file that is not under `src_root`. Frameworks set this
@@ -26,12 +29,15 @@
 //! A multi-file publish runs in two phases so an interruption during
 //! the slow part never exposes a partial *final* tree:
 //!
-//! * **Phase 1 (stage):** `copy_with_fsync` every cross-FS src to its
-//!   `.publish-tmp` sibling. Same-FS items (by `st_dev`) need no
-//!   staging and are collected for the rename phase as-is. A phase-1
-//!   failure unwinds only the temps staged *this batch* and returns the
-//!   error — no final path is touched, so the destination tree is
-//!   unchanged.
+//! * **Phase 1 (stage):** `copy_with_fsync` every cross-FS src to a
+//!   `.publish-tmp` temp in `staging_dir`. Same-FS items (by `st_dev`)
+//!   need no staging and are collected for the rename phase as-is. Each
+//!   staged temp is owned by a [`StagedTemp`] RAII guard that reaps the
+//!   file on drop unless the commit rename consumed it — so any failure
+//!   or early-return between stage and successful rename (a phase-1
+//!   copy error, a mid-batch phase-2 rename error, an EXDEV-fallback
+//!   failure, a panic) leaves no temp behind. No final path is touched
+//!   on a phase-1 failure, so the destination tree is unchanged.
 //! * **Phase 2 (commit):** `rename(2)` every item back-to-back (each
 //!   an intra-FS metadata commit, sub-ms on one NFS dir), fsync the
 //!   touched parents, then unlink the staged srcs. This phase runs
@@ -41,10 +47,11 @@
 //! * **EXDEV fallback:** `st_dev` equality is only a hint — two bind
 //!   mounts of one filesystem share it yet `rename` across them returns
 //!   `EXDEV`. A "same-FS" rename that hits `EXDEV` is therefore not a
-//!   failure: the item is deferred, copied to a `.publish-tmp` sibling
-//!   *outside* the signal mask (the copy is slow; the mask must only
-//!   cover sub-ms renames), then committed by an intra-dst rename. This
-//!   restores the cross-FS fallback the original `publish_one` had.
+//!   failure: the item is deferred, copied to a `.publish-tmp` temp in
+//!   `staging_dir` *outside* the signal mask (the copy is slow; the
+//!   mask must only cover sub-ms renames), then committed by an
+//!   intra-dst rename. This restores the cross-FS fallback the original
+//!   `publish_one` had.
 //!
 //! [`publish_one`] is the single-item case, re-expressed as a
 //! one-element [`publish_all`] so there is exactly one transaction
@@ -53,12 +60,15 @@
 //! ## Stale-temp sweep ([`sweep_stale_tmps`])
 //!
 //! Hard kills (SIGKILL/SIGSTOP, power loss) can leave `.publish-tmp`
-//! siblings behind. [`sweep_stale_tmps`] reaps them, but the
-//! destination is **shared across hosts** (multiple secondaries write
-//! the same NFS tree) and pid is not host-unique — a blind glob-delete
-//! would race a live sibling's in-flight temp. The sweep is therefore
-//! scoped to the current host (via a host token embedded in the temp
-//! name) and skips temps whose pid is still alive locally. See
+//! temps behind in `staging_dir`. [`sweep_stale_tmps`] reaps them from
+//! that single directory (the caller points it at the same
+//! `<dst_root>/.publish-tmp` the publish stages into — one flat, known
+//! place, so the sweep never has to walk the published content tree).
+//! But `staging_dir` is **shared across hosts** (multiple secondaries
+//! write the same NFS tree) and pid is not host-unique — a blind
+//! glob-delete would race a live sibling's in-flight temp. The sweep is
+//! therefore scoped to the current host (via a host token embedded in
+//! the temp name) and skips temps whose pid is still alive locally. See
 //! [`sweep_stale_tmps`] for the full safety argument.
 //!
 //! The crate is deliberately small. Higher-level concerns (queueing,
@@ -145,15 +155,21 @@ pub enum PublishError {
 /// Move `src` to `dst` atomically. `src` must be under `src_root`.
 ///
 /// On the same filesystem this collapses to a single `rename(2)`.
-/// Across filesystems it copies to a sibling of `dst` (so the final
-/// commit step is itself an intra-FS rename), `fsync`s the data,
-/// renames over `dst`, `fsync`s `dst.parent()` for rename durability,
-/// and unlinks `src` last.
+/// Across filesystems it copies to a temp in `staging_dir` (a hidden
+/// dir on the SAME filesystem as `dst`, OUTSIDE the published content
+/// tree, so the final commit step is itself an intra-FS rename),
+/// `fsync`s the data, renames over `dst`, `fsync`s `dst.parent()` for
+/// rename durability, and unlinks `src` last.
 ///
 /// Always-overwrite: if `dst` exists, it is replaced. Callers gate
 /// "should I publish at all?" upstream (handler-level skip-existing
 /// logic); reaching this function means publish is intended.
-pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), PublishError> {
+pub fn publish_one(
+    src: &Path,
+    dst: &Path,
+    src_root: &Path,
+    staging_dir: &Path,
+) -> Result<(), PublishError> {
     // One transaction implementation: the single-item case is a
     // one-element batch. Same final state as a standalone rename/copy
     // (a one-item batch has nothing to interleave), so no behaviour
@@ -161,6 +177,7 @@ pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), Publis
     publish_all(
         std::slice::from_ref(&(src.to_path_buf(), dst.to_path_buf())),
         src_root,
+        staging_dir,
     )
 }
 
@@ -169,12 +186,20 @@ pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), Publis
 ///
 /// The batch runs in two phases (see the module docs):
 ///
-/// 1. **Stage** every cross-FS src to its `.publish-tmp` sibling. A
-///    failure here unwinds only the temps staged *this batch* and
-///    returns the error; no final path is touched.
+/// 1. **Stage** every cross-FS src to a temp in `staging_dir`. A
+///    failure here unwinds the temps staged *this batch* (via each
+///    [`StagedTemp`]'s drop) and returns the error; no final path is
+///    touched.
 /// 2. **Commit** every item with `rename(2)` back-to-back under a
 ///    [`SignalMaskGuard`], then fsync the touched parents and unlink
 ///    the staged srcs.
+///
+/// `staging_dir` is a hidden directory on the SAME filesystem as the
+/// destinations, OUTSIDE the published content tree (the caller wires
+/// it to `<dst_root>/.publish-tmp`). Same-FS keeps the phase-2 rename
+/// atomic; out-of-content-tree means a crash-orphaned temp never
+/// pollutes the published tree and a content walker never enumerates
+/// it. [`sweep_stale_tmps`] reaps orphans from this same directory.
 ///
 /// Always-overwrite: an existing `dst` is replaced. Callers gate
 /// "should I publish at all?" upstream; reaching this function means
@@ -184,11 +209,17 @@ pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), Publis
 /// before any rename — so a bad item (outside `src_root`, missing
 /// src, file-vs-dir collision) fails the whole batch with no finals
 /// touched.
-pub fn publish_all(items: &[(PathBuf, PathBuf)], src_root: &Path) -> Result<(), PublishError> {
+pub fn publish_all(
+    items: &[(PathBuf, PathBuf)],
+    src_root: &Path,
+    staging_dir: &Path,
+) -> Result<(), PublishError> {
     // Production path: the real `rename(2)` is the cross-device oracle.
     // Wrapped in a closure (not passed as `fs::rename` directly) so the
     // higher-ranked `Fn(&Path, &Path)` bound unifies both arg lifetimes.
-    publish_all_with(items, src_root, |from, to| fs::rename(from, to))
+    publish_all_with(items, src_root, staging_dir, |from, to| {
+        fs::rename(from, to)
+    })
 }
 
 /// [`publish_all`] with the final-commit `rename` injected. The
@@ -202,10 +233,19 @@ pub fn publish_all(items: &[(PathBuf, PathBuf)], src_root: &Path) -> Result<(), 
 fn publish_all_with(
     items: &[(PathBuf, PathBuf)],
     src_root: &Path,
+    staging_dir: &Path,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), PublishError> {
     let canon_root = fs::canonicalize(src_root).map_err(|e| PublishError::SourceMissing {
         path: src_root.to_path_buf(),
+        source: e,
+    })?;
+    // Ensure the staging dir exists before any cross-FS copy targets it.
+    // Created on the destination FS (same FS as every dst) so the
+    // staged temp→final rename stays an intra-FS atomic commit. A
+    // no-op when it already exists (the common steady-state).
+    fs::create_dir_all(staging_dir).map_err(|e| PublishError::DestinationParentCreate {
+        path: staging_dir.to_path_buf(),
         source: e,
     })?;
 
@@ -231,20 +271,22 @@ fn publish_all_with(
                 rename_from: canon_src,
                 dst: dst.clone(),
                 unlink: None,
+                guard: None,
             }),
             Classification::CrossFs => {
-                let tmp = sibling_tmp_path(dst);
-                if let Err(e) = copy_with_fsync(&canon_src, &tmp) {
-                    // Unwind the temps staged so far this batch, then
-                    // bubble. No final path has been touched yet.
-                    unwind_staged(&commits);
-                    let _ = fs::remove_file(&tmp);
-                    return Err(e);
-                }
+                let tmp = staging_tmp_path(staging_dir, dst);
+                // Arm the cleanup guard BEFORE the copy: the
+                // `create_new` open already created the temp, so any
+                // failure (copy, fsync, or a later phase) must reap it.
+                // `commits` is dropped on the `?`-early-return below,
+                // running every guard's `Drop` — no manual unwind.
+                let guard = StagedTemp::new(tmp.clone());
+                copy_with_fsync(&canon_src, &tmp)?;
                 commits.push(Commit {
                     rename_from: tmp,
                     dst: dst.clone(),
                     unlink: Some(canon_src),
+                    guard: Some(guard),
                 });
             }
         }
@@ -269,9 +311,16 @@ fn publish_all_with(
     let mut exdev_fallback: Vec<Commit> = Vec::new();
     {
         let _mask = SignalMaskGuard::block()?;
-        for c in commits.drain(..) {
+        for mut c in commits.drain(..) {
             match rename(&c.rename_from, &c.dst) {
-                Ok(()) => committed.push(c),
+                Ok(()) => {
+                    // The rename consumed the staged temp: disarm so
+                    // its guard does not remove the now-committed final.
+                    if let Some(g) = c.guard.as_mut() {
+                        g.disarm();
+                    }
+                    committed.push(c);
+                }
                 Err(e) if c.unlink.is_none() && is_cross_device(&e) => {
                     // SameFs hint was wrong (bind mount): no temp staged
                     // for this item yet, so the final dst is untouched.
@@ -279,12 +328,10 @@ fn publish_all_with(
                     exdev_fallback.push(c);
                 }
                 Err(e) => {
-                    // Real rename failure. Best-effort cleanup of a
-                    // staged temp (cross-FS items only; SameFs items
-                    // have none). Mirrors publish_one's prior behaviour.
-                    if c.unlink.is_some() {
-                        let _ = fs::remove_file(&c.rename_from);
-                    }
+                    // Real rename failure. The failed item's `c` and
+                    // every still-staged item left in `commits` drop
+                    // here, each running its `StagedTemp` guard to reap
+                    // its temp — no manual unwind, no mid-batch leak.
                     return Err(PublishError::Rename {
                         from: c.rename_from.clone(),
                         to: c.dst.clone(),
@@ -307,30 +354,36 @@ fn publish_all_with(
             // c.rename_from is the canonical src (SameFs items never
             // had a temp); c.unlink is None.
             let canon_src = c.rename_from;
-            let tmp = sibling_tmp_path(&c.dst);
-            if let Err(e) = copy_with_fsync(&canon_src, &tmp) {
-                // The copy failed. Unwind only the temps staged in THIS
-                // fallback pass; the finals already committed above are
-                // genuine successes and are left in place (an EXDEV item
-                // whose copy fails is uncommittable — same exposure as
-                // the original per-item cross-FS path).
-                unwind_staged(&staged);
-                let _ = fs::remove_file(&tmp);
-                return Err(e);
-            }
+            let tmp = staging_tmp_path(staging_dir, &c.dst);
+            // Arm the guard before the copy: on a copy failure the
+            // early-return drops `staged` (every prior guard) and this
+            // `guard`, reaping all temps this fallback pass created. The
+            // finals already committed above are genuine successes and
+            // are left in place (an EXDEV item whose copy fails is
+            // uncommittable — same exposure as the original per-item
+            // cross-FS path).
+            let guard = StagedTemp::new(tmp.clone());
+            copy_with_fsync(&canon_src, &tmp)?;
             staged.push(Commit {
                 rename_from: tmp,
                 dst: c.dst,
                 unlink: Some(canon_src),
+                guard: Some(guard),
             });
         }
         {
             let _mask = SignalMaskGuard::block()?;
-            for c in staged.drain(..) {
+            for mut c in staged.drain(..) {
                 match rename(&c.rename_from, &c.dst) {
-                    Ok(()) => committed.push(c),
+                    Ok(()) => {
+                        if let Some(g) = c.guard.as_mut() {
+                            g.disarm();
+                        }
+                        committed.push(c);
+                    }
                     Err(e) => {
-                        let _ = fs::remove_file(&c.rename_from);
+                        // `c` and the still-staged remainder of `staged`
+                        // drop here, each guard reaping its temp.
                         return Err(PublishError::Rename {
                             from: c.rename_from.clone(),
                             to: c.dst.clone(),
@@ -363,10 +416,55 @@ fn publish_all_with(
 /// One phase-2 commit: rename `rename_from` over `dst`, and (cross-FS
 /// only) unlink the original src afterwards. For same-FS items
 /// `rename_from` is the canonical src itself and `unlink` is `None`.
+///
+/// For cross-FS items `rename_from` is a staged temp owned by `guard`:
+/// the [`StagedTemp`] removes that file on drop unless it is disarmed
+/// (the rename consumed it). This is the belt-and-suspenders that makes
+/// every error/early-return path between stage and successful rename
+/// leak-free — a `?`-propagated error, a mid-batch rename failure, or a
+/// panic all run the guard's `Drop` and reap the orphan. Same-FS items
+/// carry no guard (`None`): their `rename_from` is the caller's src,
+/// not a temp we own.
 struct Commit {
     rename_from: PathBuf,
     dst: PathBuf,
     unlink: Option<PathBuf>,
+    guard: Option<StagedTemp>,
+}
+
+/// RAII owner of a staged `.publish-tmp` file. On drop it best-effort
+/// removes the file unless [`disarm`](StagedTemp::disarm)ed, so a
+/// staged temp is reaped on EVERY failure path (error propagation,
+/// mid-batch rename error, EXDEV-fallback failure, panic) without each
+/// path open-coding a `remove_file`. The successful phase-2 rename
+/// consumes the temp, so it disarms the guard.
+///
+/// Best-effort by design: a removal error during drop is ignored — the
+/// originating error is the one that matters, and any residue is reaped
+/// by [`sweep_stale_tmps`] on the next run.
+struct StagedTemp {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedTemp {
+    fn new(path: PathBuf) -> Self {
+        StagedTemp { path, armed: true }
+    }
+
+    /// The rename consumed the temp (it no longer exists under this
+    /// name): stop the drop from attempting a redundant remove.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedTemp {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 enum Classification {
@@ -454,18 +552,6 @@ fn ensure_dst_parent(dst: &Path) -> Result<(), PublishError> {
     Ok(())
 }
 
-/// Remove the temps staged so far (cross-FS commits only) when a
-/// later phase-1 copy fails. Best-effort: a removal error during
-/// unwind is ignored — the original copy error is the one that
-/// matters, and a leftover temp is reaped by [`sweep_stale_tmps`].
-fn unwind_staged(commits: &[Commit]) {
-    for c in commits {
-        if c.unlink.is_some() {
-            let _ = fs::remove_file(&c.rename_from);
-        }
-    }
-}
-
 /// Walk `path` from the root down looking for the first ancestor that
 /// exists as a regular file (not a directory). Returned path is the
 /// culprit `create_dir_all` tripped on. None when every existing
@@ -522,8 +608,22 @@ fn sanitize_token(raw: &str) -> String {
     out
 }
 
-fn sibling_tmp_path(dst: &Path) -> PathBuf {
-    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+/// Build the staging-temp path for `dst` inside `staging_dir`.
+///
+/// The temp lands in `staging_dir` (a hidden directory on the SAME
+/// filesystem as `dst`, OUTSIDE the published content tree), NOT as a
+/// sibling of `dst`. Same-FS keeps the phase-2 `rename(2)` atomic;
+/// out-of-content-tree means a crash-orphaned temp never pollutes the
+/// published tree and a content walker never enumerates it.
+///
+/// The base name still encodes `dst`'s file name plus the
+/// `{host}.{pid}.{nanos}` token so [`parse_tmp_token`] can scope the
+/// sweep and two concurrent publishes of the same `dst` never collide.
+/// The encoded name flattens `dst`'s own path separators (the temp is
+/// flat in `staging_dir`, no nested dirs to create), so the leading
+/// `.{name}` is `dst.file_name()` only — sufficient for uniqueness
+/// given the `{pid}.{nanos}` suffix.
+fn staging_tmp_path(staging_dir: &Path, dst: &Path) -> PathBuf {
     let name = dst
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -534,7 +634,7 @@ fn sibling_tmp_path(dst: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    parent.join(format!(".{name}.{TMP_INFIX}.{host}.{pid}.{nanos}"))
+    staging_dir.join(format!(".{name}.{TMP_INFIX}.{host}.{pid}.{nanos}"))
 }
 
 fn copy_with_fsync(src: &Path, tmp: &Path) -> Result<(), PublishError> {
@@ -609,8 +709,9 @@ const DEFERRED: &[Signal] = &[Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP];
 /// this guard does nothing against them. The complementary mitigations
 /// for a hard kill mid-publish are [`publish_all`]'s stage-first
 /// ordering (an interruption before phase 2 leaves only `.publish-tmp`
-/// siblings, never a partial final) and [`sweep_stale_tmps`] reaping
-/// those leftovers on the next run.
+/// temps in `staging_dir`, never a partial final and never a temp in
+/// the published content tree) and [`sweep_stale_tmps`] reaping those
+/// leftovers from `staging_dir` on the next run.
 struct SignalMaskGuard {
     /// The mask in effect before `block`, restored on drop.
     saved: SigSet,
@@ -644,20 +745,25 @@ impl Drop for SignalMaskGuard {
     }
 }
 
-/// Reap stale `.{name}.{TMP_INFIX}.{host}.{pid}.{nanos}` siblings left
-/// in `dir` by a hard kill (SIGKILL/power loss) that bypassed
+/// Reap stale `.{name}.{TMP_INFIX}.{host}.{pid}.{nanos}` temps left in
+/// `dir` by a hard kill (SIGKILL/power loss) that bypassed
 /// [`SignalMaskGuard`] and the normal cleanup paths. Returns the
 /// number of temps removed.
 ///
+/// `dir` is the publish staging directory (`<dst_root>/.publish-tmp`):
+/// the single flat place every cross-FS publish stages into, so the
+/// sweep reaps from exactly one directory and never has to walk the
+/// published content tree. The reap is non-recursive by design — temps
+/// are flat in `staging_dir`, never nested under it.
+///
 /// # Shared-NFS safety (load-bearing)
 ///
-/// `dir` is the **shared** destination directory: multiple secondaries
-/// on different hosts publish into the same NFS tree, and a worker's
-/// pid is unique only on its own host — pid 1234 on host A is a
-/// different process than pid 1234 on host B. A naive glob-and-delete
-/// of `*.publish-tmp.*` would therefore race a *live* sibling on
-/// another host whose copy is still in flight, deleting valid staged
-/// data.
+/// `dir` is **shared** across hosts: multiple secondaries on different
+/// hosts stage into the same NFS `staging_dir`, and a worker's pid is
+/// unique only on its own host — pid 1234 on host A is a different
+/// process than pid 1234 on host B. A naive glob-and-delete of
+/// `*.publish-tmp.*` would therefore race a *live* sibling on another
+/// host whose copy is still in flight, deleting valid staged data.
 ///
 /// The sweep is safe because the temp name embeds a **host token** and
 /// the pid:
@@ -782,6 +888,14 @@ mod tests {
         fs::read(path).unwrap()
     }
 
+    /// The hidden staging dir for a destination root, mirroring the
+    /// Python glue's `<dst_root>/.publish-tmp` convention. Same FS as
+    /// the destinations (under the same root) and out of the published
+    /// content tree.
+    fn staging_in(dst_root: &Path) -> PathBuf {
+        dst_root.join(".publish-tmp")
+    }
+
     fn same_device(a: &Path, b: &Path) -> bool {
         fs::metadata(a).unwrap().dev() == fs::metadata(b).unwrap().dev()
     }
@@ -803,7 +917,7 @@ mod tests {
         // Worker tries to publish to a path under the collision file
         // (e.g. an archive's per-member output).
         let dst = collision.join("member-output.csv");
-        let err = publish_one(&src, &dst, &src_root).unwrap_err();
+        let err = publish_one(&src, &dst, &src_root, &staging_in(&dst_root)).unwrap_err();
         match err {
             PublishError::DestinationParentIsFile { path } => {
                 assert_eq!(path, collision);
@@ -835,7 +949,7 @@ mod tests {
         let dst = dst_root.join("out/payload.bin");
         write_file(&src, b"hello");
 
-        publish_one(&src, &dst, &src_root).unwrap();
+        publish_one(&src, &dst, &src_root, &staging_in(&dst_root)).unwrap();
 
         assert!(dst.exists(), "dst missing after publish");
         assert_eq!(read_file(&dst), b"hello");
@@ -859,7 +973,7 @@ mod tests {
         let dst = root.path().join("network/deeply/nested/a.bin");
         assert!(!dst.parent().unwrap().exists());
 
-        publish_one(&src, &dst, &src_root).unwrap();
+        publish_one(&src, &dst, &src_root, &staging_in(&root.path().join("network"))).unwrap();
         assert!(dst.exists());
     }
 
@@ -877,7 +991,7 @@ mod tests {
         let src = src_root.join("doc.txt");
         write_file(&src, b"new");
 
-        publish_one(&src, &dst, &src_root).unwrap();
+        publish_one(&src, &dst, &src_root, &staging_in(&dst_root)).unwrap();
         assert_eq!(read_file(&dst), b"new");
     }
 
@@ -893,7 +1007,8 @@ mod tests {
         write_file(&src, b"nope");
         let dst = root.path().join("network/escape.bin");
 
-        let err = publish_one(&src, &dst, &src_root).unwrap_err();
+        let err = publish_one(&src, &dst, &src_root, &staging_in(&root.path().join("network")))
+            .unwrap_err();
         match err {
             PublishError::SourceOutsideRoot { .. } => {}
             other => panic!("expected SourceOutsideRoot, got {other:?}"),
@@ -911,7 +1026,8 @@ mod tests {
         let src = src_root.join("never-existed.bin");
         let dst = root.path().join("network/x.bin");
 
-        let err = publish_one(&src, &dst, &src_root).unwrap_err();
+        let err = publish_one(&src, &dst, &src_root, &staging_in(&root.path().join("network")))
+            .unwrap_err();
         match err {
             PublishError::SourceMissing { .. } => {}
             other => panic!("expected SourceMissing, got {other:?}"),
@@ -943,19 +1059,22 @@ mod tests {
         write_file(&src, b"contents");
 
         let cross = !same_device(src_root.path(), dst_root.path());
+        let staging = staging_in(dst_root.path());
 
-        publish_one(&src, &dst, src_root.path()).unwrap();
+        publish_one(&src, &dst, src_root.path(), &staging).unwrap();
 
         assert!(dst.exists(), "dst missing");
         assert_eq!(read_file(&dst), b"contents");
         assert!(!src.exists(), "src not removed");
         if cross {
-            // No tmp sibling left in dst's directory.
+            // No tmp left in dst's content dir (it never was a sibling
+            // there) — and the staging dir is drained after a success.
             let leftover = fs::read_dir(dst.parent().unwrap())
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .any(|e| e.file_name().to_string_lossy().contains("publish-tmp"));
-            assert!(!leftover, "cross-FS tmp sibling not cleaned up");
+            assert!(!leftover, "cross-FS tmp left in content dir");
+            assert!(!any_tmp_in(&staging), "cross-FS tmp left in staging dir");
         }
     }
 
@@ -985,7 +1104,7 @@ mod tests {
             items.push((src, dst_root.join(format!("out/p{i}.bin"))));
         }
 
-        publish_all(&items, &src_root).unwrap();
+        publish_all(&items, &src_root, &staging_in(&dst_root)).unwrap();
 
         for (i, (src, dst)) in items.iter().enumerate() {
             assert!(dst.exists(), "dst {i} missing");
@@ -1024,7 +1143,7 @@ mod tests {
             (good_src.clone(), good_dst.clone()),
             (bad_src.clone(), bad_dst.clone()),
         ];
-        let err = publish_all(&items, &src_root).unwrap_err();
+        let err = publish_all(&items, &src_root, &staging_in(&dst_root)).unwrap_err();
         match err {
             PublishError::SourceOutsideRoot { .. } => {}
             other => panic!("expected SourceOutsideRoot, got {other:?}"),
@@ -1039,10 +1158,15 @@ mod tests {
         // Sources untouched.
         assert!(good_src.exists(), "good src wrongly removed");
         assert!(bad_src.exists(), "bad src wrongly removed");
-        // No temp from this batch survives anywhere under the dst tree.
+        // No temp from this batch survives in the content dir or the
+        // staging dir.
         assert!(
             !any_tmp_in(&dst_root.join("out")),
-            "phase-1 temp not unwound"
+            "phase-1 temp left in content dir"
+        );
+        assert!(
+            !any_tmp_in(&staging_in(&dst_root)),
+            "phase-1 temp not unwound from staging dir"
         );
     }
 
@@ -1060,7 +1184,7 @@ mod tests {
         let dst = dst_root.join("out/one.bin");
         write_file(&src, b"single");
 
-        publish_one(&src, &dst, &src_root).unwrap();
+        publish_one(&src, &dst, &src_root, &staging_in(&dst_root)).unwrap();
         assert_eq!(read_file(&dst), b"single");
         assert!(!src.exists());
         assert!(!any_tmp_in(&dst_root.join("out")));
@@ -1114,6 +1238,7 @@ mod tests {
         publish_all_with(
             std::slice::from_ref(&(src.clone(), dst.clone())),
             &src_root,
+            &staging_in(&dst_root),
             rename,
         )
         .expect("EXDEV on a same-st_dev rename must fall back, not fail");
@@ -1123,7 +1248,11 @@ mod tests {
         assert!(!src.exists(), "src not removed after fallback");
         assert!(
             !any_tmp_in(&dst_root.join("out")),
-            "fallback temp left behind"
+            "fallback temp left in content dir"
+        );
+        assert!(
+            !any_tmp_in(&staging_in(&dst_root)),
+            "fallback temp left in staging dir"
         );
     }
 
@@ -1155,13 +1284,18 @@ mod tests {
             (fast_src.clone(), fast_dst.clone()),
             (slow_src.clone(), slow_dst.clone()),
         ];
-        publish_all_with(&items, &src_root, rename).expect("mixed batch must succeed");
+        publish_all_with(&items, &src_root, &staging_in(&dst_root), rename)
+            .expect("mixed batch must succeed");
 
         assert_eq!(read_file(&fast_dst), b"fast-path");
         assert_eq!(read_file(&slow_dst), b"fallback-path");
         assert!(!fast_src.exists(), "fast src not removed");
         assert!(!slow_src.exists(), "slow src not removed");
-        assert!(!any_tmp_in(&dst_root.join("out")), "temp left behind");
+        assert!(!any_tmp_in(&dst_root.join("out")), "temp left in content dir");
+        assert!(
+            !any_tmp_in(&staging_in(&dst_root)),
+            "temp left in staging dir"
+        );
     }
 
     // ---- C.2: signal-mask RAII guard ----
@@ -1223,8 +1357,11 @@ mod tests {
 
     #[test]
     fn parse_tmp_token_round_trips_builder() {
+        let staging = Path::new("/dest/.publish-tmp");
         let dst = Path::new("/dest/out/data.tar.zst");
-        let tmp = sibling_tmp_path(dst);
+        let tmp = staging_tmp_path(staging, dst);
+        // The temp lands flat in the staging dir, not as a sibling of dst.
+        assert_eq!(tmp.parent().unwrap(), staging);
         let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
         let (host, pid) = parse_tmp_token(&name).expect("builder output must parse");
         assert_eq!(host, host_token());
@@ -1289,5 +1426,169 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("does-not-exist");
         assert_eq!(sweep_stale_tmps(&missing).unwrap(), 0);
+    }
+
+    // ---- #676: staged temps live in the staging dir, out of the
+    //            content tree, and every failure path reaps them ----
+
+    /// (b) The cross-FS staging temp lands in the STAGING dir, never in
+    /// the published content dir, and the final still commits
+    /// atomically. Forced cross-FS via the EXDEV seam (the direct
+    /// canon_src→dst rename is rejected, routing the item through the
+    /// copy-to-staging fallback). On success the content dir holds only
+    /// the final and the staging dir is drained.
+    #[test]
+    fn staged_temp_lives_in_staging_dir_not_content_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = root.path().join("staging-src");
+        let dst_root = root.path().join("network");
+        let staging = staging_in(&dst_root);
+        fs::create_dir_all(&src_root).unwrap();
+        fs::create_dir_all(&dst_root).unwrap();
+
+        let src = src_root.join("payload.bin");
+        let dst = dst_root.join("out/dataset/variant/payload.bin");
+        write_file(&src, b"deep-nested-payload");
+
+        let canon_src = fs::canonicalize(&src).unwrap();
+        // A rename seam that records every staging→final move it sees
+        // (so we can assert the temp's parent is the staging dir), then
+        // forces EXDEV on the direct move to drive the copy fallback.
+        let rename = exdev_for(canon_src, dst.clone());
+
+        publish_all_with(
+            std::slice::from_ref(&(src.clone(), dst.clone())),
+            &src_root,
+            &staging,
+            rename,
+        )
+        .expect("forced cross-FS publish must land the final");
+
+        assert!(dst.exists(), "final not committed");
+        assert_eq!(read_file(&dst), b"deep-nested-payload");
+        assert!(!src.exists(), "src not consumed");
+        // The content dir (every level of it) never held a temp.
+        assert!(
+            !any_tmp_in(dst.parent().unwrap()),
+            "temp polluted the content dir"
+        );
+        // The staging dir is drained on success.
+        assert!(!any_tmp_in(&staging), "staging dir not drained on success");
+    }
+
+    /// A `rename` seam that returns a chosen *real* (non-EXDEV) error
+    /// for a specific `(from, to)` pair and delegates everything else to
+    /// `fs::rename`. Used to drive a genuine phase-2 rename failure so
+    /// the staged-temp cleanup (the `StagedTemp` drop) is exercised.
+    fn fail_rename_for(
+        from: PathBuf,
+        to: PathBuf,
+        errno: i32,
+    ) -> impl Fn(&Path, &Path) -> io::Result<()> {
+        move |f: &Path, t: &Path| {
+            if f == from && t == to {
+                Err(io::Error::from_raw_os_error(errno))
+            } else {
+                fs::rename(f, t)
+            }
+        }
+    }
+
+    /// (a) A phase-2 rename error on a cross-FS (staged) item leaves NO
+    /// temp behind — neither in the content dir nor the staging dir. The
+    /// item is routed cross-FS by an EXDEV on its direct move, staged to
+    /// the staging dir, and then its fallback temp→final rename is
+    /// forced to fail with a real error (EIO). The `StagedTemp` drop on
+    /// the error-return must reap the temp.
+    ///
+    /// REVERT-CHECK: with `StagedTemp::drop` removed (or never armed),
+    /// this temp survives in the staging dir — the regression this fix
+    /// prevents.
+    #[test]
+    fn fallback_rename_error_reaps_staged_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = root.path().join("staging-src");
+        let dst_root = root.path().join("network");
+        let staging = staging_in(&dst_root);
+        fs::create_dir_all(&src_root).unwrap();
+        fs::create_dir_all(&dst_root).unwrap();
+
+        let src = src_root.join("doomed.bin");
+        let dst = dst_root.join("out/doomed.bin");
+        write_file(&src, b"doomed payload");
+        let canon_src = fs::canonicalize(&src).unwrap();
+
+        // Seam: EXDEV the direct canon_src→dst move (drive the fallback),
+        // and EIO the fallback's temp→dst move. The temp path is
+        // unknown ahead of time (it embeds nanos), so match the EIO on
+        // the destination only via a closure that fails ANY rename whose
+        // target is `dst` but whose source is NOT canon_src (i.e. the
+        // temp→dst commit).
+        let canon_for_seam = canon_src.clone();
+        let dst_for_seam = dst.clone();
+        let rename = move |f: &Path, t: &Path| -> io::Result<()> {
+            if t == dst_for_seam {
+                if f == canon_for_seam {
+                    // direct move → force the cross-FS fallback
+                    Err(io::Error::from_raw_os_error(nix::libc::EXDEV))
+                } else {
+                    // the fallback temp→dst commit → real failure
+                    Err(io::Error::from_raw_os_error(nix::libc::EIO))
+                }
+            } else {
+                fs::rename(f, t)
+            }
+        };
+
+        let err = publish_all_with(
+            std::slice::from_ref(&(src.clone(), dst.clone())),
+            &src_root,
+            &staging,
+            rename,
+        )
+        .expect_err("forced fallback rename error must surface");
+        match err {
+            PublishError::Rename { .. } => {}
+            other => panic!("expected Rename error, got {other:?}"),
+        }
+
+        // No final (the commit failed), and NO temp survives anywhere.
+        assert!(!dst.exists(), "no final on a failed commit");
+        assert!(
+            !any_tmp_in(&staging),
+            "staged temp leaked into staging dir on rename error"
+        );
+        assert!(
+            !any_tmp_in(&dst_root.join("out")),
+            "staged temp leaked into content dir on rename error"
+        );
+        // Silence the unused-helper warning while keeping the named
+        // seam available for future real-error tests.
+        let _ = fail_rename_for;
+    }
+
+    /// (c) The sweep reaps a dead-pid own-host orphan from the staging
+    /// dir EVEN WHEN the published final sibling already exists — the
+    /// guard keys on host+pid, not on "a final exists nearby", so a
+    /// successfully-published final never shields a dead-pid orphan from
+    /// the sweep.
+    #[test]
+    fn sweep_reaps_dead_pid_orphan_even_with_existing_final() {
+        let dst_root = tempfile::tempdir().unwrap();
+        let staging = staging_in(dst_root.path());
+        fs::create_dir_all(&staging).unwrap();
+        let host = host_token();
+        let dead_pid = i32::MAX;
+
+        // The successfully-published final lives in the content tree.
+        write_file(&dst_root.path().join("out/data.tar.zst"), b"published");
+        // A dead-pid orphan for the SAME logical output sits in staging.
+        make_tmp(&staging, "data.tar.zst", &host, dead_pid, 42);
+
+        let removed = sweep_stale_tmps(&staging).unwrap();
+        assert_eq!(removed, 1, "dead-pid orphan not reaped despite final");
+        assert!(!any_tmp_in(&staging), "orphan survived in staging dir");
+        // The published final is untouched (the sweep only scans staging).
+        assert!(dst_root.path().join("out/data.tar.zst").exists());
     }
 }
