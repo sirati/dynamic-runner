@@ -615,20 +615,23 @@ def _install_exit_signal_handlers() -> dict[int, Any]:
 
 def _sweep_stale_publish_tmps() -> None:
     """Reap ``.publish-tmp`` leftovers a prior worker run left in the
-    destination dir when it was hard-killed mid-publish. Run once at
+    staging dir when it was hard-killed mid-publish. Run once at
     worker run-start, before any task is processed.
 
-    The dest-root resolution and the own-host / dead-pid scoped sweep
+    The staging-dir resolution and the own-host / dead-pid scoped sweep
     both live in ``dynamic_runner.worker.publish`` (and, underneath,
     the native crate) — this is a thin invocation that only owns the
-    "log if anything was reaped" observability. A sweep failure must
-    not block the worker from starting (a leftover temp is benign and
-    the next run will retry), so any error is logged and swallowed.
+    "log if anything was reaped" observability. The sweep targets the
+    hidden ``<dst_root>/.publish-tmp`` staging dir (the single flat
+    place cross-FS publishes stage into), so it never has to walk the
+    published content tree. A sweep failure must not block the worker
+    from starting (a leftover temp is benign and the next run will
+    retry), so any error is logged and swallowed.
     """
-    from .publish import dst_root, sweep_stale_tmps
+    from .publish import staging_dir, sweep_stale_tmps
 
     try:
-        reaped = sweep_stale_tmps(dst_root())
+        reaped = sweep_stale_tmps(staging_dir())
     except Exception as exc:  # noqa: BLE001 — best-effort startup hygiene
         _LOG.warning(
             "worker.runtime: stale .publish-tmp sweep failed at run-start "

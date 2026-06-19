@@ -54,6 +54,18 @@ ENV_DST_ROOT = "DYNRUNNER_PUBLISH_DST_ROOT"
 DEFAULT_SRC_ROOT = "/app/out-tmp"
 DEFAULT_DST_ROOT = "/app/out-network"
 
+# Hidden staging subdirectory under the destination root. Cross-FS
+# publishes stage their `.publish-tmp` temps here — on the SAME
+# filesystem as every destination (so the staged-temp→final rename
+# stays an atomic intra-FS commit) but OUTSIDE the published content
+# tree (so a crash-orphaned temp never pollutes the published files and
+# a content walker never enumerates it). The run-start sweep reaps
+# orphans from exactly this directory. The dot prefix keeps it out of
+# the consumer's content-discovery globs. This deployment convention
+# (the subdir name) is the Python glue's concern; the native crate is
+# handed the resolved path and stays deployment-agnostic.
+STAGING_SUBDIR = ".publish-tmp"
+
 
 def _roots() -> tuple[Path, Path]:
     """Read the staging/destination roots from env, falling back to
@@ -64,6 +76,17 @@ def _roots() -> tuple[Path, Path]:
     src_root = os.environ.get(ENV_SRC_ROOT, DEFAULT_SRC_ROOT)
     dst_root = os.environ.get(ENV_DST_ROOT, DEFAULT_DST_ROOT)
     return Path(src_root), Path(dst_root)
+
+
+def staging_dir() -> Path:
+    """The hidden staging directory cross-FS publishes stage temps into
+    (``<dst_root>/.publish-tmp``). Same FS as every destination, out of
+    the published content tree. The single source of truth shared by the
+    publish calls (where temps are staged) and the run-start sweep
+    (where orphans are reaped) — they MUST agree, so both derive it
+    here.
+    """
+    return _roots()[1] / STAGING_SUBDIR
 
 
 def publish(src: PathLike, dst: PathLike) -> Path:
@@ -86,7 +109,7 @@ def publish(src: PathLike, dst: PathLike) -> Path:
     accumulator) capture this.
     """
     src_p, dst_p = Path(src), Path(dst)
-    _native_publish_one(src_p, dst_p, _roots()[0])
+    _native_publish_one(src_p, dst_p, _roots()[0], staging_dir())
     return dst_p
 
 
@@ -121,7 +144,7 @@ def publish_all(pairs: Iterable[Tuple[PathLike, PathLike]]) -> None:
     ]
     if not items:
         return
-    _native_publish_all(items, _roots()[0])
+    _native_publish_all(items, _roots()[0], staging_dir())
 
 
 def sweep_stale_tmps(dest_root: PathLike) -> int:
@@ -150,9 +173,11 @@ __all__ = [
     "ENV_DST_ROOT",
     "DEFAULT_SRC_ROOT",
     "DEFAULT_DST_ROOT",
+    "STAGING_SUBDIR",
     "PublishError",
     "publish",
     "publish_all",
     "sweep_stale_tmps",
     "dst_root",
+    "staging_dir",
 ]

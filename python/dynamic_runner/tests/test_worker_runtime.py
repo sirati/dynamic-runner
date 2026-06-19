@@ -777,22 +777,24 @@ class RunStartSweepTests(unittest.TestCase):
             run(lambda task: None, comm=comm)
         sweep.assert_called_once_with()
 
-    def test_helper_delegates_to_publish_sweep_with_dst_root(self):
-        # The helper resolves the destination root and reaps via the
-        # publish module's sweep. Patch the publish-module surface so
-        # no real dest dir / native call is needed.
-        with patch("dynamic_runner.worker.publish.dst_root",
-                   return_value="/some/dst") as droot, \
+    def test_helper_delegates_to_publish_sweep_with_staging_dir(self):
+        # The helper resolves the hidden staging dir (where cross-FS
+        # publishes stage their temps) and reaps via the publish
+        # module's sweep — NOT the bare dst_root, whose deeply-nested
+        # content subtree the sweep would never descend into. Patch the
+        # publish-module surface so no real dir / native call is needed.
+        with patch("dynamic_runner.worker.publish.staging_dir",
+                   return_value="/some/dst/.publish-tmp") as sdir, \
              patch("dynamic_runner.worker.publish.sweep_stale_tmps",
                    return_value=0) as sweep:
             runtime_mod._sweep_stale_publish_tmps()
-        droot.assert_called_once_with()
-        sweep.assert_called_once_with("/some/dst")
+        sdir.assert_called_once_with()
+        sweep.assert_called_once_with("/some/dst/.publish-tmp")
 
     def test_helper_swallows_sweep_failure(self):
         # A sweep error at startup must not stop the worker.
-        with patch("dynamic_runner.worker.publish.dst_root",
-                   return_value="/some/dst"), \
+        with patch("dynamic_runner.worker.publish.staging_dir",
+                   return_value="/some/dst/.publish-tmp"), \
              patch("dynamic_runner.worker.publish.sweep_stale_tmps",
                    side_effect=RuntimeError("boom")):
             runtime_mod._sweep_stale_publish_tmps()  # must not raise
