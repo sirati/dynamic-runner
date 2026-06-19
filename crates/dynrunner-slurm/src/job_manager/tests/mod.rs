@@ -18,9 +18,15 @@
 //!   `cancel_all_jobs`: a job that scancel exits 0 on but stays in the
 //!   queue (the run_20260611_182745 race) is re-scancelled and, if it
 //!   outlives the budget, WARN-flagged with its id.
+//! - [`status_batch`] — pins the batched `squeue -j <list>` status probe
+//!   (`get_job_status_batch`, #675): the multi-row parse produces the same
+//!   per-job `JobStatusInfo` map the per-job path would, including a job
+//!   absent from the output mapping to the "no row" (not-in-queue)
+//!   snapshot.
 
 mod binary_upload;
 mod cancel_verify;
 mod important_events;
 mod legacy;
 mod shutdown_binary;
+mod status_batch;

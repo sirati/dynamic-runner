@@ -79,16 +79,12 @@ impl<G: Gateway + Send + Sync + 'static> SlurmAuthorityProbe for SlurmJobManager
     }
 
     async fn probe_all(&self) -> std::collections::HashMap<String, PeerLifeState> {
-        let entries: Vec<(String, String)> = {
-            let mgr = self.manager.lock().await;
-            mgr.secondary_jobs_snapshot()
-        };
-        let mut out = std::collections::HashMap::with_capacity(entries.len());
-        for (secondary_id, _job_id) in entries {
-            let life = self.peer_life(&secondary_id).await;
-            out.insert(secondary_id, life);
-        }
-        out
+        // Delegate to the classified path (the batched #675 squeue probe)
+        // and discard the pending-Resources count: the per-secondary
+        // verdict is identical between the two, so this both reuses the
+        // single batched `squeue -j <list>` call and avoids a duplicate
+        // classification loop.
+        self.probe_all_classified().await.0
     }
 
     /// Probe every secondary AND count how many are PENDING with reason
@@ -106,15 +102,30 @@ impl<G: Gateway + Send + Sync + 'static> SlurmAuthorityProbe for SlurmJobManager
             let mgr = self.manager.lock().await;
             mgr.secondary_jobs_snapshot()
         };
+        // Batch the per-secondary squeue probes into ONE
+        // `squeue -j <id1>,<id2>,…` round-trip (#675). The returned map
+        // carries the SAME per-job `JobStatusInfo` the per-job path would,
+        // with a job ABSENT from the queue mapping to the missing snapshot
+        // (`state_kind == None`) — IDENTICAL to the per-job probe's
+        // empty/non-zero result. Classification below is therefore
+        // unchanged per job; only the number of squeue calls (N→1) differs.
+        let job_ids: Vec<String> = entries.iter().map(|(_, job_id)| job_id.clone()).collect();
+        let statuses = {
+            let mgr = self.manager.lock().await;
+            mgr.get_job_status_batch(&job_ids).await
+        };
         let mut out = std::collections::HashMap::with_capacity(entries.len());
         let mut pending_resources: usize = 0;
         for (secondary_id, job_id) in entries {
-            // Query each job's status including the reason field.
-            let mgr = self.manager.lock().await;
-            let status_result = mgr.get_job_status(&job_id).await;
-            drop(mgr); // release the lock before the sacct fallback below
-            let life = match status_result {
-                Ok(ref info) => match info.state_kind {
+            // A transport `Err` on the batched query degrades the whole
+            // probe to Unknown — the same direction the per-job path took
+            // when its single `get_job_status` returned `Err`.
+            let info = match &statuses {
+                Ok(map) => map.get(&job_id),
+                Err(_) => None,
+            };
+            let life = match info {
+                Some(info) => match info.state_kind {
                     Some(crate::job_manager::JobStatus::Pending) => {
                         // "Resources" is the reason SLURM prints when the
                         // job cannot schedule on the partition's capacity.
@@ -137,7 +148,7 @@ impl<G: Gateway + Send + Sync + 'static> SlurmAuthorityProbe for SlurmJobManager
                         }
                     }
                 },
-                Err(_) => PeerLifeState::Unknown,
+                None => PeerLifeState::Unknown,
             };
             out.insert(secondary_id, life);
         }
