@@ -71,6 +71,22 @@ pub struct JobStatusInfo {
     pub reason: String,
 }
 
+impl JobStatusInfo {
+    /// The "no row in squeue" snapshot: `state`/`state_kind` are `None`
+    /// and `node`/`reason` are empty. Returned for a job a squeue probe
+    /// could not find (post-purge, or absent from a batched comma-list
+    /// query). Single source of truth for the missing-job shape shared by
+    /// the per-job and batched status paths.
+    pub fn missing() -> Self {
+        Self {
+            state: None,
+            state_kind: None,
+            node: String::new(),
+            reason: String::new(),
+        }
+    }
+}
+
 /// What `cancel_job`'s `scancel` actually did, for callers that need
 /// to pick a log severity (e.g. the respawn revocation path treats a
 /// gone job as a quiet no-op). Distinct from the `Err` arm, which is

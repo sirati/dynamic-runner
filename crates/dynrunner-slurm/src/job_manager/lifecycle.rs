@@ -736,35 +736,102 @@ impl<G: Gateway> SlurmJobManager<G> {
         let result = self.gateway.execute_command(&cmd, None).await?;
 
         if !result.success() || result.stdout.trim().is_empty() {
-            return Ok(JobStatusInfo {
-                state: None,
-                state_kind: None,
-                node: String::new(),
-                reason: String::new(),
-            });
+            return Ok(JobStatusInfo::missing());
         }
 
-        let line = result.stdout.trim();
-        let mut parts = line.split('|');
-        let state_str = parts.next().unwrap_or("").to_string();
-        let node = parts.next().unwrap_or("").to_string();
-        let reason = parts.next().unwrap_or("").to_string();
+        Ok(parse_status_fields(result.stdout.trim()))
+    }
 
-        let state_kind = match state_str.as_str() {
-            "PENDING" => JobStatus::Pending,
-            "RUNNING" => JobStatus::Running,
-            "COMPLETED" | "COMPLETING" => JobStatus::Completed,
-            "FAILED" | "NODE_FAIL" | "TIMEOUT" => JobStatus::Failed,
-            "CANCELLED" => JobStatus::Cancelled,
-            other => JobStatus::Unknown(other.to_string()),
-        };
+    /// Batched [`Self::get_job_status`]: ONE `squeue -j <id1>,<id2>,…`
+    /// invocation for the whole `job_ids` set instead of one call per id.
+    ///
+    /// The result is the SAME per-job [`JobStatusInfo`] the per-job path
+    /// produces, keyed by job id. A job ABSENT from the batched output
+    /// (SLURM omits finished/purged/unknown jobs from a `squeue -j`
+    /// comma-list rather than erroring the whole query) maps to the
+    /// identical "no row" snapshot ([`JobStatusInfo::missing`],
+    /// `state_kind == None`) that a per-job `squeue -j <id>` returns for a
+    /// job no longer in the queue — so callers' "missing → consult
+    /// sacct/ledger" interpretation is unchanged. The `%i` column is
+    /// prepended to the per-job `%T|%N|%r` format purely to map each row
+    /// back to its job id; the remaining three fields parse through the
+    /// SAME [`parse_status_fields`] the per-job path uses.
+    ///
+    /// A gateway TRANSPORT failure surfaces as `Err` (mirroring the
+    /// per-job `?` on `execute_command`). A non-zero/empty result is
+    /// treated as "no rows" — every queried id maps to a missing
+    /// snapshot, the same fail-direction the per-job path takes on an
+    /// empty/non-zero single query.
+    pub async fn get_job_status_batch(
+        &self,
+        job_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, JobStatusInfo>, SlurmError> {
+        let mut out = std::collections::HashMap::with_capacity(job_ids.len());
+        if job_ids.is_empty() {
+            return Ok(out);
+        }
+        // Every queried id defaults to the "no row" snapshot; rows present
+        // in the squeue output overwrite their id below. An id absent from
+        // the output therefore retains the missing snapshot — IDENTICAL to
+        // the per-job path's empty/non-zero result.
+        for id in job_ids {
+            out.insert(id.clone(), JobStatusInfo::missing());
+        }
 
-        Ok(JobStatusInfo {
-            state: Some(state_str),
-            state_kind: Some(state_kind),
-            node,
-            reason,
-        })
+        let id_list = job_ids.join(",");
+        let cmd = format!("squeue -j {id_list} -o '%i|%T|%N|%r' --noheader 2>/dev/null");
+        let result = self.gateway.execute_command(&cmd, None).await?;
+
+        if !result.success() {
+            // Whole-query failure (e.g. SLURM rejected the list): leave
+            // every id at the missing snapshot, the same fail-direction the
+            // per-job path takes on a non-zero single query.
+            return Ok(out);
+        }
+
+        for line in result.stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // `%i|<rest>`: split the leading job id off, parse the rest with
+            // the SAME helper the per-job path uses.
+            let (job_id, rest) = match line.split_once('|') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            out.insert(job_id.to_string(), parse_status_fields(rest));
+        }
+
+        Ok(out)
+    }
+}
+
+/// Parse one `%T|%N|%r` squeue row (state|node|reason) into a populated
+/// [`JobStatusInfo`]. Single source of truth for the per-job status parse,
+/// shared by [`SlurmJobManager::get_job_status`] (one row) and
+/// [`SlurmJobManager::get_job_status_batch`] (one row per job, after the
+/// leading `%i` id is split off).
+fn parse_status_fields(fields: &str) -> JobStatusInfo {
+    let mut parts = fields.split('|');
+    let state_str = parts.next().unwrap_or("").to_string();
+    let node = parts.next().unwrap_or("").to_string();
+    let reason = parts.next().unwrap_or("").to_string();
+
+    let state_kind = match state_str.as_str() {
+        "PENDING" => JobStatus::Pending,
+        "RUNNING" => JobStatus::Running,
+        "COMPLETED" | "COMPLETING" => JobStatus::Completed,
+        "FAILED" | "NODE_FAIL" | "TIMEOUT" => JobStatus::Failed,
+        "CANCELLED" => JobStatus::Cancelled,
+        other => JobStatus::Unknown(other.to_string()),
+    };
+
+    JobStatusInfo {
+        state: Some(state_str),
+        state_kind: Some(state_kind),
+        node,
+        reason,
     }
 }
 
