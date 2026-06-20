@@ -416,4 +416,53 @@ mod tests {
             }
         });
     }
+
+    /// Codec round-trip pin for the consumer-reported truncation: a
+    /// `relative_path` whose LEAF component equals its FIRST component
+    /// (`m4/clang21_ppc64_O1_9ac0ed8d/m4`) must survive the
+    /// serialize → wire-frame → parse round-trip byte-for-byte, NOT
+    /// collapse to its first component (`m4`). Closes the codec layer
+    /// empirically alongside the extract-boundary and dispatch pins.
+    #[test]
+    fn serialize_round_trips_leaf_equals_first_relative_path() {
+        Python::attach(|py| {
+            const COLLIDE: &str = "m4/clang21_ppc64_O1_9ac0ed8d/m4";
+            let py_cmd = Py::new(
+                py,
+                (
+                    PyProcessBinaryCommand {
+                        relative_path: COLLIDE.into(),
+                        payload: None,
+                        resolved_path: None,
+                        predecessor_outputs_json: "{}".into(),
+                    },
+                    PyCommand,
+                ),
+            )
+            .expect("construct PyProcessBinaryCommand");
+
+            let bytes_any = py_cmd
+                .bind(py)
+                .call_method0("serialize")
+                .expect("serialize() returns bytes");
+            let bytes = bytes_any
+                .cast::<PyBytes>()
+                .expect("serialize() returns PyBytes")
+                .as_bytes()
+                .to_vec();
+            let line = std::str::from_utf8(&bytes)
+                .expect("wire frame is UTF-8")
+                .trim_end_matches('\n')
+                .to_string();
+            let decoded = codec_parse_command(&line).expect("codec parses wire frame");
+            match decoded {
+                RustCommand::ProcessTask { relative_path, .. } => assert_eq!(
+                    relative_path, COLLIDE,
+                    "leaf==first relative_path must survive the codec verbatim, \
+                     NOT collapse to its first component"
+                ),
+                other => panic!("expected ProcessTask, got {other:?}"),
+            }
+        });
+    }
 }

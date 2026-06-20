@@ -245,3 +245,71 @@ async fn composite_three_phase_lazy_chain_runs_every_body() {
         })
         .await;
 }
+
+/// Regression pin for the consumer-reported `relative_path` truncation:
+/// a task whose `TaskInfo.path` LEAF component equals its FIRST component
+/// (`m4/clang21_ppc64_O1_9ac0ed8d/m4` — the single-executable-package-
+/// named-after-its-package shape) must reach the worker's
+/// `Command::ProcessTask { relative_path }` with the FULL multi-component
+/// path, NOT collapsed to its first component (`m4`). The control task
+/// (`sqlite/gcc15_ppc64_O2/libsqlite3.so.3.51.2`, leaf != first) must
+/// likewise arrive verbatim. This drives the real scheduler → dispatch →
+/// manager-worker wire (`handle.rs` sets `relative_path = binary.path`),
+/// so a truncation anywhere on that chain would show here.
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_preserves_leaf_equals_first_relative_path() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            const COLLIDE: &str = "m4/clang21_ppc64_O1_9ac0ed8d/m4";
+            const CONTROL: &str = "sqlite/gcc15_ppc64_O2/libsqlite3.so.3.51.2";
+
+            let config = test_config(4, false);
+            let mut manager: LocalManager<ChannelManagerEnd, _, _, TestId> =
+                LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator);
+
+            let binaries: Vec<TaskInfo<TestId>> = vec![
+                make_task(COLLIDE, "p1", "type-p1"),
+                make_task(CONTROL, "p1", "type-p1"),
+            ];
+
+            let executed: Executed = Arc::new(Mutex::new(Vec::new()));
+            let mut factory = RecordingWorkerFactory {
+                executed: Arc::clone(&executed),
+            };
+            manager
+                .process_binaries(
+                    binaries,
+                    HashMap::new(),
+                    |_phase| {},
+                    |_p, _c, _f, _o| {},
+                    &mut factory,
+                )
+                .await
+                .expect("process_binaries");
+
+            let executed = executed.lock().expect("executed ledger").clone();
+
+            // The worker received EXACTLY the two full paths — neither was
+            // collapsed to its first component. Truncation would surface as
+            // a bare `m4` (or `sqlite`) entry, or a missing full path.
+            assert!(
+                executed.iter().any(|p| p == COLLIDE),
+                "leaf==first task must reach the worker with its FULL path; \
+                 got relative_paths = {executed:?}"
+            );
+            assert!(
+                executed.iter().any(|p| p == CONTROL),
+                "control task must reach the worker verbatim; \
+                 got relative_paths = {executed:?}"
+            );
+            // And nothing arrived collapsed to a single first-component.
+            assert!(
+                !executed.iter().any(|p| p == "m4" || p == "sqlite"),
+                "no task may arrive truncated to its first component; \
+                 got relative_paths = {executed:?}"
+            );
+        })
+        .await;
+}

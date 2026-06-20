@@ -663,6 +663,47 @@ mod tests {
         });
     }
 
+    /// Regression pin: `extract_binaries` must carry `TaskInfo.path` across the
+    /// pyo3 boundary VERBATIM, with NO per-component manipulation — in
+    /// particular when the leaf component equals the first component
+    /// (`pkg/variant/pkg`, the single-executable-package-named-after-its-package
+    /// shape). A consumer reported that such a path is collapsed to only its
+    /// first component (`pkg`) by the time the worker opens it; this pin proves
+    /// the extract layer is faithful so the truncation, if any, is downstream
+    /// or consumer-side. The control (`pkg2/variant/libfoo.so`, leaf != first)
+    /// must likewise round-trip untouched.
+    #[test]
+    fn extract_binaries_preserves_leaf_equals_first_path() {
+        Python::attach(|py| {
+            // leaf == first  (the reported-broken shape)
+            let collide = make_task_item(py, "m4", None);
+            collide
+                .setattr("path", "m4/clang21_ppc64_O1_9ac0ed8d/m4")
+                .expect("set colliding path");
+            // leaf != first  (the reported-working control)
+            let control = make_task_item(py, "libsqlite3.so.3.51.2", None);
+            control
+                .setattr("path", "sqlite/gcc15_ppc64_O2/libsqlite3.so.3.51.2")
+                .expect("set control path");
+
+            let list = PyList::new(py, [collide, control]).expect("list");
+            let out = extract_binaries(&list).expect("extract");
+            assert_eq!(out.len(), 2);
+
+            assert_eq!(
+                out[0].0.path.to_string_lossy(),
+                "m4/clang21_ppc64_O1_9ac0ed8d/m4",
+                "leaf==first path must survive the extract boundary verbatim \
+                 (all 3 components), NOT collapse to the first component"
+            );
+            assert_eq!(
+                out[1].0.path.to_string_lossy(),
+                "sqlite/gcc15_ppc64_O2/libsqlite3.so.3.51.2",
+                "leaf!=first control path must survive verbatim"
+            );
+        });
+    }
+
     // ── #336 P2: the `files=` consumer surface ──────────────────────────────
 
     /// Build a TaskInfo-shaped item carrying a `files` attribute (#336 P2).
