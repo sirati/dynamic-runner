@@ -74,11 +74,20 @@ impl ExtractionCache {
             }
         };
 
+        // A candidate resolves only if it is a regular FILE whose content
+        // verifies. The `is_file` guard is load-bearing in pre-staged mode,
+        // where `verify` is existence-only (no hash to check): a bare
+        // basename can collide with a same-named DIRECTORY in the staged
+        // tree (a binary `m4` under `m4/<variant>/m4`), and a directory is
+        // never an openable binary. `is_file` follows symlinks, so a staged
+        // symlink-to-binary still resolves.
+        let accept = |path: &Path| -> bool { path.is_file() && verify(path) };
+
         if let Some(path_str) = file_path {
             let direct_path = PathBuf::from(path_str);
 
             // Try absolute path (local/file-ready / pre-staged mode).
-            if direct_path.is_absolute() && direct_path.exists() && verify(&direct_path) {
+            if direct_path.is_absolute() && accept(&direct_path) {
                 self.extracted
                     .insert(lookup_key.to_string(), direct_path.clone());
                 return Some(direct_path);
@@ -87,29 +96,32 @@ impl ExtractionCache {
             // Try relative to tmp_dir
             let file_name = direct_path.file_name().unwrap_or(direct_path.as_os_str());
             let relative_path = self.tmp_dir.join(file_name);
-            if relative_path.exists() && verify(&relative_path) {
+            if accept(&relative_path) {
                 self.extracted
                     .insert(lookup_key.to_string(), relative_path.clone());
                 return Some(relative_path);
             }
 
-            // Try src_network fallbacks (when configured): the primary
-            // may have placed the file on the shared drive without
-            // sending an explicit StageFile, OR the wrapper bind-mount
-            // exposes the pre-staged data here. Try
-            // `src_network/<basename>` and `src_network/<full local_path>`.
+            // Try src_network fallbacks (when configured): the wrapper
+            // bind-mount exposes the pre-staged tree here, OR the primary
+            // placed the file flat on the shared drive without an explicit
+            // StageFile. Prefer the FULL relative path (the authoritative
+            // staged-tree location) over the bare `<basename>` (the
+            // flat-placement fallback): when a binary's basename equals a
+            // parent directory in the tree (`m4/<variant>/m4`), the basename
+            // probe would otherwise resolve to that directory.
             if let Some(net) = self.src_network.as_ref() {
-                let base_in_net = net.join(file_name);
-                if base_in_net.exists() && verify(&base_in_net) {
-                    self.extracted
-                        .insert(lookup_key.to_string(), base_in_net.clone());
-                    return Some(base_in_net);
-                }
                 let full_in_net = net.join(path_str);
-                if full_in_net != base_in_net && full_in_net.exists() && verify(&full_in_net) {
+                if accept(&full_in_net) {
                     self.extracted
                         .insert(lookup_key.to_string(), full_in_net.clone());
                     return Some(full_in_net);
+                }
+                let base_in_net = net.join(file_name);
+                if base_in_net != full_in_net && accept(&base_in_net) {
+                    self.extracted
+                        .insert(lookup_key.to_string(), base_in_net.clone());
+                    return Some(base_in_net);
                 }
             }
         }
@@ -418,6 +430,48 @@ mod tests {
             "expected resolution via src_network/<full local_path>"
         );
         assert_eq!(result.unwrap(), staged);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a binary whose basename equals its first path component
+    /// (`m4/<variant>/m4` — a single-executable package named after the
+    /// package) must resolve to the actual binary FILE, NOT to the
+    /// same-named package DIRECTORY at `src_network/<basename>`. In
+    /// pre-staged mode (`expected_content_hash = None`, existence-only),
+    /// the old basename-first probe accepted the directory `net/m4` and
+    /// handed it to the worker as `resolved_path`, which then failed to
+    /// open it ("Is a directory"). The full-path probe must win.
+    #[test]
+    fn resolve_prefers_full_path_over_basename_dir_collision() {
+        let dir = std::env::temp_dir().join(format!("net_collide_test_{}", std::process::id()));
+        let tmp = dir.join("tmp");
+        let net = dir.join("src_network");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&net).unwrap();
+
+        // Layout: net/m4/<variant>/m4 (file) — and net/m4 is a DIRECTORY
+        // whose basename collides with the binary's basename `m4`.
+        let rel = "m4/clang21_ppc64_O1_9ac0ed8d/m4";
+        let staged = net.join(rel);
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"the real m4 binary").unwrap();
+        let collide_dir = net.join("m4");
+        assert!(collide_dir.is_dir(), "the package dir must exist + collide");
+
+        let mut cache = ExtractionCache::new(tmp, Some(net));
+        // Pre-staged mode: no content hash to verify (existence-only).
+        let result = cache.resolve_binary(None, rel, "taskhash-m4", None);
+        assert_eq!(
+            result.as_deref(),
+            Some(staged.as_path()),
+            "must resolve to the binary FILE, never the same-named package dir"
+        );
+        assert_ne!(
+            result.as_deref(),
+            Some(collide_dir.as_path()),
+            "must never resolve to a directory"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
