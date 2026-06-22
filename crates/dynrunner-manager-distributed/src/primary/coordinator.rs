@@ -595,6 +595,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// operational loop's drop arm. Reset to `false` at the start of every
     /// run.
     pub(super) run_start_batch_fired: bool,
+    /// The construction-stamped bootstrap discriminator for THIS operational
+    /// primary (`BootstrapRelocation` cold target vs `Failover` survivor),
+    /// captured in `run_consuming`'s `PromotedDestination` arm. Held on the
+    /// coordinator so the seed-dependent bring-up tail
+    /// (`finalize_bringup_assignment`) can gate `seed_bringup_reservation` on
+    /// it from BOTH of its run sites — the pre-loop (cold/failover, seed
+    /// already present) AND `finish_discovery_arm` (mode-2, seed produced by
+    /// discovery), where the original arm binding is out of scope. Defaults to
+    /// `Failover` (the conservative no-reservation kind) for the
+    /// non-promoted/setup-peer constructions that never reach the tail.
+    pub(super) bringup_kind: crate::process::BootstrapKind,
     /// Per-task identities a runtime `spawn_tasks` batch could not apply
     /// because the validator rejected them (`UnknownDependency` —
     /// an `on_phase_end`-spawned task naming a `(phase_id, task_id)`
@@ -1868,6 +1879,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             stranded_count: 0,
             mesh_pump_gone: false,
             run_start_batch_fired: false,
+            // Conservative default: a non-promoted / setup-peer construction
+            // never reaches the bring-up tail; the `PromotedDestination` arm
+            // overwrites this with the real kind before the tail runs.
+            bringup_kind: crate::process::BootstrapKind::Failover,
             spawn_rejected_task_ids: Vec::new(),
             spawn_continuation_queue: std::collections::VecDeque::new(),
             spawn_queue: crate::primary::spawn_queue::PendingSpawnQueue::new(),
@@ -5667,6 +5682,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `bootstrap_kind` (relocation vs failover) gates the bring-up
             // reservation below.
             BootstrapRole::PromotedDestination(bootstrap_kind) => {
+                // Stamp the bootstrap kind onto the coordinator so the
+                // seed-dependent bring-up tail (`finalize_bringup_assignment`)
+                // can read it from EITHER run site — here in the pre-loop
+                // (non-owed: seed already present) or in `finish_discovery_arm`
+                // (mode-2 owed: seed produced by discovery, where this binding
+                // is out of scope). It gates `seed_bringup_reservation`
+                // (relocation reserves, failover does not).
+                self.bringup_kind = bootstrap_kind;
                 // Mode-2 discover-on-promotion (V6), as a CONCURRENT op-loop
                 // arm (not a sequential pre-loop await). START the discovery
                 // future here IFF the CRDT declares discovery `Owed` (a
@@ -5766,99 +5789,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // the setup peer never reaches here.
                 self.maybe_auto_stage_initial()?;
 
-                // V2: rebuild the remote-worker roster from the replicated
-                // per-secondary capacity NOW — `wait_for_connections` has
-                // originated every connected secondary's `SecondaryCapacity`
-                // (and `rebroadcast_full_roster` above re-emitted the full
-                // set), so `known_secondaries()` is populated.
-                // `reconstruct_workers_from_cluster_state` is the SOLE roster
-                // builder. It MUST run BEFORE `perform_initial_assignment`
-                // commits any slot: the wholesale replace re-derives occupancy
-                // only from CRDT `InFlight`, so a re-invoke AFTER assignment
-                // began committing would zero committed-but-not-yet-originated
-                // slots — FORBIDDEN.
-                self.reconstruct_workers_from_cluster_state();
-
-                // Phase 4.9: OPEN the bring-up reservation (#494/#507).
-                // Partition the initial pending pool across the connected
-                // fleet (one task per idle worker) via the projected-load
-                // interleave so each member gets a capacity-bounded reserved
-                // share. Opens ONLY on a `BootstrapRelocation` cold target
-                // with an unstarted ledger — a `Failover` must NOT reserve
-                // (its inherited pool dispatches via the re-announce flow; a
-                // pre-partitioned share would wedge it). MUST run AFTER the
-                // roster is reconstructed (it reads `self.workers`) and BEFORE
-                // `perform_initial_assignment` — both the initial batch and the
-                // operational idle-worker recheck construct their views through
-                // `dispatch_view_for_worker`, which scopes to the member's
-                // reserved share, so a first-confirmed member drains only its
-                // slice instead of the whole pool while the fleet forms (the
-                // 14/2/0×N pack). The veto in `should_skip_worker_for_dispatch`
-                // still withholds any send to an unconfirmed member — the
-                // reservation only caps what a CONFIRMED member may pull.
-                self.seed_bringup_reservation(bootstrap_kind);
-
-                // Phase 5: the initial per-secondary assignment — a pure
-                // scheduler over the reconstructed `self.workers`, staged-files
-                // inline. The cold-seed broadcast already ran UNCONDITIONALLY
-                // above (it had to precede a possible relocate); the assignment
-                // is the operational primary's concern and assigns over the
-                // inherited roster.
+                // The seed-dependent bring-up tail — reconstruct the worker
+                // roster, open the cold bring-up reservation, perform the
+                // initial per-secondary assignment, release the setup gate
+                // (transfer-complete), latch the run-start batch, and emit the
+                // "initial setup done" milestone (see
+                // `finalize_bringup_assignment`).
                 //
-                // A `ClusterCollapsed` outcome means a secondary died during
-                // the initial assignment (the mesh-pump went away mid-send —
-                // the egress-side twin of the operational loop's
-                // `recv() -> None` collapse). The operational loop tolerates a
-                // mid-loop collapse by breaking and letting the finalize tail
-                // classify the strand; an assignment-time collapse must reach
-                // that SAME classification rather than `?`-escaping as a raw
-                // `RunError::Other` (which is the gap the uniform-relocate
-                // reorder exposed). So skip the rest of the pre-loop chain
-                // (transfer-complete / op-loop) — every send would just hit the
-                // same dead mesh — and route straight into the SOLE
-                // strand-classification site, where the full (un-dispatched)
-                // pool surfaces as stranded and the honest `RunAborted`
-                // terminal is broadcast. Put `command_rx` back first for
+                // DEFERRED on the discovery-`Owed` path: the mode-2
+                // `--source-already-staged` primary holds the setup gate OPEN
+                // and keeps its workers parked while `discover_items` runs as
+                // the concurrent op-loop arm, then runs this SAME tail in
+                // `finish_discovery_arm` once that arm has SEEDED the ledger —
+                // so "initial assignment complete" + transfer-complete never
+                // fire over the empty pre-discovery ledger. (The
+                // premature-completion bug: an all-empty initial assignment
+                // flipped the fleet operational with zero work, so an
+                // incremental run whose phase-1 discovers nothing never
+                // advanced to the build phases.) On every non-owed path the
+                // ledger is already seeded here (cold mode-1 seeded by
+                // `originate_cold_seed`, or a failover whose inherited snapshot
+                // carries the tasks), so the tail runs inline.
+                //
+                // `ControlFlow::Break` ⇒ a secondary died mid-bring-up (the
+                // initial assignment hit a cluster-collapse send, or the
+                // transfer-complete fan-out found the local mesh-pump gone):
+                // skip the rest of the pre-loop chain — every send would hit
+                // the same dead mesh — and route the un-dispatched pool
+                // straight to the SOLE strand-classification site for the
+                // honest `RunAborted` terminal. Put `command_rx` back first for
                 // symmetry with the take at the top of the pre-loop chain.
-                if let InitialAssignmentOutcome::ClusterCollapsed =
-                    self.perform_initial_assignment().await?
+                if self.cluster_state.discovery_debt() != DiscoveryDebt::Owed
+                    && self.finalize_bringup_assignment().await?.is_break()
                 {
-                    return self.bail_to_finalize(command_rx).await;
-                }
-
-                // Phase 6: Send transfer complete.
-                self.send_transfer_complete().await?;
-
-                // RUN-START LATCH: both halves of the run-start batch have
-                // now fired over the roster known at this instant. From here
-                // on, a member completing its welcome/cert-exchange has
-                // MISSED the batch, so the incremental per-member serve
-                // (`serve_setup_on_cert_exchange`) must hand it the FULL
-                // setup trio itself — see `run_start_batch_fired`'s field
-                // doc. Latched HERE (the one site that sequences both
-                // halves) and nowhere else. No frame dispatch happens
-                // between `perform_initial_assignment` above and this line
-                // (the pre-loop chain never recvs the inbox), so no
-                // cert-exchange can race the latch.
-                self.run_start_batch_fired = true;
-
-                // Pre-loop collapse gate (transfer-complete window): a
-                // secondary dying AFTER its initial assignment send succeeded
-                // but before/at `send_transfer_complete` makes that fan-out's
-                // per-secondary `send_to` hit the now-gone local mesh-pump —
-                // latched on `mesh_pump_gone`. (`send_transfer_complete` now
-                // fans the gate-release per CRDT-known secondary over the
-                // directed router path, but its `Err` arm is still uniformly the
-                // mesh-pump-gone collapse — the per-peer no-route outcome is
-                // resolved asynchronously inside the pump and never sets the
-                // latch.) Route it through the SAME finalize tail as the
-                // assignment-time collapse (rather than the warn-swallow letting
-                // the doomed run proceed into the operational loop over a dead
-                // mesh): the assigned-but-unconfirmed pool surfaces as stranded
-                // with the honest `RunAborted` terminal. Mirror of the
-                // operational loop's break-then-finalize, observed from the
-                // send side.
-                if self.mesh_pump_gone {
                     return self.bail_to_finalize(command_rx).await;
                 }
 
@@ -5891,18 +5854,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // chain.
                 self.command_rx = command_rx;
 
-                // Initial-setup-done important event — the honest once-per-run
-                // "all initial setup complete, entering steady-state"
-                // milestone: the fleet is connected, staged, peer-linked, the
-                // primary's own membership is recorded, the ledger is seeded +
-                // tasks assigned, and transfer-complete is sent. A single emit
-                // at this point fires EXACTLY ONCE per run on the operational
-                // primary.
-                tracing::info!(
-                    target: super::important_events::IMPORTANT_TARGET,
-                    "initial setup done",
-                );
-
                 // Bootstrap tail: activate THIS node as the local primary and
                 // run the operational loop to completion in place. The
                 // self-announce routes over the primary↔secondary leg; the
@@ -5911,6 +5862,120 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.bootstrap_tail_dispatch().await
             }
         }
+    }
+
+    /// The seed-dependent initial bring-up tail: reconstruct the worker
+    /// roster, open the cold bring-up reservation, perform the initial
+    /// per-secondary assignment, release the setup gate (transfer-complete),
+    /// latch the run-start batch, and emit the once-per-run "initial setup
+    /// done" milestone.
+    ///
+    /// # One concern
+    ///
+    /// Turn a SEEDED ledger + a connected, setup-parked fleet into the first
+    /// dispatched batch. Runs at EXACTLY ONE of two sites — whichever is the
+    /// first point at which the ledger is populated:
+    ///   * the bring-up pre-loop, when discovery is NOT owed (a cold mode-1
+    ///     run seeded by `originate_cold_seed`, or a failover whose inherited
+    ///     snapshot already carries the tasks); or
+    ///   * [`Self::finish_discovery_arm`], when discovery WAS owed — the
+    ///     mode-2 `--source-already-staged` primary parks its workers + holds
+    ///     the setup gate OPEN while `discover_items` runs as a concurrent arm,
+    ///     and runs this tail only once that arm has seeded the ledger. This is
+    ///     what keeps "initial assignment complete" + transfer-complete from
+    ///     firing over the still-empty pre-discovery ledger (the premature-
+    ///     completion bug: the fleet went operational with zero work, so an
+    ///     incremental run whose phase-1 discovers nothing never advanced).
+    ///
+    /// # Ordering (preserved from the original pre-loop chain)
+    ///
+    /// `reconstruct_workers_from_cluster_state` (the SOLE roster builder) MUST
+    /// run BEFORE `perform_initial_assignment` commits any slot — the wholesale
+    /// replace re-derives occupancy only from CRDT `InFlight`, so a re-invoke
+    /// AFTER assignment began committing would zero committed-but-not-yet-
+    /// originated slots (FORBIDDEN). The reservation opens AFTER the roster (it
+    /// reads `self.workers`) and BEFORE assignment.
+    ///
+    /// # Return
+    ///
+    /// `ControlFlow::Break` means a secondary died mid-bring-up — the initial
+    /// assignment hit a cluster-collapse send (the egress-side twin of the
+    /// operational loop's `recv() -> None` collapse), or the transfer-complete
+    /// fan-out found the local mesh-pump gone (`mesh_pump_gone`). Both directed
+    /// the original pre-loop to skip the rest of the chain and route the
+    /// un-dispatched pool to the SOLE strand-classification site
+    /// (`finalize_terminal_accounting`); the callers do exactly that on
+    /// `Break`. `ControlFlow::Continue` means the batch is out and the run may
+    /// enter / continue the operational loop.
+    pub(crate) async fn finalize_bringup_assignment(
+        &mut self,
+    ) -> Result<std::ops::ControlFlow<()>, RunError> {
+        // V2: rebuild the remote-worker roster from the replicated
+        // per-secondary capacity NOW — `wait_for_connections` has originated
+        // every connected secondary's `SecondaryCapacity` (and
+        // `rebroadcast_full_roster` re-emitted the full set), so
+        // `known_secondaries()` is populated. The SOLE roster builder; it MUST
+        // run before any slot is committed (see the ordering note above).
+        self.reconstruct_workers_from_cluster_state();
+
+        // Phase 4.9: OPEN the bring-up reservation (#494/#507). Partition the
+        // initial pending pool across the connected fleet (one task per idle
+        // worker) via the projected-load interleave so each member gets a
+        // capacity-bounded reserved share. Opens ONLY on a `BootstrapRelocation`
+        // cold target with an unstarted ledger — a `Failover` must NOT reserve
+        // (its inherited pool dispatches via the re-announce flow; a
+        // pre-partitioned share would wedge it). Reads the construction-stamped
+        // `self.bringup_kind` (the original pre-loop binding is out of scope in
+        // the discovery-arm caller). On the mode-2 path the ledger is unstarted
+        // here (discovery just seeded it; nothing dispatched yet), so a
+        // relocation target opens the reservation exactly as a cold pre-loop
+        // target would.
+        self.seed_bringup_reservation(self.bringup_kind);
+
+        // Phase 5: the initial per-secondary assignment — a pure scheduler over
+        // the reconstructed `self.workers`, staged-files inline. A
+        // `ClusterCollapsed` outcome means a secondary died during the initial
+        // assignment (the mesh-pump went away mid-send). Signal `Break` so the
+        // caller routes the full un-dispatched pool through the SOLE
+        // strand-classification site — never `?`-escaping as a raw error.
+        if let InitialAssignmentOutcome::ClusterCollapsed = self.perform_initial_assignment().await?
+        {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+
+        // Phase 6: send transfer complete — release the setup gate so the
+        // (until-now parked) fleet goes operational with its real assignment.
+        self.send_transfer_complete().await?;
+
+        // RUN-START LATCH: both halves of the run-start batch have now fired
+        // over the roster known at this instant. From here a member completing
+        // its welcome/cert-exchange has MISSED the batch, so the incremental
+        // per-member serve (`serve_setup_on_cert_exchange`) hands it the FULL
+        // setup trio itself — see `run_start_batch_fired`'s field doc. Latched
+        // HERE (the one site that sequences both halves) and nowhere else.
+        self.run_start_batch_fired = true;
+
+        // Pre-loop collapse gate (transfer-complete window): a secondary dying
+        // AFTER its initial assignment send succeeded but before/at
+        // `send_transfer_complete` makes that fan-out's per-secondary `send_to`
+        // hit the now-gone local mesh-pump — latched on `mesh_pump_gone`. Route
+        // it through the SAME finalize tail as the assignment-time collapse:
+        // signal `Break`.
+        if self.mesh_pump_gone {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+
+        // Initial-setup-done important event — the honest once-per-run "all
+        // initial setup complete, entering steady-state" milestone: the fleet
+        // is connected, staged, peer-linked, the primary's own membership is
+        // recorded, the ledger is seeded + tasks assigned, and transfer-complete
+        // is sent. Fires EXACTLY ONCE per run on the operational primary.
+        tracing::info!(
+            target: super::important_events::IMPORTANT_TARGET,
+            "initial setup done",
+        );
+
+        Ok(std::ops::ControlFlow::Continue(()))
     }
 
     /// The operational bootstrap tail: activate THIS node as the local primary
@@ -6193,7 +6258,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `run_pipeline` before `discover_on_promotion` ran would be the stale
     /// pre-discovery `0` on the `Owed`/`RelocatedSeed` path and falsely
     /// classify a post-discovery collapse as a clean run.
-    async fn finalize_terminal_accounting(&mut self) -> Result<(), RunError> {
+    pub(super) async fn finalize_terminal_accounting(&mut self) -> Result<(), RunError> {
         // Live denominator (see doc comment): the count as of NOW, after any
         // discovery-driven re-hydrate, never a pre-discovery snapshot.
         let total = self.total_tasks;

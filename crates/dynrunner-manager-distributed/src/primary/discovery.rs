@@ -315,12 +315,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // run_complete_check) are lifted and it narrates + drains the now-
         // populated ledger, not phantom-empty phases.
         self.run_initial_phase_cascade(command_rx).await;
-        // The seeded pool now holds dispatchable work, but no worker will send a
-        // fresh TaskRequest unprompted (they parked "no work" while the ledger
-        // was empty). EMIT onto the decoupled worker-management bus so the
-        // operational loop's worker-mgmt arm coalesces it into one batched
-        // `dispatch_to_idle_workers` recheck over every confirmed idle worker —
-        // identical to the task-backoff arm's re-dispatch trigger.
+        // Segment B — the seed-dependent bring-up tail the `Owed` pre-loop
+        // DEFERRED. While discovery was owed the pre-loop parked the workers
+        // and held the setup gate OPEN (it skipped `finalize_bringup_assignment`
+        // on the `Owed` path); NOW the ledger is seeded + `Owed` flipped to
+        // `Settled`, so run that SAME shared tail — reconstruct the roster,
+        // perform the initial assignment over the populated ledger, release the
+        // setup gate (transfer-complete), latch the run-start batch, emit
+        // "initial setup done". This is the deferred "mark initial assignment
+        // complete" that keeps the milestone + transfer-complete off the empty
+        // pre-discovery ledger.
+        if self.finalize_bringup_assignment().await?.is_break() {
+            // A secondary died during the (post-discovery) bring-up send. The
+            // op-loop tail reaches the SOLE strand-classifier only on a loop
+            // BREAK, not on a `?`-propagated `Err` — so route the un-dispatched
+            // pool through `finalize_terminal_accounting` HERE, exactly as the
+            // pre-loop's `bail_to_finalize` does, and surface its verdict
+            // (`RunAborted` + `ClusterCollapsed` on a strand) as the arm's —
+            // hence the operational loop's — result. Put `command_rx` back on
+            // `self` first, mirroring `bail_to_finalize`.
+            self.command_rx = command_rx.take();
+            return self.finalize_terminal_accounting().await;
+        }
+        // The seeded pool now holds dispatchable work beyond the one-per-worker
+        // initial batch, but no operational worker will send a fresh
+        // TaskRequest unprompted. EMIT onto the decoupled worker-management bus
+        // so the operational loop's worker-mgmt arm coalesces it into one
+        // batched `dispatch_to_idle_workers` recheck over every confirmed idle
+        // worker — identical to the task-backoff arm's re-dispatch trigger.
         self.cluster_state
             .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
         Ok(())
